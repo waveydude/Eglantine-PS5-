@@ -1,0 +1,120 @@
+Subject: [PATCH] djihads-range-guard: GPU address range guards in MemoryManager (pure crash safety, unconditional)
+
+djihads-range-guard: GPU address range guards in MemoryManager (pure crash safety, unconditional)
+
+Ported from Djihads80/Eglantine nx2-experimental c6d2acd37 ("nx2: Ocarina of Time stability,
+shader and performance fixes", #794, "guard unmapped GPU writes and GPU address ranges"),
+GPL-3.0-or-later, src/video_core/memory_manager.cpp only. Co-authors per that commit.
+
+MemoryManager::GetEntry and the page tables have no bounds check. A GPU address past the address
+space (junk render-target or copy registers after a pushbuffer desync) read past them and faulted
+on GPUBack; our 0407-junk-address-guard covers one caller (JoinImages -> IsContinuousRange), this
+covers the shared paths:
+- MemoryOperation leaves a range that starts or runs past the address space alone.
+- ReadBlockImpl reads such a range as zeros (as an unmapped range reads).
+- IsGranularRange, IsContinuousRange and IsFullyMappedRange answer false for it (MemoryOperation
+  skipping it would otherwise leave their default "true").
+- GpuToCpuAddress refuses a page-table entry that points past the 36-bit device space (logged,
+  first 16), instead of handing out a pointer past the device memory manager's tables.
+Unconditional: only ranges that indexed past the tables (undefined behaviour, a GPUBack fault)
+change; every in-range access is byte-identical. Not ported from the same hunks: Nx2Perf bounds
+(map-time continuous runs), ReadU32 page cache, FlushQueryResults plumbing.
+
+Checks (djihads-c6d2_checks.sh, log djihads-c6d2.checks.log): git apply --check on the T82 core,
+patch on a copy, prepare-vulkan-port.py same 6 anchor skips as baseline, -fsyntax-only rc=0 on
+every TU the diff reaches (generated copies included), injected static_assert seen in each,
+and all four djihads-*.diff stack in one tree (same anchors, rc=0). Not built, not run.
+
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index da05b21..a33fea5 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -266,14 +266,27 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
+     if (!IsWithinGPUAddressRange(gpu_addr)) [[unlikely]] {
+         return std::nullopt;
+     }
++    DAddr dev_addr;
+     if (GetEntry(gpu_addr, true) != EntryType::Mapped) [[unlikely]] {
+         if (GetEntry(gpu_addr, false) != EntryType::Mapped)
+             return std::nullopt;
+-        const DAddr dev_addr_base = DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits;
+-        return dev_addr_base + (gpu_addr & page_mask);
++        dev_addr = (DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits) +
++                   (gpu_addr & page_mask);
++    } else {
++        dev_addr = (DAddr(big_page_table_dev[PageEntryIndex(gpu_addr, true)]) << cpu_page_bits) +
++                   (gpu_addr & big_page_mask);
++    }
++    // Djihads80/Eglantine c6d2acd37: an entry past the device address space would index past the
++    // device memory manager's tables (every caller treats nullopt as unmapped).
++    if ((dev_addr >> MaxwellDeviceMemoryManager::AS_BITS) != 0) [[unlikely]] {
++        static std::atomic<u32> reported{};
++        if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
++            LOG_ERROR(HW_GPU, "GPU address {:#x} maps outside the device space, to {:#x}",
++                      gpu_addr, dev_addr);
++        }
++        return std::nullopt;
+     }
+-    const DAddr dev_addr_base = DAddr(big_page_table_dev[PageEntryIndex(gpu_addr, true)]) << cpu_page_bits;
+-    return dev_addr_base + (gpu_addr & big_page_mask);
++    return dev_addr;
+ }
+ 
+ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr addr, std::size_t size) const {
+@@ -376,6 +389,14 @@ const u8* MemoryManager::GetPointer(GPUVAddr gpu_addr) const {
+ 
+ template <typename FuncMapped, typename FuncReserved, typename FuncUnmapped>
+ inline void MemoryManager::MemoryOperation(GPUVAddr gpu_src_addr, std::size_t size, bool is_big_page, FuncMapped&& func_mapped, FuncReserved&& func_reserved, FuncUnmapped&& func_unmapped) const {
++    // Djihads80/Eglantine c6d2acd37: GetEntry and the page tables have no bounds check, so a range
++    // that starts or runs past the address space (junk addresses after a pushbuffer desync) read
++    // past them and faulted on GPUBack. Such a range is left alone; the callers whose answer
++    // depends on the callbacks running check the range themselves first.
++    if (!IsWithinGPUAddressRange(gpu_src_addr) || size > address_space_size - gpu_src_addr)
++        [[unlikely]] {
++        return;
++    }
+     using FuncMappedReturn =
+         typename std::invoke_result<FuncMapped, std::size_t, std::size_t, std::size_t>::type;
+     using FuncReservedReturn =
+@@ -441,6 +462,11 @@ inline void MemoryManager::MemoryOperation(GPUVAddr gpu_src_addr, std::size_t si
+ }
+ 
+ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) const {
++    if (!IsWithinGPUAddressRange(gpu_src_addr) || size > address_space_size - gpu_src_addr)
++        [[unlikely]] {
++        std::memset(dest_buffer, 0, size); // As an unmapped range reads (MemoryOperation skips it)
++        return;
++    }
+     auto set_to_zero = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
+         std::memset(dest_buffer, 0, copy_amount);
+         dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
+@@ -741,6 +767,9 @@ void MemoryManager::CopyBlock(GPUVAddr gpu_dest_addr, GPUVAddr gpu_src_addr, std
+ }
+ 
+ bool MemoryManager::IsGranularRange(GPUVAddr gpu_addr, std::size_t size) const {
++    if (!IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr) [[unlikely]] {
++        return false;
++    }
+     if (GetEntry(gpu_addr, true) == EntryType::Mapped) [[likely]] {
+         size_t page_index = gpu_addr >> big_page_bits;
+         if (IsBigPageContinuous(page_index)) [[likely]] {
+@@ -758,6 +787,9 @@ bool MemoryManager::IsGranularRange(GPUVAddr gpu_addr, std::size_t size) const {
+ }
+ 
+ bool MemoryManager::IsContinuousRange(GPUVAddr gpu_addr, std::size_t size) const {
++    if (!IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr) [[unlikely]] {
++        return false; // Out of range: MemoryOperation skips it, which would answer true below
++    }
+     std::optional<DAddr> old_page_addr{};
+     bool result{true};
+     auto fail = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset,
+@@ -796,6 +828,9 @@ bool MemoryManager::IsContinuousRange(GPUVAddr gpu_addr, std::size_t size) const
+ }
+ 
+ bool MemoryManager::IsFullyMappedRange(GPUVAddr gpu_addr, std::size_t size) const {
++    if (!IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr) [[unlikely]] {
++        return false; // Out of range: MemoryOperation skips it, which would answer true below
++    }
+     bool result{true};
+     auto fail = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset,
+                     [[maybe_unused]] std::size_t copy_amount) {

@@ -1,0 +1,133 @@
+Subject: [PATCH] fritchii2-wideaff: Ocarina's multi-core thread affinity masks widened to all six guest cores.
+
+fritchii2-wideaff: Ocarina's multi-core thread affinity masks widened to all six guest cores.
+Switch EDEN_UP_FRITCHII_WIDEAFF=1, off by default (Ocarina of Time 0400486024DEC000 only).
+
+Upstream: Frizti/Fritchii 4aa4e08be0 "kernel: EDEN_NX2_OOT_WIDE_AFFINITY widens Ocarina's
+multi-core affinity masks" (merge 3ba6b4a1f7, Fritchii v5), a port of the switch in
+stephenjayakar's zortos293/Lichii#641 (closed draft; on by default there, inside the waves that
+took Kokiri from 31 to 46.5 fps on a 3700X; never measured alone). Credit to both.
+
+What it does: Ocarina's two main threads (priorities 55 and 47) get affinity masks of two of
+cores 3-5, where the per-core job workers (priority 44, single-core masks) keep preempting them
+while cores 0-2 have idle time. SetThreadCoreMask now widens any mask of more than one core that
+Ocarina sets to every emulated core the process may use (FoldExtraCoreMask(process mask),
+normally 0x3f; the log line shows it), after the mask was validated, so the core id checks still
+pass. The kernel's own migration (KScheduler::UpdateHighestPriorityThreadsImpl: an idle core
+takes a suggested thread that is not the top thread on its core) can then run a preempted main
+thread on an idle core. Single-core masks, IdealCoreUseProcessValue and every other title are
+unchanged.
+
+Why it matters on the PS5: my timing notes had the main thread at 58% and the second at 36%
+of wall time with guest cores 0-2 ~37% idle and 3-5 10-17% idle; the 9 Nov stack samples have
+CPUCore_4/5 busy 82-88% and the guest cores as the limit. This attacks exactly that imbalance.
+
+Interaction with EDEN_PS5_PIN=pairs + EDEN_PS5_PLACE (layout A, +1.3 fps): the host side is not
+touched and keeps working, but layout A was tuned for the current load. It puts CPUCore_4 on CPU 0
+next to CPUCore_0 on CPU 1, CPUCore_5 (2) next to CPUCore_1 (3), CPUCore_3 (4) next to CPUCore_2
+(5): under the 2n/2n+1 sibling guess each busy guest core shares a physical core with a mostly idle
+one. With the switch the main threads migrate onto cores 0-2, so those siblings get busy too and
+the two guest threads of a pair share one Zen 2 core. A main thread then runs at SMT speed instead
+of waiting out the preemption: likely still a gain, but it must be measured with layout A on and
+off, with EDEN_PERF_REPORT=1 (EDEN_PERF_IDLE per guest core, EDEN_GUEST_RUN per guest thread).
+CPUs 7, 9 and 12 stay free/secondary in layout A; a later layout could move CPUCore_0-2 there if
+the pairs turn out to hurt.
+
+Deviations: the switch name; Common::PeSwitch (exactly "1"); the widening runs after the core
+id check, against the mask the game asked for, and only when it adds cores (review fix, 9 Nov:
+upstream widens first, so a core id outside the game's own mask would pass); the title is checked before the switch
+is read, so the static is first read on Ocarina's first multi-core mask (game code, after env.txt);
+the first 32 widenings are logged ("EDEN_UP_FRITCHII_WIDEAFF: thread N (priority P) core C mask
+0x.. -> 0x.."), so a run shows which threads it touched and the mask they got. Unset: identical
+behaviour (one popcount and a program id compare per SetThreadCoreMask, a rare SVC).
+
+Risk: guest scheduling and timing change (threads the game confined to cores 3-5 can run anywhere);
+could expose a game race. No crash risk in the code. Memory (review, 9 Nov): each guest core has its
+own JIT code cache, committed as code is emitted (play env EDEN_JIT_CACHE_MIB=256,192,192). Once
+the main threads run on cores 0-2, their code is compiled again in those JITs: more commit charge
+on a tight PS5, and compile hitches the first times a main thread lands on a new core. Watch
+EDEN_PERF_PROGRESS compilations/evacuations per core and the memory report. Files: src/core/hle/kernel/svc/svc_thread.cpp
+(compiled from the tree, no derived copy).
+
+diff --git a/src/core/hle/kernel/svc/svc_thread.cpp b/src/core/hle/kernel/svc/svc_thread.cpp
+--- a/src/core/hle/kernel/svc/svc_thread.cpp
++++ b/src/core/hle/kernel/svc/svc_thread.cpp
+@@ -4,9 +4,12 @@
+ // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <atomic>
++#include <bit>
+ #include <chrono>
+ #include <thread>
+ 
++#include "common/pe_switch.h"
+ #include "common/scope_exit.h"
+ #include "core/core.h"
+ #include "core/core_timing.h"
+@@ -35,6 +38,23 @@
+     return (mask & low) | ((mask >> Core::Hardware::NUM_CPU_CORES) & low);
+ }
+ 
++// EDEN_UP_FRITCHII_WIDEAFF=1 (boot switch, off by default; Frizti/Fritchii 4aa4e08be0, there
++// EDEN_NX2_OOT_WIDE_AFFINITY, from zortos293/Lichii#641). Ocarina of Time's two main threads
++// (priorities 55 and 47) may only run on two of cores 3-5, where the per-core job workers
++// (priority 44) keep preempting them while cores 0-2 sit idle part of the time. With the switch,
++// an affinity mask of more than one core that Ocarina sets is widened to all of the process's
++// emulated cores, so the scheduler's migration (an idle core takes a suggested thread) can move
++// a preempted main thread to an idle core. Single-core masks and every other title are unchanged.
++// Read on Ocarina's first multi-core mask: game code, after env.txt was applied.
++bool WidenAffinity(const KProcess& process, u64 affinity_mask) {
++    constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
++    if (std::popcount(affinity_mask) <= 1 || process.GetProgramId() != OcarinaOfTimeProgramId) {
++        return false;
++    }
++    static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_WIDEAFF");
++    return enabled;
++}
++
+ } // Anonymous namespace
+ 
+ /// Creates a new thread
+@@ -296,6 +316,7 @@
+ 
+ Result SetThreadCoreMask(Core::System& system, Handle thread_handle, s32 core_id,
+                          u64 affinity_mask) {
++    u64 widened_from = 0; ///< EDEN_UP_FRITCHII_WIDEAFF: the mask Ocarina asked for
+     // Determine the core id/affinity mask.
+     if (core_id == IdealCoreUseProcessValue) {
+         core_id = GetCurrentProcess(system.Kernel()).GetIdealCoreId();
+@@ -317,6 +338,16 @@
+             R_UNLESS(core_id == IdealCoreNoUpdate || core_id == IdealCoreDontCare,
+                      ResultInvalidCoreId);
+         }
++
++        // Widened only after the core id was checked against the mask the game asked for, so a
++        // call that fails without the switch fails with it too (upstream widens before).
++        if (WidenAffinity(GetCurrentProcess(system.Kernel()), affinity_mask)) {
++            const u64 widened = FoldExtraCoreMask(process_core_mask);
++            if (widened != affinity_mask) { // a superset: the validated core id stays in it
++                widened_from = affinity_mask;
++                affinity_mask = widened;
++            }
++        }
+     }
+ 
+     // Get the thread from its handle.
+@@ -324,6 +355,16 @@
+         GetCurrentProcess(system.Kernel()).GetHandleTable().GetObject<KThread>(system.Kernel(), thread_handle);
+     R_UNLESS(thread.IsNotNull(), ResultInvalidHandle);
+ 
++    if (widened_from != 0) {
++        static std::atomic<u32> widened_logs{};
++        if (widened_logs.fetch_add(1, std::memory_order_relaxed) < 32) {
++            LOG_INFO(Kernel_SVC,
++                     "EDEN_UP_FRITCHII_WIDEAFF: thread {} (priority {}) core {} mask {:#x} -> "
++                     "{:#x}",
++                     thread->GetId(), thread->GetPriority(), core_id, widened_from, affinity_mask);
++        }
++    }
++
+     // Set the core mask.
+     R_RETURN(thread->SetCoreMask(system.Kernel(), core_id, affinity_mask));
+ }

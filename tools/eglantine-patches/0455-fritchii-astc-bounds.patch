@@ -1,0 +1,87 @@
+Subject: [PATCH] fritchii-astc-bounds: the GPU ASTC decoder stores only texels inside the destination image.
+
+fritchii-astc-bounds: the GPU ASTC decoder stores only texels inside the destination image.
+Unconditional (pure overflow safety, no switch): a texel inside the image is stored exactly as
+before; only stores past the image's right or bottom edge, undefined in Vulkan, are dropped.
+
+Upstream: Frizti/Fritchii f52631cf66 "host_shaders: bounds-check every ASTC decode and unswizzle
+image store (AMD corruption and device loss)" (Frizti, with Claude Opus 5.5), in fritchii-v5.2
+(2026-11-09), from CheezerWheezer/Lichii "AMD Superior build 7" 132cc46c9e (CheezerWheezer).
+Fritchii v5.2 notes: "AMD: textures no longer write into other textures' memory. Images whose size
+isn't a multiple of their block size wrote past their edge while being decoded. NVIDIA ignores
+that, AMD put it in other textures: black blocks, a crosshatch, and in the end a GPU crash."
+
+What: each ASTC block writes block_dims.x * block_dims.y texels from its origin. main() already
+returned for a block whose origin is outside the image, but a block at the right or bottom edge of
+an image whose size is not a multiple of the block size (every small mip level: a 4x4 level of an
+8x8-block texture gets 64 stores for 16 texels) stored the rest past the edge. StoreTexel checks
+each store against imageSize(dest_image).xy (read once in main into image_extent, the value the
+existing origin check already used). FillError, FillVoidExtentLDR and DecompressBlock go through
+it. The layer (z) is already bounded by the origin check.
+
+PS5: the decoder runs here (my 2026-11-09 play: "ASTC GPU decodes" 100-400 per 5 s in free
+play, 478 opaque / 824 alpha per 600 frames). Whether RADV on the PS5's RDNA2 GPU drops such
+stores in hardware is not known; if it does not, they land in neighbouring images (black blocks,
+crosshatch, device loss). Cost: one compare per stored texel, after the decode math.
+
+Not ported: the same check in block_linear_unswizzle_2d.comp, block_linear_unswizzle_3d.comp and
+pitch_unswizzle.comp. In our tree only the OpenGL backend uses those (util_shaders.cpp); Vulkan
+uses block_linear_unswizzle_3d_bcn.comp, which already returns for blocks outside pc.blocks_dim.
+
+diff --git a/src/video_core/host_shaders/astc_decoder.comp b/src/video_core/host_shaders/astc_decoder.comp
+index 01bec11..502320a 100644
+--- a/src/video_core/host_shaders/astc_decoder.comp
++++ b/src/video_core/host_shaders/astc_decoder.comp
+@@ -1095,10 +1095,23 @@ int FindLayout(uint mode) {
+ }
+ 
+ 
++// The image's size: a block at the right or bottom edge of an image whose size isn't a multiple
++// of the block size reaches past it (every small mip level of a texture with 8x8 blocks does).
++// Storing those texels anyway is undefined; on AMD's Windows driver they landed in other images'
++// memory (black blocks and a crosshatch in Ocarina of Time on an RX 6750 XT, and at last a GPU
++// fault), where NVIDIA dropped them. Fritchii f52631cf66, from CheezerWheezer/Lichii 132cc46c9e.
++ivec3 image_extent;
++
++void StoreTexel(ivec3 texel, vec4 value) {
++    if (all(lessThan(texel.xy, image_extent.xy))) {
++        imageStore(dest_image, texel, value);
++    }
++}
++
+ void FillError(ivec3 coord) {
+     for (uint j = 0; j < block_dims.y; j++) {
+         for (uint i = 0; i < block_dims.x; i++) {
+-            imageStore(dest_image, coord + ivec3(i, j, 0), vec4(0.0, 0.0, 0.0, 0.0));
++            StoreTexel(coord + ivec3(i, j, 0), vec4(0.0, 0.0, 0.0, 0.0));
+         }
+     }
+ }
+@@ -1115,7 +1128,7 @@ void FillVoidExtentLDR(ivec3 coord) {
+     const float b = float(b_u) / 65535.0f;
+     for (uint j = 0; j < block_dims.y; j++) {
+         for (uint i = 0; i < block_dims.x; i++) {
+-            imageStore(dest_image, coord + ivec3(i, j, 0), vec4(r, g, b, a));
++            StoreTexel(coord + ivec3(i, j, 0), vec4(r, g, b, a));
+         }
+     }
+ }
+@@ -1389,7 +1402,7 @@ void DecompressBlock(ivec3 coord) {
+                 p = Cf / 65535.0f;
+             }
+ 
+-            imageStore(dest_image, coord + ivec3(i, j, 0), clamp(p, 0.0f, 1.0f).gbar);
++            StoreTexel(coord + ivec3(i, j, 0), clamp(p, 0.0f, 1.0f).gbar);
+         }
+     }
+ }
+@@ -1421,7 +1434,8 @@ void main() {
+     offset += swizzle;
+ 
+     const ivec3 coord = ivec3(gl_GlobalInvocationID * uvec3(block_dims, 1));
+-    if (any(greaterThanEqual(coord, imageSize(dest_image)))) {
++    image_extent = imageSize(dest_image);
++    if (any(greaterThanEqual(coord, image_extent))) {
+         return;
+     }
+     local_buff = astc_data[offset / 16];

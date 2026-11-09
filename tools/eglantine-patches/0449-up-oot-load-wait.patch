@@ -1,0 +1,192 @@
+Subject: [PATCH] (adapted: the EDEN_UP_OOT_FRONT_WAIT hunk is left out, 0439 is not ported) EDEN_UP_OOT_LOAD_WAIT: Ocarina keeps the full frame wait while it loads or the GPU threads stall (few draws per present, slow presents) and for a hold time after, and drops it in steady gameplay; off by default
+diff --git a/src/common/nx2_load_wait.h b/src/common/nx2_load_wait.h
+new file mode 100644
+--- /dev/null
++++ b/src/common/nx2_load_wait.h
+@@ -0,0 +1,126 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdlib>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++
++/// EDEN_UP_OOT_LOAD_WAIT=1 (exact "1", Ocarina of Time only): the full frame wait of
++/// EDEN_UP_OOT_FRAME_WAIT, but only while the game loads or the GPU threads stall, and for a
++/// while after. In steady gameplay a present waits as it does with no Ocarina switch set (for
++/// this frame's fence unless a channel is suspended, then for the previous frame's), or as
++/// EDEN_UP_OOT_FRONT_WAIT says.
++///
++/// Why: without the full wait Ocarina runs ahead of the GPU threads. In steady gameplay that
++/// gives 4 to 5 fps and one-frame dark flashes. While loading it ends the session: the game
++/// reuses its command ring before the front has read it again (hangs with no new frames, and
++/// command stream desyncs; t80-f run527 to run529, and the pond desync of 8 Nov). This switch
++/// keeps the wait where the risk is, so a run without the wait can reach gameplay at all.
++///
++/// "Steady" is decided at each present from two things the game cannot fake:
++/// - the 3D draws the GPU thread ran since the previous present: under
++///   EDEN_UP_OOT_LOAD_WAIT_DRAWS (default 300) twice in a row is a loading screen, a menu, a
++///   movie or a fade (once can be two presents close together);
++/// - the time since the previous present: over EDEN_UP_OOT_LOAD_WAIT_SLOW_MS (default 250) is a
++///   stall (an area load, a burst of uploads or pipeline builds).
++/// Either one makes the present unsteady. The game is steady once every present has been steady
++/// for EDEN_UP_OOT_LOAD_WAIT_HOLD_MS (default 8000): the pond desync came 3 to 4 s after the
++/// scene started drawing.
++/// With EDEN_UP_OOT_FRAME_WAIT=1 as well, every present takes the full wait and this does nothing.
++namespace Common::Nx2LoadWait {
++
++/// EDEN_UP_OOT_LOAD_WAIT=1 (exact "1"), read once.
++[[nodiscard]] inline bool Enabled() {
++    static const bool enabled = PeSwitch("EDEN_UP_OOT_LOAD_WAIT");
++    return enabled;
++}
++
++/// 3D draws run since the last present took the count. Any thread.
++inline std::atomic<u64> g_draws{};
++
++/// The thread that runs the 3D engine, for each draw it runs.
++inline void NoteDraw() {
++    if (Enabled()) {
++        g_draws.fetch_add(1, std::memory_order_relaxed);
++    }
++}
++
++[[nodiscard]] inline long long Setting(const char* name, long long fallback, long long low,
++                                       long long high) {
++    const char* const value = std::getenv(name);
++    if (value == nullptr || value[0] == '\0') {
++        return fallback;
++    }
++    return (std::clamp)(std::strtoll(value, nullptr, 10), low, high);
++}
++
++/// The presenting thread, once per present of the game: whether this present may skip the full
++/// frame wait. Logs each change (the first 64) and a line per 600 presents.
++[[nodiscard]] inline bool SteadyAtPresent() {
++    using Clock = std::chrono::steady_clock;
++    static const u64 min_draws =
++        static_cast<u64>(Setting("EDEN_UP_OOT_LOAD_WAIT_DRAWS", 300, 1, 1'000'000));
++    static const auto slow =
++        std::chrono::milliseconds{Setting("EDEN_UP_OOT_LOAD_WAIT_SLOW_MS", 250, 1, 60'000)};
++    static const auto hold =
++        std::chrono::milliseconds{Setting("EDEN_UP_OOT_LOAD_WAIT_HOLD_MS", 8000, 0, 600'000)};
++    static Clock::time_point last_present = Clock::now();
++    static Clock::time_point last_unsteady = last_present;
++    static bool steady = false;
++    static u64 presents{};
++    static u64 window_waited{};
++    static u64 window_low_draws{};
++    static u64 window_slow{};
++    static u64 window_draws{};
++    static u32 changes{};
++    static u32 low_run{};
++
++    const auto now = Clock::now();
++    const u64 draws = g_draws.exchange(0, std::memory_order_relaxed);
++    const bool low_draws = draws < min_draws;
++    const bool slow_present = now - last_present > slow;
++    last_present = now;
++    low_run = low_draws ? low_run + 1 : 0;
++    if (low_run >= 2 || slow_present) {
++        last_unsteady = now;
++    }
++    const bool now_steady = now - last_unsteady >= hold;
++    if (presents == 0) {
++        LOG_INFO(Service,
++                 "EDEN_UP_OOT_LOAD_WAIT=1: full frame wait until every present has run at least "
++                 "{} draws and come within {} ms of the one before for {} ms",
++                 min_draws, slow.count(), hold.count());
++    }
++    if (now_steady != steady) {
++        steady = now_steady;
++        if (changes++ < 64) {
++            LOG_INFO(Service,
++                     "Load wait: full frame wait {} at present #{} ({} draws since the last "
++                     "present{}{})",
++                     steady ? "off" : "on", presents, draws, low_draws ? ", few draws" : "",
++                     slow_present ? ", slow present" : "");
++        }
++    }
++    ++presents;
++    window_waited += steady ? 0 : 1;
++    window_low_draws += low_draws ? 1 : 0;
++    window_slow += slow_present ? 1 : 0;
++    window_draws += draws;
++    if (presents % 600 == 0) {
++        LOG_INFO(Service,
++                 "Load wait: {} of the last 600 presents took the full frame wait ({} with few "
++                 "draws, {} slow), {} draws a present on average",
++                 window_waited, window_low_draws, window_slow, window_draws / 600);
++        window_waited = window_low_draws = window_slow = window_draws = 0;
++    }
++    return steady;
++}
++
++} // namespace Common::Nx2LoadWait
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -29,6 +29,7 @@
+ #include "common/alignment.h"
+ #include "common/div_ceil.h"
+ #include "common/game_presets.h"
++#include "common/nx2_load_wait.h"
+ #include "common/settings.h"
+ #include "common/thread.h"
+ #include "core/core.h"
+@@ -1890,11 +1891,18 @@
+         constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+         int frames_ahead = frames_ahead_setting;
+         const u64 app_program_id = system.GetApplicationProcessProgramID();
+-        const bool slack_wait = oot_slack && frames_ahead == -1 &&
++        // EDEN_UP_OOT_LOAD_WAIT=1 (Ocarina only, common/nx2_load_wait.h): the full wait for this
++        // frame while the game loads or the GPU threads stall and for a while after, whatever
++        // the other Ocarina wait switches say; in steady gameplay they apply as if it were unset.
++        // SteadyAtPresent takes the draw count, so it runs once per present.
++        const bool load_wait = Common::Nx2LoadWait::Enabled() && frames_ahead == -1 &&
++                               app_program_id == OcarinaOfTimeProgramId &&
++                               !Common::Nx2LoadWait::SteadyAtPresent();
++        const bool slack_wait = !load_wait && oot_slack && frames_ahead == -1 &&
+                                 app_program_id == OcarinaOfTimeProgramId;
+-        const bool cap_wait = !slack_wait && oot_cap && frames_ahead == -1 &&
++        const bool cap_wait = !load_wait && !slack_wait && oot_cap && frames_ahead == -1 &&
+                               app_program_id == OcarinaOfTimeProgramId;
+-        if (slack_wait || cap_wait) {
++        if (slack_wait || cap_wait || load_wait) {
+             frames_ahead = 0;
+         }
+         if (frames_ahead == -1 && (app_program_id == DonkeyKongBananzaProgramId ||
+diff --git a/src/video_core/engines/draw_manager.cpp b/src/video_core/engines/draw_manager.cpp
+--- a/src/video_core/engines/draw_manager.cpp
++++ b/src/video_core/engines/draw_manager.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <cstring>
+ 
++#include "common/nx2_load_wait.h"
+ #include "common/settings.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/maxwell_3d.h"
+@@ -324,6 +325,7 @@
+                                         static_cast<u32>(maxwell3d.regs.render_enable_override));
+     }
+     if (maxwell3d.ShouldExecute()) {
++        Common::Nx2LoadWait::NoteDraw(); // EDEN_UP_OOT_LOAD_WAIT
+         if (draw_indexed && maxwell3d.regs.IsShaderConfigEnabled(4)) {
+             maxwell3d.GetNativeMacroEngine().RecordBananzaTerrainDepthDraw(maxwell3d, instance_count);
+         }
+@@ -336,6 +338,7 @@
+     LOG_TRACE(HW_GPU, "called, topology={}, is_indexed={}, includes_count={}, buffer_size={}, max_draw_count={}", draw_state.topology, indirect_state.is_indexed, indirect_state.include_count, indirect_state.buffer_size, indirect_state.max_draw_counts);
+     UpdateTopology(maxwell3d);
+     if (maxwell3d.ShouldExecute()) {
++        Common::Nx2LoadWait::NoteDraw(); // EDEN_UP_OOT_LOAD_WAIT
+         maxwell3d.rasterizer->DrawIndirect();
+     }
+ }

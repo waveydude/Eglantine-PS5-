@@ -1,0 +1,149 @@
+Subject: [PATCH] Lichii #880 via Fritchii: a texture cache image that does not fit is left out instead of unbacked (EDEN_UP_FRITCHII_UNBACKED, off by default)
+
+Port of zortos293/Lichii#880 (a07eed1ad9, by zortos293, merged 2026-11-08) as cherry-picked into
+Frizti/Fritchii 73880e166a (v5 "RAM cuts" merge b8338f4241).
+
+With EDEN_UP_FRITCHII_UNBACKED=1, MemoryAllocator::CreateImage no longer gives an image that the
+texture cache can do without an unbacked sparse stand-in when no memory is left (reads zero,
+writes dropped; drawing into one is what AMD drivers, RADV included, do not survive). It throws
+VK_ERROR_OUT_OF_DEVICE_MEMORY instead, and our existing refusal path takes it:
+TextureCacheRuntime::SurvivesImageRefusal returns false and JoinImages leaves the image out ("No
+memory for the image ... left out", 1 s pause for that size or larger; EDEN_NX2_REFUSAL_EVICT
+retries as before), so the image is made again at a later use once the collector freed memory.
+The console's own steps before the fallback (prepare-vulkan-port.py: ReleaseRefused retry,
+NoFallbackLeft / EDEN_NX2_UNBACKED_LIMIT accounting) run unchanged first; only the unbacked
+fallback is replaced. Images over 2^28 texels (never backed) and every other caller keep it.
+
+Deviations: upstream adds may_fail to AllocateImage/TryCreateImage; this tree throws through
+SlotVector::insert instead (the console's copy throws, headless/slot_vector_recovery.cmake, as
+0169-oom-fix-02 relies on), so the "may fail" state is a thread_local set by an RAII scope only
+around JoinImages' make_image inside SurvivesImageRefusal, and never when a refusal ends the
+session (ImageRefusalEnds). The allocator anchor line the generator replaces is untouched; the check
+sits inside that block, after the console's retry. Not ported: #880's UNIMPLEMENTED() skip for
+remapped GPU-modified overlaps (a log line), the MaxBackedImageTexels rename in Image::Image.
+
+Checks (fritchii-unbacked_checks.sh, log fritchii-unbacked.checks.log): git apply --check on
+$R/Eglantine; 6 anchor skips before and after (same); only the generated vulkan_memory_allocator.cpp
+differs and holds the check inside the console's "&& !no_fallback" block; -fsyntax-only of the
+generated allocator, vk_texture_cache_cost, vk_texture_cache_base (Vulkan instantiation),
+vulkan_rasterizer, vulkan_renderer, blit_image: rc=0; injected static_asserts and injected calls in
+SurvivesImageRefusal (instantiated) and the generated allocator all reported; host unit test
+fritchii-unbacked_test.cpp (#880's cases, the scope through an exception, the switch) passes, fails
+on a wrong expectation and does not build against T81b.
+
+Expected effect: in the recent PS5 runs 31 of 323 logged "does not fit; using an unbacked sparse
+image" (1280x720 format 97/126, 2560x1440 122/126) and 10 of those 31 crashed: a missing target for
+a frame instead. Memory is not created. Risk: black or partial frames under memory pressure.
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index caed1f4..86b5c8d 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -25,6 +25,7 @@
+ #include "video_core/renderer_vulkan/vk_render_pass_cache.h"
+ #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+ #include "video_core/texture_cache/image_view_base.h"
++#include "video_core/vulkan_common/unbacked_fallback.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #include "video_core/vulkan_common/vulkan_wrapper.h"
+ 
+@@ -81,6 +82,9 @@ public:
+     template <typename Make>
+     [[nodiscard]] bool SurvivesImageRefusal(Make&& make) {
+         try {
++            // EDEN_UP_FRITCHII_UNBACKED=1 (Lichii #880): while this image is made, one that does
++            // not fit fails here instead of becoming unbacked; not when a refusal ends the session.
++            const ImageMayFailScope may_fail{FailBackableImages() && !ImageRefusalEnds()};
+             make();
+             return true;
+         } catch (const vk::Exception& refused) {
+diff --git a/src/video_core/vulkan_common/unbacked_fallback.h b/src/video_core/vulkan_common/unbacked_fallback.h
+new file mode 100644
+index 0000000..fe8934b
+--- /dev/null
++++ b/src/video_core/vulkan_common/unbacked_fallback.h
+@@ -0,0 +1,51 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include "common/common_types.h"
++#include "common/pe_switch.h"
++
++namespace Vulkan {
++
++/// Images larger than this are never backed (title 1's sparse texture arrays reach 4.5G texels,
++/// ~23 GB): VMA would quietly place them in system memory once VRAM is full.
++constexpr u64 MaxBackedImageTexels = u64{1} << 28;
++
++/// EDEN_UP_FRITCHII_UNBACKED=1 (off unless set; zortos293/Lichii#880 a07eed1ad9, as Fritchii
++/// 73880e166a): a texture cache image no memory is left for fails instead of becoming an
++/// unbacked sparse image (reads return zero, writes are dropped; an unbacked render target is
++/// drawn into, which AMD's drivers, RADV included, do not survive). The texture cache leaves it
++/// out (JoinImages' refusal path) until the collector has freed memory.
++[[nodiscard]] inline bool FailBackableImages() {
++    static const bool enabled = Common::PeSwitch("EDEN_UP_FRITCHII_UNBACKED");
++    return enabled;
++}
++
++/// Set on this thread while the texture cache makes an image it can do without
++/// (TextureCacheRuntime::SurvivesImageRefusal, only with the switch on). Every other caller of
++/// MemoryAllocator::CreateImage keeps the unbacked fallback.
++inline thread_local bool g_image_may_fail = false;
++
++class ImageMayFailScope {
++public:
++    explicit ImageMayFailScope(bool may_fail) noexcept : previous{g_image_may_fail} {
++        g_image_may_fail = may_fail;
++    }
++    ~ImageMayFailScope() {
++        g_image_may_fail = previous;
++    }
++    ImageMayFailScope(const ImageMayFailScope&) = delete;
++    ImageMayFailScope& operator=(const ImageMayFailScope&) = delete;
++
++private:
++    bool previous;
++};
++
++/// Whether an image no memory is left for gets an unbacked sparse image instead of failing: one
++/// too large to back, or one whose caller cannot do without an image.
++constexpr bool UsesUnbackedFallback(u64 texels, bool may_fail) {
++    return texels > MaxBackedImageTexels || !may_fail;
++}
++
++} // namespace Vulkan
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index 3a60217..90599c1 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -19,6 +19,7 @@
+ #include "common/literals.h"
+ #include "common/logging.h"
+ #include <ranges>
++#include "video_core/vulkan_common/unbacked_fallback.h"
+ #include "video_core/vulkan_common/vma.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+@@ -272,6 +273,20 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
+         if (!huge) {
+             pressure_events.fetch_add(1, std::memory_order_relaxed);
+         }
++        // EDEN_UP_FRITCHII_UNBACKED=1 (zortos293/Lichii#880): an image the texture cache can do
++        // without fails instead (TextureCacheRuntime::SurvivesImageRefusal leaves it out until the
++        // collector freed memory). Without the switch g_image_may_fail is never set.
++        if (!UsesUnbackedFallback(texels, g_image_may_fail)) {
++            static u32 failed_logged{};
++            if (failed_logged++ < 32) {
++                LOG_WARNING(Render_Vulkan,
++                            "Image {}x{}x{} ({} levels, {} layers, format {}) does not fit; left "
++                            "out instead of unbacked (EDEN_UP_FRITCHII_UNBACKED, {} so far)",
++                            ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
++                            ci.arrayLayers, static_cast<u32>(ci.format), failed_logged);
++            }
++            throw vk::Exception(VK_ERROR_OUT_OF_DEVICE_MEMORY);
++        }
+         // Too big to back at all, e.g. title 1's sparse virtual texture arrays (8192x8192,
+         // 68 layers, ~23 GB): on the console only resident tiles have memory. Use an image with
+         // nothing bound, so views and copies still work, instead of aborting.

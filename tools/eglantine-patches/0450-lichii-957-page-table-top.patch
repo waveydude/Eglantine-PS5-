@@ -1,0 +1,25 @@
+Subject: [PATCH] Lichii #957 (c9df50563e): page table ReserveRange no longer overflows for a GPU mapping that ends at the top of the address space (safety, unconditional)
+
+diff --git a/src/common/multi_level_page_table.inc b/src/common/multi_level_page_table.inc
+index 79125e8..c515927 100644
+--- a/src/common/multi_level_page_table.inc
++++ b/src/common/multi_level_page_table.inc
+@@ -52,7 +52,17 @@ MultiLevelPageTable<BaseAddr>::~MultiLevelPageTable() noexcept {
+ template <typename BaseAddr>
+ void MultiLevelPageTable<BaseAddr>::ReserveRange(u64 start, std::size_t size) {
+     const u64 new_start = start >> first_level_shift;
+-    const u64 new_end = (start + size) >> first_level_shift;
++    u64 new_end = (start + size) >> first_level_shift;
++    // Lichii #957 (c9df50563e): for a range that ends at the top of the GPU address space (which
++    // MemoryManager::PageTableOp accepts) the index above is one past first_level_map: an 8-byte
++    // heap read, a heap write when that word was null, and on the PS5 a sparse slot committed past
++    // the table (headless/CMakeLists.txt derives AllocateLevel). Clamped, so a call that was in
++    // range reserves exactly the chunks it did. Upstream takes the index of the range's last byte
++    // instead, which also stops reserving the unused chunk after a range that ends on a first-level
++    // boundary (and the one chunk of an empty range); not taken in this unconditional fix.
++    if (new_end >= first_level_map.size()) {
++        new_end = first_level_map.size() - 1;
++    }
+     for (u64 i = new_start; i <= new_end; i++)
+         if (!first_level_map[i])
+             AllocateLevel(i);
