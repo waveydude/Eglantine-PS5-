@@ -1,0 +1,595 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Ocarina MME state fix: parked methods carry their macro state; macro restarts and
+ non-macro methods reset a half-fed macro (captured from the working tree, 8 Nov 2026)
+
+Until this patch these edits lived only in Eglantine/src (the PS5 build of ocarina-mme-state-fix
+was made from them) and were not in the patch series, so a clean resync would have dropped them.
+
+- ParkedMacro (split_macro_state.h): a method parked at a split entry takes the Maxwell3D / compute
+  macro id, words, segments with it (Take/Restore), and gets them back when the stream resumes.
+- A macro-start write (even method) for another macro, or a non-macro method, resets a half-fed macro
+  in Maxwell3D (back and front) and KeplerCompute instead of appending to it / asserting.
+- A failed native macro on the front no longer leaves draw_pending set.
+- "Submission ended with an unparked method" is reset and logged.
+- SplitContinuesHere shares ReadsAsCommands with split_macro_state.h.
+- Ocarina (0400486024DEC000) defaults for EDEN_NX2_UPSCALE_KEEP_FRAME, _INVALIDATION_FILTER,
+  _SKIP_OVERWRITTEN_UPLOADS and _FLUSH_DRAWS=4096 when the variable is unset.
+---
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 2f5501d..08ffe32 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -489,12 +489,33 @@ bool DmaPusher::Step() {
+             if (reported.fetch_add(1) < 16) {
+                 LOG_WARNING(HW_GPU,
+                             "Submission ended with parked method {:#x} (sub {}, {} words left, "
+-                            "resume {:#x})",
++                            "macro {:#x} with {} params, resume {:#x})",
+                             parked.method, parked.subchannel, parked.method_count,
++                            parked.macro.method, parked.macro.parameters.size(),
+                             parked.resume_address);
+             }
+         }
+         parked_methods.clear();
++        if (g_nx2_ampere && SplitCheckMode() != 0 && dma_state.method_count != 0) {
++            static std::atomic<u32> reported_unparked{};
++            if (reported_unparked.fetch_add(1) < 16) {
++                LOG_WARNING(HW_GPU,
++                            "Submission ended with active unparked method {:#x} (sub {}, {} words left) - resetting",
++                            dma_state.method, dma_state.subchannel, dma_state.method_count);
++            }
++            auto* sub = subchannels[dma_state.subchannel];
++            if (sub) {
++                ParkedMacro discarded;
++                const auto engine = subchannel_type[dma_state.subchannel];
++                if (engine == Engines::EngineTypes::Maxwell3D) {
++                    static_cast<Engines::Maxwell3D*>(sub)->ParkMacro(discarded);
++                } else if (engine == Engines::EngineTypes::KeplerCompute) {
++                    static_cast<Engines::KeplerCompute*>(sub)->ParkMacro(discarded.method, discarded.parameters);
++                }
++            }
++            dma_state.method_count = 0;
++            dma_increment_once = false;
++        }
+         dma_pushbuffer.pop_front();
+         dma_pushbuffer_subindex = 0;
+     } else {
+@@ -645,45 +666,21 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
+ int DmaPusher::SplitCheckMode() {
+     static const int mode = [] {
+         const char* value = std::getenv("EDEN_NX2_SPLIT_PARSE_CHECK");
+-        return value != nullptr ? std::atoi(value) : 0;
++        return value != nullptr ? std::max(0, std::atoi(value)) : 0;
+     }();
+     return mode;
+ }
+ 
+-static bool ReadsAsCommands(std::span<const u32> words, size_t entry_words, size_t skip) {
+-    size_t i = skip;
+-    while (i < words.size()) {
+-        const u32 header = words[i];
+-        const size_t count = (header >> 16) & 0x1fff;
+-        switch (header >> 29) {
+-        case 1: // Increasing
+-        case 3: // NonIncreasing
+-        case 5: // IncreaseOnce
+-            if (i + 1 + count > entry_words + 64) {
+-                return false; // a count no split explains: data read as a header
+-            }
+-            i += 1 + count;
+-            break;
+-        case 4: // Inline: the data is in the header
+-            ++i;
+-            break;
+-        default:
+-            return false; // IncreasingOld, NonIncreasingOld and the unused modes: ProcessCommands drops them
+-        }
+-    }
+-    return true; // data to the end of the window is a continuation too
+-}
+-
+ bool DmaPusher::SplitContinuesHere(const CommandListHeader& header) {
+     std::array<u32, 64> words{};
+     const size_t read = std::min<size_t>(header.size, words.size());
+     memory_manager.ReadBlockUnsafe(header.addr, words.data(), read * sizeof(u32));
+     const std::span<const u32> window{words.data(), read};
+-    const bool as_continuation = ReadsAsCommands(window, header.size, dma_state.method_count);
+-    const bool as_fresh = ReadsAsCommands(window, header.size, 0);
+-    const bool continues = as_continuation || !as_fresh;
++    const bool continues = SplitReadsAsContinuation(window, header.size, dma_state.method_count);
+     if (static u32 logged{}; SplitCheckMode() >= 2 && logged < 64) {
+         ++logged;
++        const bool as_continuation = ReadsAsCommands(window, header.size, dma_state.method_count);
++        const bool as_fresh = ReadsAsCommands(window, header.size, 0);
+         LOG_WARNING(HW_GPU,
+                     "Split check: method {:#x} wants {} more words at entry {:#x}+{} (split one ended {:#x}): "
+                     "as continuation {}, fresh {}: {}; starts {:08x} {:08x} {:08x} {:08x}",
+@@ -695,11 +692,12 @@ bool DmaPusher::SplitContinuesHere(const CommandListHeader& header) {
+ }
+ 
+ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
++    if (dma_state.method_count != 0 && entry_address == split_method_end) return;
+     const auto continued = std::ranges::find(parked_methods, entry_address,
+                                              &ParkedMethod::resume_address);
+     std::optional<ParkedMethod> resume;
+     if (continued != parked_methods.end()) {
+-        resume = *continued;
++        resume = std::move(*continued);
+         parked_methods.erase(continued);
+     }
+     if (dma_state.method_count != 0 && entry_address != split_method_end) {
+@@ -708,20 +706,31 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+             if (reported.fetch_add(1) < 8) {
+                 const auto& oldest = parked_methods.front();
+                 LOG_WARNING(HW_GPU,
+-                            "Dropping parked method {:#x} (sub {}, {} words left, resume {:#x})",
++                            "Dropping parked method {:#x} (sub {}, {} words left, macro {:#x} with {} params, resume {:#x})",
+                             oldest.method, oldest.subchannel, oldest.method_count,
++                            oldest.macro.method, oldest.macro.parameters.size(),
+                             oldest.resume_address);
+             }
+             parked_methods.erase(parked_methods.begin());
+         }
+-        parked_methods.push_back(ParkedMethod{
++        ParkedMethod parked{
+             .method = dma_state.method,
+             .subchannel = dma_state.subchannel,
+             .method_count = dma_state.method_count,
+             .non_incrementing = dma_state.non_incrementing,
+             .increment_once = dma_increment_once,
+             .resume_address = split_method_end,
+-        });
++        };
++        auto* sub = subchannels[dma_state.subchannel];
++        if (sub) {
++            const auto engine = subchannel_type[dma_state.subchannel];
++            if (engine == Engines::EngineTypes::Maxwell3D) {
++                static_cast<Engines::Maxwell3D*>(sub)->ParkMacro(parked.macro);
++            } else if (engine == Engines::EngineTypes::KeplerCompute) {
++                static_cast<Engines::KeplerCompute*>(sub)->ParkMacro(parked.macro.method, parked.macro.parameters);
++            }
++        }
++        parked_methods.push_back(std::move(parked));
+         dma_state.method_count = 0;
+         dma_increment_once = false;
+     }
+@@ -731,6 +740,15 @@ void DmaPusher::ResolveSplitMethod(GPUVAddr entry_address) {
+         dma_state.method_count = resume->method_count;
+         dma_state.non_incrementing = resume->non_incrementing;
+         dma_increment_once = resume->increment_once;
++        auto* sub = subchannels[dma_state.subchannel];
++        if (sub) {
++            const auto engine = subchannel_type[dma_state.subchannel];
++            if (engine == Engines::EngineTypes::Maxwell3D) {
++                static_cast<Engines::Maxwell3D*>(sub)->ResumeMacro(std::move(resume->macro));
++            } else if (engine == Engines::EngineTypes::KeplerCompute) {
++                static_cast<Engines::KeplerCompute*>(sub)->ResumeMacro(resume->macro.method, resume->macro.parameters);
++            }
++        }
+     }
+ }
+ 
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index 1c80bb6..1c2a418 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -21,6 +21,7 @@
+ #include "common/scratch_buffer.h"
+ #include "video_core/engines/engine_interface.h"
+ #include "video_core/engines/puller.h"
++#include "video_core/split_macro_state.h"
+ 
+ namespace Core {
+ class System;
+@@ -281,6 +282,7 @@ public:
+         bool non_incrementing;
+         bool increment_once;
+         GPUVAddr resume_address; ///< Where the entry that continues the method starts
++        ParkedMacro macro;
+     };
+     void ResolveSplitMethod(GPUVAddr entry_address);
+     static constexpr size_t MaxParkedMethods = 16;
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index 34b195e..9c2ff66 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -152,6 +152,9 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
+         if (!native_executing_macro) {
+             if (method & 1) { LOG_ERROR(HW_GPU, "Native compute macro starts on argument method"); return true; }
+             native_executing_macro = method;
++        } else if ((method % 2) == 0 && *native_executing_macro != method) {
++            native_parameters.clear();
++            native_executing_macro = method;
+         }
+         native_parameters.push_back(argument);
+         if (!is_last_call) return true;
+@@ -282,6 +285,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
+         native_parameters.clear();
+         return true;
+     }
++    if (native_executing_macro) {
++        LOG_WARNING(HW_GPU, "Non-macro compute method {:#x} while macro {:#x} active - resetting", method, *native_executing_macro);
++        native_executing_macro.reset();
++        native_parameters.clear();
++    }
+     native_registers[method] = argument;
+     if (method == 0x6c3) { // SET_REPORT_SEMAPHORE_D: the compute class's semaphore release
+         ProcessNativeReportSemaphore(argument);
+@@ -1152,7 +1160,13 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         // without this it gives way to a B10G11R11 image its handle scan doesn't list.
+         // A same-size pair keeps its input too: the frame it reads is drawn, not filled by
+         // rejected passes, and another image of that size is as likely the network's own output.
+-        static const bool keep_drawn_frame = std::getenv("EDEN_NX2_UPSCALE_KEEP_FRAME") != nullptr;
++        static const bool keep_drawn_frame = [] {
++            const char* const value = std::getenv("EDEN_NX2_UPSCALE_KEEP_FRAME");
++            if (value != nullptr) {
++                return value[0] != '0';
++            }
++            return Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
++        }();
+         const bool keep_input =
+             same_size_pair ||
+             (keep_drawn_frame && input && input->format == Texture::TextureFormat::E5B9G9R9);
+@@ -1751,6 +1765,9 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
+                 return;
+             }
+             fs.executing_macro = method;
++        } else if ((method % 2) == 0 && *fs.executing_macro != method) {
++            fs.parameters.clear();
++            fs.executing_macro = method;
+         }
+         fs.parameters.push_back(argument);
+         if (is_last_call) {
+@@ -1758,6 +1775,11 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
+         }
+         return;
+     }
++    if (fs.executing_macro) {
++        LOG_WARNING(HW_GPU, "Non-macro compute method {:#x} while macro {:#x} active - resetting", method, *fs.executing_macro);
++        fs.executing_macro.reset();
++        fs.parameters.clear();
++    }
+     if (FrontDropsWrite(fs, method, argument)) {
+         return;
+     }
+@@ -1816,6 +1838,11 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
+         }
+         return;
+     }
++    if (fs.executing_macro) {
++        LOG_WARNING(HW_GPU, "Non-macro compute multi-method {:#x} while macro {:#x} active - resetting", method, *fs.executing_macro);
++        fs.executing_macro.reset();
++        fs.parameters.clear();
++    }
+     if (method < fs.registers.size()) {
+         for (u32 i = 0; i < amount; ++i) {
+             FrontApply(fs, method, base_start[i]);
+@@ -1869,4 +1896,36 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
+     }
+ }
+ 
++void KeplerCompute::ParkMacro(u32& out_macro, std::vector<u32>& out_params) {
++    if (front) {
++        out_macro = front->executing_macro.value_or(0);
++        out_params = std::move(front->parameters);
++        front->executing_macro.reset();
++        front->parameters.clear();
++    } else {
++        out_macro = native_executing_macro.value_or(0);
++        out_params = std::move(native_parameters);
++        native_executing_macro.reset();
++        native_parameters.clear();
++    }
++}
++
++void KeplerCompute::ResumeMacro(u32 in_macro, const std::vector<u32>& in_params) {
++    if (front) {
++        if (in_macro != 0) {
++            front->executing_macro = in_macro;
++        } else {
++            front->executing_macro.reset();
++        }
++        front->parameters = in_params;
++    } else {
++        if (in_macro != 0) {
++            native_executing_macro = in_macro;
++        } else {
++            native_executing_macro.reset();
++        }
++        native_parameters = in_params;
++    }
++}
++
+ } // namespace Tegra::Engines
+diff --git a/src/video_core/engines/kepler_compute.h b/src/video_core/engines/kepler_compute.h
+index 19cdf5c..c348fae 100644
+--- a/src/video_core/engines/kepler_compute.h
++++ b/src/video_core/engines/kepler_compute.h
+@@ -274,6 +274,8 @@ public:
+     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                               const u32* base_start, u32 amount, u32 methods_pending,
+                               const GPUVAddr* segment);
++    void ParkMacro(u32& out_macro, std::vector<u32>& out_params);
++    void ResumeMacro(u32 in_macro, const std::vector<u32>& in_params);
+ 
+ private:
+     struct FrontState;
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index ae9c92d..4b6994a 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -226,10 +226,15 @@ bool Maxwell3D::IsMethodExecutable(u32 method) {
+ }
+ 
+ void Maxwell3D::ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call) {
+-    if (executing_macro == 0) {
+-        // A macro call must begin by writing the macro method's register, not its argument.
+-        ASSERT((method % 2) == 0 && "Can't start macro execution by writing to the ARGS register");
++    if ((method % 2) == 0) {
++        if (executing_macro != 0 && executing_macro != method) {
++            macro_params.clear();
++            macro_segments.clear();
++        }
+         executing_macro = method;
++    } else if (executing_macro == 0) {
++        LOG_ERROR(HW_GPU, "Can't send macro parameters to {:#x} without active macro", method);
++        return;
+     }
+ 
+     macro_segments.emplace_back(current_dma_segment, amount);
+@@ -509,8 +514,11 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
+     if (executing_macro != 0 && method != executing_macro + 1) {
+         DumpRecentWrites(method);
+     }
+-    if (executing_macro != 0) {
+-        ASSERT(method == executing_macro + 1);
++    if (executing_macro != 0 && method < MacroRegistersStart) {
++        DumpRecentWrites(method);
++        executing_macro = 0;
++        macro_params.clear();
++        macro_segments.clear();
+     }
+     RecordWrite(method, method_argument, 1, is_last_call ? 1 : 2);
+ 
+@@ -1160,8 +1168,14 @@ void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& spl
+                                 u32 argument, bool is_last_call) {
+     auto& fs = Front(system, split);
+     if (method >= MacroRegistersStart) {
+-        if (fs.executing_macro == 0) {
++        if ((method % 2) == 0) {
++            if (fs.executing_macro != 0 && fs.executing_macro != method) {
++                fs.parameters.clear();
++            }
+             fs.executing_macro = method;
++        } else if (fs.executing_macro == 0) {
++            LOG_ERROR(HW_GPU, "Can't send macro parameters to {:#x} without active macro", method);
++            return;
+         }
+         fs.parameters.push_back(argument);
+         if (is_last_call) {
+@@ -1169,6 +1183,11 @@ void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& spl
+         }
+         return;
+     }
++    if (fs.executing_macro != 0) {
++        LOG_WARNING(HW_GPU, "Non-macro method {:#x} received while macro {:#x} active - resetting", method, fs.executing_macro);
++        fs.executing_macro = 0;
++        fs.parameters.clear();
++    }
+     FrontWrite(split, fs, method, argument, is_last_call, false);
+ }
+ 
+@@ -1177,8 +1196,14 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+                                      u32 methods_pending) {
+     auto& fs = Front(system, split);
+     if (method >= MacroRegistersStart) {
+-        if (fs.executing_macro == 0) {
++        if ((method % 2) == 0) {
++            if (fs.executing_macro != 0 && fs.executing_macro != method) {
++                fs.parameters.clear();
++            }
+             fs.executing_macro = method;
++        } else if (fs.executing_macro == 0) {
++            LOG_ERROR(HW_GPU, "Can't send macro parameters to {:#x} without active macro", method);
++            return;
+         }
+         fs.parameters.insert(fs.parameters.end(), base_start, base_start + amount);
+         if (amount == methods_pending) {
+@@ -1186,6 +1211,11 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+         }
+         return;
+     }
++    if (fs.executing_macro != 0) {
++        LOG_WARNING(HW_GPU, "Non-macro multi-method {:#x} received while macro {:#x} active - resetting", method, fs.executing_macro);
++        fs.executing_macro = 0;
++        fs.parameters.clear();
++    }
+     // What CallMultiMethod does to the registers on the back, then one entry for all the words.
+     constexpr u32 cb_data = MAXWELL3D_REG_INDEX(const_buffer.buffer);
+     const auto tracked = [&fs] {
+@@ -1293,6 +1323,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+             });
+         if (!result.success) {
+             engine.native_execution_failed = true;
++            fs.draw_pending = false;
+             // fs.parameters still holds the call's words (the JIT reads them in place); words a
+             // MME_DMA_READ_FIFOED appended during the call follow them.
+             LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}{}",
+@@ -1431,4 +1462,22 @@ void Maxwell3D::FinishFrontMacro(Core::System& system) {
+     draw_manager.DrawDeferred(*this);
+ }
+ 
++void Maxwell3D::ParkMacro(ParkedMacro& parked) {
++    if (front) {
++        parked.method = std::exchange(front->executing_macro, 0);
++        parked.parameters.swap(front->parameters);
++    } else {
++        parked.Take(executing_macro, macro_params, macro_segments, current_macro_dirty);
++    }
++}
++
++void Maxwell3D::ResumeMacro(ParkedMacro&& parked) {
++    if (front) {
++        front->executing_macro = parked.method;
++        front->parameters = std::move(parked.parameters);
++    } else {
++        std::move(parked).Restore(executing_macro, macro_params, macro_segments, current_macro_dirty);
++    }
++}
++
+ } // namespace Tegra::Engines
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index aba49b5..1c68164 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -26,6 +26,7 @@
+ #include "video_core/engines/engine_upload.h"
+ #include "video_core/gpu.h"
+ #include "video_core/macro.h"
++#include "video_core/split_macro_state.h"
+ #include "video_core/textures/texture.h"
+ #include "video_core/engines/maxwell_3d.h"
+ 
+@@ -3214,6 +3215,8 @@ public:
+                          u32 argument, bool is_last_call);
+     void FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+                               const u32* base_start, u32 amount, u32 methods_pending);
++    void ParkMacro(ParkedMacro& parked);
++    void ResumeMacro(ParkedMacro&& parked);
+ 
+     bool ShouldExecute() const {
+         return execute_on;
+diff --git a/src/video_core/page_filter.h b/src/video_core/page_filter.h
+index b698489..dde14a2 100644
+--- a/src/video_core/page_filter.h
++++ b/src/video_core/page_filter.h
+@@ -9,6 +9,7 @@
+ #include <memory>
+ 
+ #include "common/common_types.h"
++#include "common/settings.h"
+ 
+ namespace VideoCommon {
+ 
+@@ -22,7 +23,10 @@ namespace VideoCommon {
+ inline bool InvalidationFilterEnabled() {
+     static const bool enabled = [] {
+         const char* const value = std::getenv("EDEN_NX2_INVALIDATION_FILTER");
+-        return value != nullptr && value[0] != '0';
++        if (value != nullptr) {
++            return value[0] != '0';
++        }
++        return Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
+     }();
+     return enabled;
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index abcf729..663eb99 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -2231,11 +2231,17 @@ void RasterizerVulkan::FlushWork() {
+         constexpr u32 fallback = 128;
+         const char* value = std::getenv("EDEN_NX2_FLUSH_DRAWS");
+         if (value == nullptr || value[0] < '0' || value[0] > '9') {
++            if (Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL) {
++                return 4096U;
++            }
+             return fallback;
+         }
+         char* end = nullptr;
+         const unsigned long parsed = std::strtoul(value, &end, 10);
+         if (*end != '\0' || parsed == 0) {
++            if (Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL) {
++                return 4096U;
++            }
+             return fallback;
+         }
+         return static_cast<u32>(std::clamp(parsed, 32UL, 1'048'576UL));
+diff --git a/src/video_core/split_macro_state.h b/src/video_core/split_macro_state.h
+new file mode 100644
+index 0000000..8a3158d
+--- /dev/null
++++ b/src/video_core/split_macro_state.h
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++
++#include <cstddef>
++#include <span>
++#include <utility>
++#include <vector>
++
++#include "common/common_types.h"
++
++namespace Tegra {
++
++struct ParkedMacro {
++    using Segments = std::vector<std::pair<u64, std::size_t>>;
++
++    u32 method{};
++    std::vector<u32> parameters;
++    Segments segments;
++    bool dirty{};
++
++    void Take(u32& active, std::vector<u32>& args, Segments& reads, bool& needs_refresh) {
++        method = std::exchange(active, 0);
++        parameters.swap(args);
++        segments.swap(reads);
++        dirty = std::exchange(needs_refresh, false);
++    }
++
++    void Restore(u32& active, std::vector<u32>& args, Segments& reads, bool& needs_refresh) && {
++        active = method;
++        args = std::move(parameters);
++        reads = std::move(segments);
++        needs_refresh = dirty;
++    }
++};
++
++inline bool ReadsAsCommands(std::span<const u32> words, size_t entry_words, size_t skip) {
++    size_t i = skip;
++    while (i < words.size()) {
++        const u32 header = words[i];
++        const size_t count = (header >> 16) & 0x1fff;
++        switch (header >> 29) {
++        case 1: // Increasing
++        case 3: // NonIncreasing
++        case 5: // IncreaseOnce
++            if (i + 1 + count > entry_words + 64) {
++                return false; // a count no split explains: data read as a header
++            }
++            i += 1 + count;
++            break;
++        case 4: // Inline: the data is in the header
++            ++i;
++            break;
++        default:
++            return false; // IncreasingOld, NonIncreasingOld and the unused modes: ProcessCommands drops them
++        }
++    }
++    return true; // data to the end of the window is a continuation too
++}
++
++inline bool SplitReadsAsContinuation(std::span<const u32> words, std::size_t entry_words,
++                                      u32 pending_words) {
++    return ReadsAsCommands(words, entry_words, pending_words) ||
++           !ReadsAsCommands(words, entry_words, 0);
++}
++
++} // namespace Tegra
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 9b3fc72..0ae347b 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -3555,7 +3555,10 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+     // EDEN_NX2_SKIP_OVERWRITTEN_UPLOADS=1 (Lichii PR 288, off unless asked for).
+     static const bool skip_overwritten_uploads = [] {
+         const char* const value = std::getenv("EDEN_NX2_SKIP_OVERWRITTEN_UPLOADS");
+-        return value != nullptr && value[0] == '1';
++        if (value != nullptr) {
++            return value[0] == '1';
++        }
++        return Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
+     }();
+     size_t first_copy = 0;
+     bool copied_whole = false;

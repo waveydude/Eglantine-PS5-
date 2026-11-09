@@ -95,31 +95,49 @@
             }
         }
     };
-    const auto UsePrefetched = [&](ImageId id, Image& image) {
+    const auto PublishEviction = [&](Image& image, const auto& map, const auto& copies) {
+        auto publish = [&] {
+            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies,
+                         map.mapped_span, swizzle_data_buffer);
+        };
+#ifdef PS5_NATIVE
+        if (gpu_memory->UsesNativeTiling() && image.info.type != ImageType::Linear) {
+            // A contiguous address is not necessarily backed by writable CRAM. Pin the backing
+            // through the copy, or keep the dirty image when any part is unavailable.
+            auto* const destination = gpu_memory->GetSpan(image.gpu_addr, image.guest_size_bytes);
+            if (destination == nullptr) return false;
+            return eden_try_resident_guest_write(
+                destination, image.guest_size_bytes,
+                [](void* context) { (*static_cast<decltype(publish)*>(context))(); }, &publish);
+        }
+#endif
+        publish();
+        return true;
+    };
+    const auto UsePrefetched = [&](ImageId id, Image& image) -> std::optional<bool> {
         if constexpr (std::is_same_v<Runtime, Vulkan::TextureCacheRuntime>) {
             const auto it = std::ranges::find_if(gc_downloads, [id](const auto& entry) {
                 return entry.first == id;
             });
             if (it != gc_downloads.end()) {
                 const auto copies = FullDownloadCopies(image.info);
-                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies,
-                             it->second.mapped_span, swizzle_data_buffer);
+                const bool published = PublishEviction(image, it->second, copies);
                 runtime.FreeDeferredStagingBuffer(it->second);
                 gc_downloads.erase(it);
-                return true;
+                return published;
             }
         }
-        return false;
+        return std::nullopt;
     };
     // The copy of an image Cleanup is about to free: from the batch, and when the batch is used
     // up and this image came after it (the batch was full, or the lookahead had stopped), from a
     // new batch that starts here. Without that every image after the first batch waited alone.
-    const auto TakePrefetched = [&](ImageId id, Image& image) {
-        if (UsePrefetched(id, image)) return true;
+    const auto TakePrefetched = [&](ImageId id, Image& image) -> std::optional<bool> {
+        if (auto result = UsePrefetched(id, image); result.has_value()) return result;
         if constexpr (std::is_same_v<Runtime, Vulkan::TextureCacheRuntime>) {
-            if (!gc_downloads.empty()) return false;
+            if (!gc_downloads.empty()) return std::nullopt;
             PrefetchDownloads();
             return UsePrefetched(id, image);
         }
-        return false;
+        return std::nullopt;
     };

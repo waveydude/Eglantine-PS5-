@@ -1281,7 +1281,10 @@ cleanup_capture = gc[cleanup_begin:cleanup_end]
 for old, new in [
     (cleanup_capture,
      gc_setup + '\n    const auto Cleanup = [&, this]'),
-    ('        if (must_download) {', '        if (must_download && !TakePrefetched(image_id, image)) {'),
+    ('        if (must_download) {',
+     '        const auto prefetched = must_download ? TakePrefetched(image_id, image) : std::nullopt;\n'
+     '        if (prefetched.has_value() && !*prefetched) return false;\n'
+     '        if (must_download && !prefetched.has_value()) {'),
     # A refused staging buffer leaves the image where it is: it is not deleted, nothing is lost.
     ('            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);\n',
      '            auto staged = [&] {\n'
@@ -1304,7 +1307,7 @@ for old, new in [
      '                    ::Eden::Performance::gc_unbatched_drain, 1);\n'
      '                runtime.Finish();\n'
      '            }\n'
-     '            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);'),
+     '            if (!PublishEviction(image, map, copies)) return false;'),
     # Copying a dirty image out needs a staging buffer and a scratch buffer of its size, and its bytes
     # then land in guest memory: on a pool the CPU shares, evicting a large one takes more than it gives
     # (Ocarina of Time's 288 MiB depth image: 576 MiB more at that moment, 288 MiB for good).
@@ -1369,7 +1372,10 @@ for signature, index in (
     texture_costs.append((anchor, anchor + scope))
 adapt('src/video_core/texture_cache/texture_cache.h',
       'vulkan-cache/video_core/texture_cache/texture_cache.h', [
-    ('namespace VideoCommon {', '#include "performance.h"\n#include "common/scope_exit.h"\nnamespace Vulkan { class TextureCacheRuntime; }\n\nnamespace VideoCommon {'),
+    ('namespace VideoCommon {', '#include "performance.h"\n#include "common/scope_exit.h"\n'
+     '#ifdef PS5_NATIVE\n'
+     'extern "C" bool eden_try_resident_guest_write(void*, std::size_t, void (*)(void*), void*);\n'
+     '#endif\nnamespace Vulkan { class TextureCacheRuntime; }\n\nnamespace VideoCommon {'),
     ('    // If we can obtain the memory info, use it instead of the estimate.\n    if (runtime.CanReportMemoryUsage()) {',
      "    // The console: the images' own memory (performance.h texture_usage_from_images), the figure\n    // Eden keeps itself when the driver gives none, set right every 300 frames from the images there\n    // are (scaled ones hold their original too, as the collector counts them).\n    const bool from_images = std::is_same_v<Runtime, Vulkan::TextureCacheRuntime> &&\n                             ::Eden::Performance::texture_usage_from_images.load(std::memory_order_relaxed);\n    if (from_images && frame_tick % 300 == 0) {\n        u64 held = 0;\n        for (const auto [image_id, image] : slot_images) {\n            held += ImageMemoryBytes(*image) + (image->HasScaled() ? GetScaledImageSizeBytes(*image) : 0);\n        }\n        total_used_memory = held;\n    }\n    // If we can obtain the memory info, use it instead of the estimate.\n    if (runtime.CanReportMemoryUsage() && !from_images) {"),
     (download_prefix, download_prefix + (port / 'vulkan_download_batch.inc').read_text() + '\n'),

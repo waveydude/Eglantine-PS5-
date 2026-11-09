@@ -907,6 +907,39 @@ void Refused(std::uintptr_t address, unsigned why, std::uint8_t state) noexcept 
 }
 } // namespace
 
+// Optional GPU writeback must leave the image resident if guest backing cannot be pinned.
+extern "C" bool eden_try_resident_guest_write(void* destination, std::size_t bytes,
+                                              void (*write)(void*), void* context) {
+    const auto address = reinterpret_cast<std::uintptr_t>(destination);
+    SparseRange* const range = WriteRangeOf(address);
+    if (range == nullptr || bytes == 0) {
+        write(context);
+        return true;
+    }
+    if (bytes > range->end - address) return false;
+
+    const auto base = range->begin.load(std::memory_order_relaxed);
+    const std::size_t first = (address - base) / SparseSlot;
+    const std::size_t last = (address - base + bytes - 1) / SparseSlot;
+    struct Pins {
+        SparseRange& range;
+        std::size_t first;
+        std::size_t end;
+        ~Pins() {
+            while (end != first) UnlockSlot(range, --end, SlotOwn);
+        }
+    } pins{*range, first, first};
+    for (; pins.end <= last; ++pins.end) {
+        std::uint8_t expected = SlotOwn;
+        if (!range->state[pins.end].compare_exchange_strong(
+                expected, SlotOwn | SlotLock, std::memory_order_acquire, std::memory_order_relaxed)) {
+            return false;
+        }
+    }
+    write(context);
+    return true;
+}
+
 // The last write the service refused (headless/crash_report.cpp): its address, 0 for none.
 extern "C" std::uintptr_t eden_guest_write_refused(unsigned* why, unsigned* state) noexcept {
     const std::uintptr_t address = refused_address.load(std::memory_order_acquire);
@@ -1580,6 +1613,7 @@ void SwapReport(SparseRange& range) noexcept {
         swap_pool_largest.load(std::memory_order_relaxed) >> 20);
     if (length > 0) Report(line);
     if (swap_mode.load(std::memory_order_relaxed) == 3) {
+#ifdef PS5_NATIVE
         char pack[160];
         const int packed_length = std::snprintf(pack, sizeof(pack),
                                                 "EDEN_SWAP_PACK slots=%zu held=%zuMiB not_worth=%llu in_place=%llu tail_refused=%llu\n",
@@ -1588,6 +1622,7 @@ void SwapReport(SparseRange& range) noexcept {
                                                 (unsigned long long)packed_in_place.load(std::memory_order_relaxed),
                                                 (unsigned long long)pack_tail_refused.load(std::memory_order_relaxed));
         if (packed_length > 0) Report(pack);
+#endif
     }
 }
 
