@@ -1,0 +1,44 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Descriptor tables: a pool limit past 2^20 entries is ignored (garbage after a desync asked for 80 GB)
+
+crash-20261109-123053 (Ocarina, 125 s): DescriptorTable<TSCEntry>::Refresh sized the table for a garbage limit
+(Direct allocation failed: 85920317440 bytes) and std::bad_alloc ended the session from a noexcept function.
+---
+diff --git a/src/video_core/texture_cache/descriptor_table.h b/src/video_core/texture_cache/descriptor_table.h
+--- a/src/video_core/texture_cache/descriptor_table.h
++++ b/src/video_core/texture_cache/descriptor_table.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <algorithm>
+ #include <bit>
+ #include <cstdlib>
+@@ -17,6 +18,7 @@
+ #include "common/div_ceil.h"
+ #include "common/assert.h"
+ #include "core/memory.h"
++#include "common/logging.h"
+ #include "video_core/memory_manager.h"
+ #include "video_core/rasterizer_interface.h"
+ 
+@@ -70,6 +72,18 @@
+     }
+ 
+     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
++        // A pool limit past 2^20 entries is garbage register state (a desynced command stream):
++        // sizing the table for it asked for 80 GB and ended the session (Ocarina, 125 s,
++        // crash-20261109-123053, std::bad_alloc in a noexcept Refresh). Keep the table as it was.
++        constexpr u32 MaxLimit = 0xFFFFF;
++        if (limit > MaxLimit) [[unlikely]] {
++            static std::atomic<u32> reported{};
++            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
++                LOG_ERROR(HW_GPU, "Descriptor pool at {:#x} with limit {:#x} (over {:#x}): ignored",
++                          gpu_addr, limit, MaxLimit);
++            }
++            return;
++        }
+         current_gpu_addr = gpu_addr;
+         current_limit = limit;
+         // EDEN_NX2_TIGHT_DESCRIPTOR_TABLES=1: round up geometrically. Growth stays amortized without
