@@ -453,6 +453,7 @@ extern "C" void eden_heap_name_thread(const char* name) __attribute__((weak));
 extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
 extern "C" void eden_guest_memory_report(void) __attribute__((weak));
+extern "C" std::size_t eden_guest_memory_reclaim(std::size_t want) __attribute__((weak));
 extern "C" void eden_guest_memory_pool_short(int is_short) __attribute__((weak));
 extern "C" void eden_guest_memory_waits(unsigned long long* won, unsigned long long* lost,
                                         unsigned long long* refused) __attribute__((weak));
@@ -529,11 +530,11 @@ struct MemorySummaryNumbers {
     std::size_t largest{};
     bool memory_short{};
 };
-static void QueueOffThreadReport(bool report, bool trim, MemorySummaryNumbers summary = {}) {
+static void QueueOffThreadReport(bool report, bool trim, MemorySummaryNumbers summary = {}, bool reclaim = false) {
     struct Pending {
         std::mutex mutex;
         std::condition_variable changed;
-        bool report{}, trim{}, started{};
+        bool report{}, trim{}, reclaim{}, started{};
         MemorySummaryNumbers summary;
     };
     static Pending* const pending = new Pending;  // outlives every static destructor
@@ -541,27 +542,39 @@ static void QueueOffThreadReport(bool report, bool trim, MemorySummaryNumbers su
         std::scoped_lock lock{pending->mutex};
         pending->report |= report;
         pending->trim |= trim;
+        pending->reclaim |= reclaim;
         if (summary.due) pending->summary = summary;
         if (!pending->started) {
             pending->started = true;
             std::thread([] {
                 RegisterWorker("MemoryReport");
                 for (;;) {
-                    bool do_report, do_trim;
+                    bool do_report, do_trim, do_reclaim;
                     MemorySummaryNumbers do_summary;
                     {
                         std::unique_lock lock{pending->mutex};
                         pending->changed.wait(lock, [] {
-                            return pending->report || pending->trim || pending->summary.due;
+                            return pending->report || pending->trim || pending->reclaim || pending->summary.due;
                         });
                         do_report = pending->report;
                         do_trim = pending->trim;
+                        do_reclaim = pending->reclaim;
                         do_summary = pending->summary;
-                        pending->report = pending->trim = false;
+                        pending->report = pending->trim = pending->reclaim = false;
                         pending->summary = {};
                     }
                     if (do_report && eden_guest_memory_report) eden_guest_memory_report();
                     if (do_trim) TrimHeap("the pool is short");
+                    if (do_reclaim && eden_guest_memory_reclaim) {
+                        // Cold guest memory goes out before the pool is empty, not after a refusal:
+                        // the driver's own allocations (command buffers, Ocarina 85 s) fail without
+                        // ever reaching the refusal path that would have done this.
+                        const std::size_t freed = eden_guest_memory_reclaim(std::size_t{512} << 20);
+                        static std::atomic<unsigned> logged{0};
+                        if (logged.fetch_add(1, std::memory_order_relaxed) < 64)
+                            std::fprintf(stderr, "EDEN_EARLY_RECLAIM %zu MiB of cold guest memory went out (pool short)\n",
+                                         freed >> 20);
+                    }
                     if (do_summary.due) WriteMemorySummary(do_summary.largest, do_summary.memory_short);
                 }
             }).detach();
@@ -653,6 +666,19 @@ static void RefreshFreeMemory() {
     // every slot of the guest's memory: with the pool short, run108 had a 120 to 134 ms frame in
     // nearly every 5 s window where the clean stretch had 44 to 52 ms, and the frame rate fell from
     // 27 to 19 to 24. Off: as before, on the calling thread.
+    // EDEN_NX2_EARLY_RECLAIM=0 turns this off. While the pool's largest block is under the short mark,
+    // cold guest memory is swapped out every 2 s on the report thread (never on this one: a reclaim
+    // compresses up to 512 MiB). Needs EDEN_GUEST_SWAP=2/3 and EDEN_GUEST_SWAP_RECLAIM=1.
+    static const bool early_reclaim = [] {
+        const char* const value = std::getenv("EDEN_NX2_EARLY_RECLAIM");
+        return value == nullptr || value[0] != '0';
+    }();
+    static std::atomic<long long> reclaimed_ns{0};
+    if (early_reclaim && known && pool_short.load(std::memory_order_relaxed) && eden_guest_memory_reclaim &&
+        now - reclaimed_ns.load(std::memory_order_relaxed) >= 2'000'000'000) {
+        reclaimed_ns.store(now, std::memory_order_relaxed);
+        QueueOffThreadReport(false, false, {}, true);
+    }
     if (burst_due || trim_due) {
         if (OffThreadReportsEnabled()) {
             QueueOffThreadReport(burst_due, trim_due);
