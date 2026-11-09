@@ -6,9 +6,10 @@ The global `env.txt` (presets/ocarina-arena-reuse/env.txt) is unchanged and stil
 | File | Frame wait | Use |
 |---|---|---|
 | `env-0400486024dec000.stable.txt` | `EDEN_UP_OOT_FRAME_WAIT=1` (full: the guest waits for this frame's GPU fence) | first test, correctness baseline |
+| `env-0400486024dec000.stable-profile.txt` | full wait, plus `EDEN_NX2_GPU_PROFILE=1` | second run, to measure where GPU-thread time goes (eden_log: "GPU thread per second" every 10 s); small overhead |
 | `env-0400486024dec000.fast.txt` | `EDEN_UP_OOT_FRAME_CAP=1`, `_CAP_MS=30` (waits at most 30 ms for this frame, then only for the previous one) | experimental; upstream reports flashes come back with it |
 
-Both keep the six lines of the deployed title preset and add, by group (delete a group's lines to turn it off):
+All keep the six lines of the deployed title preset and add, by group (delete a group's lines to turn it off):
 
 - Parser: `EDEN_NX2_DESYNC_FIX=1` (keep the submit copy of a list the game reshaped after a semaphore wait),
   `EDEN_NX2_BAD_COND_SKIP=1` (already the Ocarina default in this build; written out so it is visible).
@@ -21,3 +22,6 @@ suggests SWAP_AHEAD 2048 on firmware 13.x only if the Deku Tree load freezes. `m
 `EDEN_NX2_AREA_EVICT=40` (Test 2's image eviction after area loads) to append only if memory runs short.
 
 All switches are read once at start. Removing a line restores the previous behaviour of that part.
+
+JIT: `EDEN_JIT_TABLE=0` and `EDEN_JIT_PAGE_REUSE=0` are written out. The playable ocarina-pipeline-oom build ran both off
+(no default in its main(), no line in env.txt); the 109 s crash build had both compiled on.
