@@ -14,6 +14,12 @@ active = {line.split(': ', 1)[0] for line in ninja('targets', 'all').splitlines(
 headers = ('network/packet.h', 'network/room_member.h',
            'core/internal_network/sockets.h', 'core/internal_network/socket_proxy.h',
            'core/hle/service/sockets/bsd.h')
+# headless/multiplayer_packets.cmake rewrites socket_proxy.h / bsd.h only for cores that do not harden
+# the room sockets themselves (no AcceptsProxyPacket); newer cores keep their own, and objects then
+# include the originals by design. Same probe as the CMake file.
+proxy = build.parent / 'source/src/core/internal_network/socket_proxy.h'
+if proxy.is_file() and 'AcceptsProxyPacket' in proxy.read_text():
+    headers = headers[:3]
 seen = dict.fromkeys(headers, 0)
 wrong, target = [], None
 for line in ninja('deps').splitlines():
