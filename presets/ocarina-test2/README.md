@@ -1,5 +1,13 @@
 # Ocarina of Time (0400486024DEC000) presets for the Test 2 integration build
 
+**Use `env-0400486024dec000.boot-safe.txt` first.** The stable preset hung at boot on 8 Nov (run 1: the GPU
+thread never processed the first command lists; no present, no resume). Boot-safe is the previously working
+runtime set (the six deployed lines) plus the crash fixes that cannot act before the first resume or draw
+(DESYNC_FIX, BAD_COND_SKIP), JIT off, and EDEN_NX2_GPU_PROFILE=1 so a stall names the GPU thread's zone.
+It leaves out EDEN_UP_AM_THREADS (prime suspect: it moves nx2:gsv/syncpt sessions onto three host threads at
+boot) and the rest of the movie group, and EDEN_UP_OOT_FRAME_WAIT (upstream runs it only with AM_THREADS;
+without them a present waiting for its fence blocks the only service thread).
+
 Copy ONE of these to the console as `env-0400486024dec000.txt` (next to the currently installed one).
 The global `env.txt` (presets/ocarina-arena-reuse/env.txt) is unchanged and still applies.
 
