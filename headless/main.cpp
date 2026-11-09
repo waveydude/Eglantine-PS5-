@@ -574,7 +574,9 @@ int main(int argc, char** argv) {
                                           std::pair{"EDEN_PS5_READ_SPIN_US", "300"},
                                           std::pair{"EDEN_PS5_GPU_SPIN_US", "300"},
                                           std::pair{"EDEN_PS5_WORKER_SPIN_US", "300"},
-                                          std::pair{"EDEN_NX2_UNBACKED_LIMIT", "0"}}) {
+                                          std::pair{"EDEN_NX2_UNBACKED_LIMIT", "0"},
+                                          std::pair{"EDEN_JIT_TABLE", "1"},
+                                          std::pair{"EDEN_JIT_PAGE_REUSE", "1"}}) {
             setenv(name, value, 0);
         }
         // Nearby A64 accesses share one page lookup (headless/dynarmic/page-reuse.cmake). The pass
