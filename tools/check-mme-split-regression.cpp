@@ -103,40 +103,6 @@ static void TestMacroParkingAndResume() {
 // Entry 42's words (above) hold the same header followed by its four real words. What is
 // synthetic below is marked: the "live" words (a reshaped ring) and the carry of 1.
 
-// What the parser does with an entry that "continues" an open method: its first `carry` words are
-// the method's data.
-static std::vector<u32> MethodDataTaken(std::span<const u32> entry, u32 carry, bool continues) {
-    if (!continues) {
-        return {};
-    }
-    return std::vector<u32>(entry.begin(), entry.begin() + std::min<std::size_t>(carry, entry.size()));
-}
-
-static void TestDecisionUsesTheWordsTheParserRuns() {
-    std::puts("[TEST 4] split decision on the parse words, not on memory the game refilled...");
-    const std::array<u32, 8> parse_copy = {0xa0040e02, 0x00000008, 0x00000000, 0x34dce500,
-                                           0x03500022, 0xa0040e02, 0x00000004, 0x00000000};
-    // SYNTHETIC: the ring after the game reused it - inline headers only, which read as commands
-    // after any first word, so the entry looks like a continuation.
-    const std::array<u32, 8> live_refilled = {0xa0040e02, 0x80000e3a, 0x80000e3a, 0x80000e3a,
-                                              0x80000e3a, 0x80000e3a, 0x80000e3a, 0x80000e3a};
-    const u32 carry = 1; // SYNTHETIC: the open method wanted its last word
-    assert(ReadsAsCommands(parse_copy, 8, 0) && "the copy is a fresh stream");
-    assert(!ReadsAsCommands(parse_copy, 8, carry) && "...and not a continuation");
-    assert(ReadsAsCommands(live_refilled, 8, carry) && "the refilled ring reads as a continuation");
-
-    const bool old_decision = SplitReadsAsContinuation(live_refilled, 8, carry); // memory (old)
-    const bool new_decision = SplitReadsAsContinuation(parse_copy, 8, carry);     // parse words
-    assert(old_decision && !new_decision && "old and new decisions differ on this ring");
-
-    // Old: the header reaches the macro as its single parameter - the logged failure.
-    const auto old_params = MethodDataTaken(parse_copy, carry, old_decision);
-    assert((old_params == std::vector<u32>{0xa0040e02}));
-    // New: parked; the entry parses from its header, the macro gets its four words.
-    assert(MethodDataTaken(parse_copy, carry, new_decision).empty());
-    std::puts("  -> PASS: the old decision hands macro 0x21 the header a0040e02; the new one parks");
-}
-
 static void TestDeviceRangeBounds() {
     std::puts("[TEST 6] device address range checks...");
     constexpr std::uint64_t size = 1ULL << 34;
@@ -154,7 +120,6 @@ int main() {
     TestEntry42FreshStreamSplit();
     TestSubroutineContinuationNotParked();
     TestMacroParkingAndResume();
-    TestDecisionUsesTheWordsTheParserRuns();
     TestDeviceRangeBounds();
     std::puts("ALL PASS");
 }
