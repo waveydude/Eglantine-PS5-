@@ -138,6 +138,13 @@ int eden_heap_commit(void *address, size_t size); /* zeroed memory for a part of
 int eden_heap_decommit(void *address, size_t size);
 void *eden_heap_split_pages(size_t size);         /* a large block in pieces of memory; NULL: none */
 void eden_heap_split_pages_free(void *address, size_t size);
+/* The block kept for a big image (EDEN_BIG_IMAGE_RESERVE_MIB, headless/heap_pages.cpp): for a large
+ * block that found no single free range; NULL: no reserve, given out, or the wrong size. */
+void *eden_heap_reserve_pages(size_t size);
+void eden_heap_reserve_pages_free(void *address, size_t size);
+/* 1: a block of this size is of the reserve's class and may not be taken in pieces
+ * (EDEN_BIG_IMAGE_NO_SPLIT): the request fails instead. */
+int eden_heap_big_image_refuses(size_t size);
 
 static void *_Atomic eden_heap_slots[EDEN_HEAP_SLOTS]; /* arena mspace owning each slot */
 static void *eden_heap_arena_list[EDEN_HEAP_MAX_ARENAS]; /* NULL: given back, free for a new one */
@@ -439,7 +446,15 @@ static void *eden_heap_large_allocate(size_t bytes) {
     void *block = eden_heap_pages(bytes);
     int split = 0;
     if (block == NULL) {
-      /* No free piece of the pool that large: memory in smaller pieces behind one range. */
+      /* No free piece of the pool that large: the block kept for a big image, when there is one
+       * and the request is its size (EDEN_BIG_IMAGE_RESERVE_MIB). */
+      block = eden_heap_reserve_pages(bytes);
+      if (block != NULL)
+        split = 2;
+    }
+    if (block == NULL && !eden_heap_big_image_refuses(bytes)) {
+      /* Memory in smaller pieces behind one range; not for a big image's block that the reserve
+       * could not serve, with EDEN_BIG_IMAGE_NO_SPLIT (eden_heap_allocate gives up on it). */
       block = eden_heap_split_pages(bytes);
       split = 1;
     }
@@ -463,7 +478,9 @@ static void eden_heap_large_free(int entry) {
   /* The entry stops naming the address before the memory goes: the next large block may be
    * given the same address at once. */
   atomic_store_explicit(&eden_heap_large[entry].address, 1, memory_order_release);
-  if (eden_heap_large[entry].split)
+  if (eden_heap_large[entry].split == 2)
+    eden_heap_reserve_pages_free(block, bytes);
+  else if (eden_heap_large[entry].split)
     eden_heap_split_pages_free(block, bytes);
   else
     eden_heap_pages_free(block, bytes);
@@ -1744,6 +1761,12 @@ static void *eden_heap_allocate(size_t count, size_t size, int zero) {
     void *block = eden_heap_large_allocate(bytes);
     if (block != NULL)
       return block;
+    /* EDEN_BIG_IMAGE_NO_SPLIT: a big image's block the reserve could not serve is refused here
+     * too, not grown into the heap's spaces (pieces that stay for good). */
+    if (eden_heap_big_image_refuses(bytes)) {
+      eden_heap_note_failure(bytes, EDEN_HEAP_WHY_NO_MEMORY); /* eden_heap_record counts it */
+      return NULL;
+    }
   }
   if (bytes < EDEN_HEAP_SMALL_REQUEST) {
     void *address = eden_heap_arena_allocate(count, size, zero);

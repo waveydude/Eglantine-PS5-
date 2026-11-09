@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 04:30:00 +0100
+Subject: [PATCH] EDEN_NX2_AREA_EVICT=<frames>: after a burst of new images, delete images unused that long
+
+Off unless set. A burst of new images (EDEN_NX2_AREA_EVICT_BURST, 100 in 30 frames) is an
+area load; for the 120 frames after it, images unused for <frames> frames that need no copy
+back go, 64 a frame, before the pool runs dry. GPU-written images stay for the collector
+unless EDEN_NX2_AREA_EVICT_DIRTY=1. Lines: EDEN_AREA_EVICT in stderr.
+---
+ src/video_core/texture_cache/texture_cache.h      | 137 ++++++++++++++++++++
+ src/video_core/texture_cache/texture_cache_base.h |  15 +++
+ 2 files changed, 152 insertions(+)
+
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -142,6 +142,15 @@
+     u64 gc_download_deletes{}; ///< Evictions that downloaded the image first (a full GPU wait)
+     u64 async_decodes_queued{};
+     u64 images_created{};
++    u64 area_images_created{};  ///< Images created since the start (AreaEvict; never reset)
++    u64 area_created_seen{};    ///< Of them, counted into AreaEvict's window so far
++    u64 area_window_frame{};    ///< First frame of the window the burst is counted over
++    u64 area_window_created{};  ///< Images created in that window
++    u64 area_evict_until{};     ///< AreaEvict deletes stale images while frame_tick is under this
++    u64 area_bursts{};
++    u64 area_evicted_images{};  ///< This burst's totals (the done line)
++    u64 area_evicted_bytes{};
++    u64 area_dropped_images{};  ///< Of them, GPU-written images deleted without a copy
+     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
+     u64 uploaded_bytes{};    ///< Guest bytes those uploads read
+     u64 largest_upload{};    ///< Largest of them
+@@ -260,6 +269,11 @@
+     /// of a frame, with mutex held: nothing holds their views then. Needs no staging, which the
+     /// collector's dirty images do, and the collector has already taken what is older.
+     void CollectForBuffer(u64 wanted);
++
++    /// EDEN_NX2_AREA_EVICT=<frames>: after a burst of new images (an area load), deletes images
++    /// unused for that many frames that need no copy back, 64 a frame for 120 frames. At the end
++    /// of a frame, with mutex held, before the collector.
++    void AreaEvict();
+ 
+     /// Destroys the deleted images the GPU is done with, as TickFrame does. Mutex held.
+     void ReleaseFinished();
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -387,6 +387,142 @@
+     std::fprintf(stderr, "EDEN_BUFFER_REFUSED %zu images, %llu MiB, deleted for %llu MiB\n",
+                  clean.size(), static_cast<unsigned long long>(total >> 20),
+                  static_cast<unsigned long long>(wanted >> 20));
++}
++
++// EDEN_NX2_AREA_EVICT=<frames> (unset or 0: off, as before): when the game changes area, the
++// images of the area it left go before the pool runs dry. The collector keys on its marks and
++// on the pool's largest free block, and on the PS5 both can sit quiet until the pool is gone:
++// Ocarina of Time's New Game intro to Kokiri Forest held 3962 MiB of images against marks of
++// 4351 and 5119 MiB, with the largest free block at 1100 and 1036 MiB (over the 1 GiB "short"
++// mark) for 20 s and then 0 MiB four seconds later (crash-20261108-023138). 998 of those images,
++// 1700 MiB, had been unused for 10 frames or more.
++// The signal is a burst of new images: at least EDEN_NX2_AREA_EVICT_BURST (100) created within
++// 30 frames, which only a load does (0 to 12 images per 600 frames in that intro, 1962 in the
++// 600 frames of the forest load). For the 120 frames after a burst, images unused for <frames>
++// frames are deleted at the end of each frame, up to 64 a frame: only images the cache can
++// upload again from guest memory (nothing the GPU wrote still to copy back), so this needs no
++// staging buffer and no GPU wait, and nothing is lost; a CPU-decoded image is decoded again if
++// the new area needs it. An image the GPU wrote stays for the collector, which copies it back
++// first, unless EDEN_NX2_AREA_EVICT_DIRTY=1: then it goes without a copy, as the collector's
++// EDEN_NX2_TC_DOWNLOAD_MAX_MIB drops huge ones, and whatever the game reads from it before it
++// writes it again is lost. An image in use is touched every frame it is bound or sampled
++// (PrepareImage), so it is never <frames> old and never a candidate.
++// Lines in stderr: EDEN_AREA_EVICT burst/done, and one per frame with EDEN_NX2_TC_LOG.
++template <class P>
++void TextureCache<P>::AreaEvict() {
++    static const u64 age = [] {
++        const char* const value = std::getenv("EDEN_NX2_AREA_EVICT");
++        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
++    }();
++    if (age == 0) {
++        return;
++    }
++    static const u64 burst = [] {
++        const char* const value = std::getenv("EDEN_NX2_AREA_EVICT_BURST");
++        const u64 images = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
++        return images != 0 ? images : 100ULL;
++    }();
++    static const bool drop_dirty = [] {
++        const char* const value = std::getenv("EDEN_NX2_AREA_EVICT_DIRTY");
++        return value != nullptr && value[0] == '1';
++    }();
++    static const bool log_passes = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
++    constexpr u64 WindowFrames = 30;
++    constexpr u64 EvictFrames = 120;
++    constexpr size_t MaxPerFrame = 64;
++    // Images created since the last frame, summed over a window of WindowFrames.
++    const u64 created = area_images_created - area_created_seen;
++    area_created_seen = area_images_created;
++    if (frame_tick - area_window_frame >= WindowFrames) {
++        area_window_frame = frame_tick;
++        area_window_created = 0;
++    }
++    area_window_created += created;
++    if (area_window_created >= burst) {
++        if (frame_tick >= area_evict_until) {
++            ++area_bursts;
++            area_evicted_images = area_evicted_bytes = area_dropped_images = 0;
++            std::fprintf(stderr,
++                         "EDEN_AREA_EVICT burst %llu at frame %llu: %llu new images in %llu frames; "
++                         "images unused for %llu frames go for the next %llu frames (%zu images "
++                         "hold %llu MiB)\n",
++                         static_cast<unsigned long long>(area_bursts),
++                         static_cast<unsigned long long>(frame_tick),
++                         static_cast<unsigned long long>(area_window_created),
++                         static_cast<unsigned long long>(frame_tick - area_window_frame + 1),
++                         static_cast<unsigned long long>(age),
++                         static_cast<unsigned long long>(EvictFrames), slot_images.size(),
++                         static_cast<unsigned long long>(total_used_memory >> 20));
++        }
++        area_evict_until = frame_tick + EvictFrames;
++        area_window_frame = frame_tick;
++        area_window_created = 0;
++    }
++    if (frame_tick >= area_evict_until || frame_tick <= age) {
++        return;
++    }
++    boost::container::small_vector<ImageId, MaxPerFrame> doomed;
++    u64 bytes = 0;
++    size_t dropped = 0;
++    size_t kept = 0;
++    lru_cache.ForEachItemBelow(frame_tick - age, [&](ImageId image_id) {
++        const Image& image = slot_images[image_id];
++        if (True(image.flags & ImageFlagBits::IsDecoding) ||
++            (KeepAsyncDecodedFrames() != 0 &&
++             True(image.flags & ImageFlagBits::AsynchronousDecode))) {
++            return false;
++        }
++        // What the GPU wrote and the guest may still read: the collector's download path.
++        const bool dirty = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
++        if (dirty && !drop_dirty) {
++            ++kept;
++            return false;
++        }
++        dropped += dirty ? 1 : 0;
++        bytes += ImageMemoryBytes(image) + (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0);
++        doomed.push_back(image_id);
++        return doomed.size() == MaxPerFrame;
++    });
++    for (const ImageId image_id : doomed) {
++        Image& image = slot_images[image_id];
++        // The large ones by name: which of the images a refusal report lists were stale.
++        if (const u64 image_bytes = ImageMemoryBytes(image); image_bytes >= 64_MiB) {
++            std::fprintf(stderr,
++                         "EDEN_AREA_EVICT_IMAGE %llu MiB %ux%ux%u, %d layers, %d levels, flags "
++                         "0x%x, at 0x%llx\n",
++                         static_cast<unsigned long long>(image_bytes >> 20), image.info.size.width,
++                         image.info.size.height, image.info.size.depth, image.info.resources.layers,
++                         image.info.resources.levels, static_cast<u32>(image.flags),
++                         static_cast<unsigned long long>(image.gpu_addr));
++        }
++        if (True(image.flags & ImageFlagBits::Tracked)) {
++            UntrackImage(image, image_id);
++        }
++        UnregisterImage(image_id);
++        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
++    }
++    area_evicted_images += doomed.size();
++    area_evicted_bytes += bytes;
++    area_dropped_images += dropped;
++    if (log_passes && !doomed.empty()) {
++        std::fprintf(stderr,
++                     "EDEN_AREA_EVICT frame %llu: %zu images, %llu MiB deleted (%zu GPU-written, "
++                     "without a copy), %zu GPU-written kept\n",
++                     static_cast<unsigned long long>(frame_tick), doomed.size(),
++                     static_cast<unsigned long long>(bytes >> 20), dropped, kept);
++    }
++    if (frame_tick + 1 == area_evict_until) {
++        std::fprintf(stderr,
++                     "EDEN_AREA_EVICT done at frame %llu: %llu images, %llu MiB deleted (%llu "
++                     "GPU-written, without a copy); %zu GPU-written images unused for %llu frames "
++                     "stay; %zu images hold %llu MiB\n",
++                     static_cast<unsigned long long>(frame_tick),
++                     static_cast<unsigned long long>(area_evicted_images),
++                     static_cast<unsigned long long>(area_evicted_bytes >> 20),
++                     static_cast<unsigned long long>(area_dropped_images), kept,
++                     static_cast<unsigned long long>(age), slot_images.size(),
++                     static_cast<unsigned long long>(total_used_memory >> 20));
++    }
+ }
+ 
+ template <class P>
+@@ -590,6 +726,7 @@
+         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+         images_created = images_deleted = 0;
+     }
++    AreaEvict();
+     if (total_used_memory > minimum_memory) {
+         RunGarbageCollector();
+     }
+@@ -3384,6 +3521,7 @@
+             shape.second = gpu_addr;
+         }
+         ++images_created;
++        ++area_images_created;
+     }
+ 
+     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&

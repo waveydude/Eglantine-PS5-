@@ -67,6 +67,7 @@ void ClearGuestMemory(std::uint8_t* at, std::uint64_t offset, std::size_t bytes,
 void FreeGuestMemory(void* base, size_t size) noexcept;
 #ifdef PS5_NATIVE
 std::int64_t DirectMemoryStart(const void* pointer) noexcept;
+int ReserveOver(void* at, std::size_t size, std::size_t alignment) noexcept;
 #endif
 } // namespace Common
 
@@ -327,9 +328,8 @@ private:
         const std::size_t bytes = count * Granule;
         return Kernel([&] {
 #ifdef PS5_NATIVE
-            if (munmap(at, bytes) != 0) return false;
-            void* address = at;
-            return sceKernelReserveVirtualRange(&address, bytes, MAP_FIXED, Granule) == 0 && address == at;
+            // In one call (memory_pages.cpp): unmapped first, the chunks were free for a moment.
+            return Common::ReserveOver(at, bytes, Granule) == 1;
 #else
             return mmap(at, bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_NORESERVE,
                         -1, 0) == at;

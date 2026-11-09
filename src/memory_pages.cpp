@@ -64,6 +64,10 @@ int sceKernelDebugOutText(int, const char*);
 }
 #endif
 
+// Threads of the guest memory service name themselves for the crash report and the thread dump
+// (headless/crash_report.cpp). Weak: a check built without the frontend links, and skips it.
+extern "C" void eden_crash_name_thread(const char* name) __attribute__((weak));
+
 namespace Common {
 namespace {
 // The header sits in the page before the data. Blocks of at least LargePage start their data
@@ -255,6 +259,140 @@ void FreeMemoryPages(void* pointer) noexcept {
     FreeMemoryPages(pointer, header.total - header.lead);
 }
 
+// ---- One block kept for a big image: EDEN_BIG_IMAGE_RESERVE_MIB ----
+//
+// Ocarina of Time's 6144x6144 ground texture is decoded on the CPU into one 144 MiB buffer
+// (video_core/texture_cache/texture_cache.h, QueueAsyncDecode: decoded_data.resize_destructive).
+// Minutes into a game the pool has no single free range that large ("Direct allocation failed:
+// rc=80020023 bytes=153092096", with 300 to 514 MiB free in pieces), so the heap's large block
+// took its memory in pieces (eden_heap_split_pages) and left the pool with 2 MiB; the pipeline
+// builder threads' next allocations found nothing and the session ended (SIGSEGV on
+// VkPipelineBuilder, 7 Nov). With the switch set, one block of n MiB is taken from the top of
+// the pool while the pool is still whole (headless/heap_pages.cpp, eden_heap_pool_init, from
+// main after env.txt), and goes only to a large block that found no single free range and needs
+// at least 7/8 of it; it is back in the reserve when that block is freed. One holder at a time:
+// a second such request goes in pieces as before, or fails with EDEN_BIG_IMAGE_NO_SPLIT=1
+// (headless/heap_pages.cpp).
+#ifdef PS5_NATIVE
+extern "C" int eden_direct_high(std::size_t size, std::size_t alignment, int type, std::int64_t* start);
+#endif
+namespace {
+#ifdef PS5_NATIVE
+struct BigImageReserve {
+    std::atomic<int> state{0}; // 0: none; 3: being taken; 1: free; 2: given out
+    void* base = nullptr;
+    std::size_t size = 0;
+    std::int64_t physical = -1;
+    // The reserve's class: requests of [least, most] bytes (7/8 of n MiB to n MiB, rounded up to whole
+    // large pages). Ocarina's runs also ask for 82 to 108 MiB blocks at the same area loads (stderr
+    // "Direct allocation failed": 88080384, 102760448, 115343360 bytes) and 216 MiB ones (228589568):
+    // with a class of n/2 the first could hold the reserve when the 144 MiB block comes, and the second
+    // could never be served but was refused by EDEN_BIG_IMAGE_NO_SPLIT for good. (Review, 8 Nov.)
+    std::atomic<std::size_t> least{0}, most{0};
+    std::atomic<unsigned> given{0}, refused{0};
+};
+BigImageReserve big_image_reserve;
+#endif
+} // namespace
+
+// A request of the reserve's class: 7/8 of the size asked for with EDEN_BIG_IMAGE_RESERVE_MIB up to that
+// size, whether or not the reserve could be taken. False with the switch unset.
+bool BigImageRequest(std::size_t bytes) noexcept {
+#ifdef PS5_NATIVE
+    const std::size_t least = big_image_reserve.least.load(std::memory_order_relaxed);
+    const std::size_t most = big_image_reserve.most.load(std::memory_order_relaxed);
+    return least != 0 && bytes >= least && bytes <= most;
+#else
+    (void)bytes;
+    return false;
+#endif
+}
+
+// Takes the reserve: a block of mib MiB (rounded up to whole large pages). Once; later calls do
+// nothing. Reports what it did (EDEN_BIG_IMAGE_RESERVE).
+void TakeBigImageReserve(std::size_t mib) noexcept {
+#ifdef PS5_NATIVE
+    auto& reserve = big_image_reserve;
+    if (mib == 0 || mib > 4096) return;
+    int expected = 0;
+    if (!reserve.state.compare_exchange_strong(expected, 3, std::memory_order_acq_rel)) return;
+    const std::size_t size = ((mib << 20) + LargePage - 1) / LargePage * LargePage;
+    reserve.most.store(size, std::memory_order_relaxed);
+    reserve.least.store(size - size / 8, std::memory_order_relaxed);
+    std::int64_t physical = -1;
+    char line[160];
+    if (eden_direct_high(size, LargePage, 12, &physical) != 0) {
+        std::snprintf(line, sizeof(line), "EDEN_BIG_IMAGE_RESERVE none: the pool has no free range of %zu MiB\n",
+                      size >> 20);
+        Report(line);
+        reserve.state.store(0, std::memory_order_release);
+        return;
+    }
+    void* base = reinterpret_cast<void*>(cpu_mapping_hint);
+    const int rc = sceKernelMapDirectMemory(&base, size, PROT_READ | PROT_WRITE, 0, physical, LargePage);
+    if (rc != 0 || !cpu_mapping_range(base, size)) {
+        if (rc == 0 && base != nullptr && base != MAP_FAILED) (void)munmap(base, size);
+        (void)sceKernelReleaseDirectMemory(physical, size);
+        std::snprintf(line, sizeof(line), "EDEN_BIG_IMAGE_RESERVE none: mapping failed rc=%08x bytes=%zu\n",
+                      unsigned(rc), size);
+        Report(line);
+        reserve.state.store(0, std::memory_order_release);
+        return;
+    }
+    reserve.base = base;
+    reserve.size = size;
+    reserve.physical = physical;
+    reserve.state.store(1, std::memory_order_release);
+    std::snprintf(line, sizeof(line), "EDEN_BIG_IMAGE_RESERVE %zu MiB va=%p pa=%llx\n", size >> 20, base,
+                  static_cast<unsigned long long>(physical));
+    Report(line);
+#else
+    (void)mib;
+#endif
+}
+
+// The reserve for a large block of `bytes` (zeroed, as the heap's other large blocks), or nullptr:
+// no reserve, given out already, too small for the request, or the request under 7/8 of it (a
+// smaller block has room enough in the pool's pieces, and must not hold the reserve when the
+// big image comes). Called inside malloc: no stdio.
+void* TakeBigImageBlock(std::size_t bytes) noexcept {
+#ifdef PS5_NATIVE
+    auto& reserve = big_image_reserve;
+    if (reserve.state.load(std::memory_order_acquire) != 1 || bytes == 0) return nullptr;
+    if (bytes > reserve.size || bytes < reserve.least.load(std::memory_order_relaxed)) return nullptr;
+    int expected = 1;
+    if (!reserve.state.compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) {
+        reserve.refused.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    std::memset(reserve.base, 0, bytes);
+    const unsigned given = reserve.given.fetch_add(1, std::memory_order_relaxed) + 1;
+    char line[128];
+    const int length = std::snprintf(line, sizeof(line), "EDEN_BIG_IMAGE_RESERVE given bytes=%zu va=%p times=%u\n",
+                                     bytes, reserve.base, given);
+    if (length > 0) Note(line);
+    return reserve.base;
+#else
+    (void)bytes;
+    return nullptr;
+#endif
+}
+
+// 1: the block was the reserve, which is free again; 0: some other block.
+int GiveBigImageBlock(void* address) noexcept {
+#ifdef PS5_NATIVE
+    auto& reserve = big_image_reserve;
+    if (address == nullptr || address != reserve.base ||
+        reserve.state.load(std::memory_order_acquire) != 2)
+        return 0;
+    reserve.state.store(1, std::memory_order_release);
+    return 1;
+#else
+    (void)address;
+    return 0;
+#endif
+}
+
 // ---- Sparse pages: Eden's large tables ----
 //
 // Eden indexes its guest page table (and the GPU's address tables) directly: 8 bytes for every
@@ -307,6 +445,7 @@ SparseRange* SparseRangeOf(std::uintptr_t address) {
 extern "C" int eden_direct_high(std::size_t size, std::size_t alignment, int type, std::int64_t* start);
 // Where the system puts it: a 2 MiB block of this file's, which a session gives back.
 extern "C" int eden_direct_low(std::size_t size, std::size_t alignment, int type, std::int64_t* start);
+extern "C" int eden_direct_guest(std::size_t size, std::size_t alignment, int type, std::int64_t* start);
 #endif
 
 #ifdef PS5_NATIVE
@@ -321,8 +460,8 @@ std::atomic<std::uintptr_t> slot_view_hint{cpu_mapping_hint};
 constexpr std::uintptr_t slot_view_high = 0x3800000000ull;
 
 // A 2 MiB block of direct memory, zeroed through a mapping of its own that is gone again.
-bool ZeroedBlock(std::int64_t* physical) {
-    if (eden_direct_low(SparseSlot, SparseSlot, 12, physical) != 0)
+bool ZeroedBlock(std::int64_t* physical, bool guest = false) {
+    if ((guest ? eden_direct_guest : eden_direct_low)(SparseSlot, SparseSlot, 12, physical) != 0)
         return false;
     void* view = reinterpret_cast<void*>(slot_view_hint.load(std::memory_order_relaxed));
     if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, *physical, SparseSlot) != 0) {
@@ -339,6 +478,26 @@ bool MapSlot(std::uintptr_t at, int protection, std::int64_t physical) {
            address == reinterpret_cast<void*>(at);
 }
 #endif
+} // namespace
+
+#ifdef PS5_NATIVE
+// A mapping of ours becomes reserved address space in one call: a fixed reservation replaces what
+// it covers. Unmapped first and reserved after, the range was free for a moment, and a mapping the
+// system placed meanwhile (ZeroedBlock's view, any other without a fixed address) was overwritten
+// by the reservation: an experimental build that gave heap memory back often (mimalloc,
+// docs/MEMORY-CPU-EXPERIMENTS.md) faulted so in FillReserve's memset. Refused, it goes the old way.
+// 1: reserved; 0: unmapped, not reserved again (the range must not be used again); -1: still mapped
+// (nothing was done).
+int ReserveOver(void* at, std::size_t size, std::size_t alignment) noexcept {
+    void* again = at;
+    if (sceKernelReserveVirtualRange(&again, size, MAP_FIXED, alignment) == 0 && again == at) return 1;
+    if (munmap(at, size) != 0) return -1;
+    again = at;
+    return sceKernelReserveVirtualRange(&again, size, MAP_FIXED, alignment) == 0 && again == at ? 1 : 0;
+}
+#endif
+
+namespace {
 
 // Reserves `span` bytes whose every slot reads as zeroes. Null when the platform refuses. The
 // guest's memory goes above the guest's address space, as it does when it is taken whole.
@@ -368,14 +527,14 @@ void* ReserveSparse(std::size_t span, [[maybe_unused]] bool guest = false) {
 #ifdef PS5_NATIVE
 bool TableReserveBlock(std::int64_t* physical) noexcept; // guest_memory_service.inc
 #endif
-bool OwnSlot(std::uintptr_t at, std::int64_t* physical) {
+bool OwnSlot(std::uintptr_t at, std::int64_t* physical, [[maybe_unused]] bool guest = false) {
 #ifdef PS5_NATIVE
     // The block is zeroed before it appears in the table: a JIT thread may read the slot at any
     // moment, and the mapping changes in one step.
     // A table slot has nowhere to go if this fails (CommitSparsePage ends the app), so it may
     // take a block of the guest reserve, as the guest writes do: run 62 ended here with 242 MiB
     // of the reserve idle.
-    if (!ZeroedBlock(physical) && !TableReserveBlock(physical)) return false;
+    if (!ZeroedBlock(physical, guest) && !TableReserveBlock(physical)) return false;
     if (MapSlot(at, PROT_READ | PROT_WRITE, *physical)) return true;
     (void)sceKernelReleaseDirectMemory(*physical, SparseSlot);
     return false;
@@ -681,7 +840,7 @@ void CommitSparsePage(std::uintptr_t page) noexcept {
     }
     const std::lock_guard lock{sparse_mutex};
     if (range->owned[slot].load(std::memory_order_relaxed)) return;
-    if (!OwnSlot(begin + slot * SparseSlot, &range->physical[slot])) {
+    if (!OwnSlot(begin + slot * SparseSlot, &range->physical[slot], range->guest)) {
         // Out of memory in the middle of a guest mapping: there is no table to continue with.
         ReportSparseCommitFailure(*range, slot);
         Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
@@ -828,11 +987,7 @@ bool CommitMemoryRangeFrom(void* address, std::size_t size, bool high) noexcept 
         }
         if (!RecordCommitted(begin + done, block, physical)) {
             // No entry left to give it back with: unmap it now, keeping the address space.
-            if (munmap(at, block) == 0) {
-                void* again = at;
-                (void)sceKernelReserveVirtualRange(&again, block, MAP_FIXED, LargePage);
-                (void)sceKernelReleaseDirectMemory(physical, block);
-            }
+            if (ReserveOver(at, block, LargePage) >= 0) (void)sceKernelReleaseDirectMemory(physical, block);
             break;
         }
         done += block;
@@ -873,15 +1028,14 @@ int DecommitMemoryRange(void* address, std::size_t size) noexcept {
     LockCommitted();
     for (auto& block : committed_blocks) {
         if (block.address < begin || block.address >= end || block.address == 0) continue;
-        void* at = reinterpret_cast<void*>(block.address);
-        // As the guest's memory gives a block back (src/host_memory.cpp): unmapped, the address
-        // space reserved again at once, then the memory released.
-        if (munmap(at, block.size) != 0) {
+        // As the guest's memory gives a block back (src/host_memory.cpp): the mapping becomes
+        // reserved address space (ReserveOver), then the memory is released.
+        const int reserved = ReserveOver(reinterpret_cast<void*>(block.address), block.size, LargePage);
+        if (reserved < 0) {
             result = -1;
             continue;
         }
-        void* again = at;
-        if (sceKernelReserveVirtualRange(&again, block.size, MAP_FIXED, LargePage) != 0 || again != at) result = -1;
+        if (reserved == 0) result = -1;
         if (sceKernelReleaseDirectMemory(block.physical, block.size) != 0) result = -1;
         covered += block.size;
         block = CommittedBlock{};

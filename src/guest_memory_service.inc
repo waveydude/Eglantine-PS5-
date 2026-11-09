@@ -172,7 +172,7 @@ void FillReserve(std::size_t blocks = ReserveBlocks) noexcept {
         reserve_lock.clear(std::memory_order_release);
         if (full) return;
         std::int64_t physical = -1;
-        if (!ZeroedBlock(&physical)) return;
+        if (!ZeroedBlock(&physical, true)) return;
         Spin(reserve_lock);
         const std::size_t count = reserve_count.load(std::memory_order_relaxed);
         if (count < blocks) {
@@ -324,7 +324,7 @@ bool PromoteZero(SparseRange& range, std::size_t slot) noexcept {
     const std::uintptr_t at = SlotAddress(range, slot);
 #ifdef PS5_NATIVE
     std::int64_t physical = -1;
-    if (!SparedBlock(&physical) && !ZeroedBlock(&physical) && !ReserveBlock(&physical)) return false;
+    if (!SparedBlock(&physical) && !ZeroedBlock(&physical, true) && !ReserveBlock(&physical)) return false;
     if (!MapSlot(at, PROT_READ | PROT_WRITE, physical)) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
@@ -354,7 +354,7 @@ bool PromoteShared(SparseRange& range, std::size_t slot) noexcept {
     shared_lock.clear(std::memory_order_release);
     if (last) return mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_READ | PROT_WRITE) == 0;
     std::int64_t physical = -1;
-    if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !ReserveBlock(&physical)) return false;
+    if (eden_direct_guest(SparseSlot, SparseSlot, 12, &physical) != 0 && !ReserveBlock(&physical)) return false;
     void* view = reinterpret_cast<void*>(slot_view_hint.load(std::memory_order_relaxed));
     if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, physical, SparseSlot) != 0) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
@@ -463,7 +463,7 @@ bool PromoteFine(SparseRange& range, std::size_t slot) noexcept {
     const std::size_t kept = FineKept(range, slot);
 #ifdef PS5_NATIVE
     std::int64_t physical = -1;
-    if (!SparedBlock(&physical) && eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 &&
+    if (!SparedBlock(&physical) && eden_direct_guest(SparseSlot, SparseSlot, 12, &physical) != 0 &&
         !ReserveBlock(&physical))
         return false;
     void* view = reinterpret_cast<void*>(slot_view_hint.load(std::memory_order_relaxed));
@@ -513,7 +513,7 @@ bool FineInPlace() noexcept {
         return false;
     }
     std::int64_t block = -1;
-    if (eden_direct_low(SparseSlot, SparseSlot, 12, &block) != 0) return false; // no block now: asked again later
+    if (eden_direct_guest(SparseSlot, SparseSlot, 12, &block) != 0) return false; // no block now: asked again later
     const int tail = sceKernelReleaseDirectMemory(block + SparseSlot / 2, SparseSlot / 2);
     if (sceKernelReleaseDirectMemory(block, tail == 0 ? SparseSlot / 2 : SparseSlot) != 0) std::abort();
     fine_in_place.store(tail == 0 ? 1 : 2, std::memory_order_relaxed);
@@ -572,7 +572,7 @@ bool MakeFine(SparseRange& range, std::size_t slot, const bool (&zero)[FinePages
             return false;
         }
     } else {
-        if (eden_direct_low(kept * FinePage, FinePage, 12, &compact) != 0) return false;
+        if (eden_direct_guest(kept * FinePage, FinePage, 12, &compact) != 0) return false;
         void* view = reinterpret_cast<void*>(slot_view_hint.load(std::memory_order_relaxed));
         if (sceKernelMapDirectMemory(&view, kept * FinePage, PROT_READ | PROT_WRITE, 0, compact, FinePage) != 0) {
             (void)sceKernelReleaseDirectMemory(compact, kept * FinePage);
@@ -694,7 +694,7 @@ bool PackInPlace() noexcept {
         return false;
     }
     std::int64_t block = -1;
-    if (eden_direct_low(SparseSlot, SparseSlot, 12, &block) != 0) return false; // no block now: asked again later
+    if (eden_direct_guest(SparseSlot, SparseSlot, 12, &block) != 0) return false; // no block now: asked again later
     const int tail = sceKernelReleaseDirectMemory(block + SparseSlot / 2, SparseSlot / 2);
     if (sceKernelReleaseDirectMemory(block, tail == 0 ? SparseSlot / 2 : SparseSlot) != 0) std::abort();
     pack_in_place.store(tail == 0 ? 1 : 2, std::memory_order_relaxed);
@@ -752,7 +752,7 @@ bool PackOut(SparseRange& range, std::size_t slot) noexcept {
         UnlockSlot(range, slot, SlotOut);
         return true;
     }
-    if (!worth || eden_direct_low(kept * FinePage, FinePage, 12, &block) != 0 ||
+    if (!worth || eden_direct_guest(kept * FinePage, FinePage, 12, &block) != 0 ||
         sceKernelMapDirectMemory(&view, kept * FinePage, PROT_READ | PROT_WRITE, 0, block, FinePage) != 0) {
         if (block >= 0) (void)sceKernelReleaseDirectMemory(block, kept * FinePage);
         if (mprotect(reinterpret_cast<void*>(at), SparseSlot, PROT_NONE) != 0) std::abort();
@@ -788,7 +788,7 @@ bool UnpackIn(SparseRange& range, std::size_t slot) noexcept {
     const std::uint32_t size = range.swap[slot];
     const std::size_t kept = PackedPages(size);
     std::int64_t physical = -1;
-    if (!SparedBlock(&physical) && eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 &&
+    if (!SparedBlock(&physical) && eden_direct_guest(SparseSlot, SparseSlot, 12, &physical) != 0 &&
         !ReserveBlock(&physical)) {
         errno = saved;
         return false;
@@ -839,7 +839,7 @@ bool SwapIn(SparseRange& range, std::size_t slot) noexcept {
     const std::uint64_t start = NowNs();
     const std::uint32_t place = range.swap[slot];
     std::int64_t physical = -1;
-    if (!SparedBlock(&physical) && eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 &&
+    if (!SparedBlock(&physical) && eden_direct_guest(SparseSlot, SparseSlot, 12, &physical) != 0 &&
         !ReserveBlock(&physical)) {
         errno = saved;
         return false;
@@ -1320,6 +1320,7 @@ bool scanner_stop = false;
 std::thread keeper;
 
 void ReserveKeeper() {
+    if (::eden_crash_name_thread) ::eden_crash_name_thread("CramKeeper");  // crash report, thread dump
     std::unique_lock lock{scanner_mutex};
     while (!scanner_stop) {
         scanner_wake.wait_for(lock, std::chrono::milliseconds(100), [] { return scanner_stop; });
@@ -1465,6 +1466,7 @@ void SwapTick(SparseRange& range, std::size_t& hand, std::vector<std::pair<std::
 
 std::thread swapper;
 void SwapLoop(SparseRange* range) {
+    if (::eden_crash_name_thread) ::eden_crash_name_thread("GuestSwapper");  // crash report, thread dump
     std::vector<std::pair<std::int64_t, std::size_t>> cold;
     cold.reserve((range->end - range->begin.load(std::memory_order_relaxed)) / SparseSlot);
     std::size_t hand = 0;
@@ -2075,6 +2077,7 @@ void MeasureFinePages(SparseRange& range) noexcept {
 }
 
 void ScannerLoop(SparseRange* range) {
+    if (::eden_crash_name_thread) ::eden_crash_name_thread("CramScanner");  // crash report, thread dump
     auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     std::unique_lock lock{scanner_mutex};
     while (!scanner_stop) {
