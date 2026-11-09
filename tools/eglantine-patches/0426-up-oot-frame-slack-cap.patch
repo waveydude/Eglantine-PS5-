@@ -1,0 +1,206 @@
+Subject: [PATCH] EDEN_UP_OOT_FRAME_SLACK / EDEN_UP_OOT_FRAME_CAP: cheaper Ocarina frame wait experiments (fence minus N increments, or this frame's fence for at most CAP_MS), with per-600-present logs; off by default
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -1876,9 +1876,27 @@
+         // the frame rendered with the next one's (one-frame white or overexposed flashes).
+         constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
+         static const bool oot_wait = Common::PeSwitch("EDEN_UP_OOT_FRAME_WAIT");
++        // EDEN_UP_OOT_FRAME_SLACK=1 (Ocarina only; overrides EDEN_UP_OOT_FRAME_WAIT): wait for this
++        // frame's fence minus EDEN_UP_OOT_FRAME_SLACK_N increments (default 2), never below the
++        // previous frame's, so the game starts the next frame while the GPU thread still records
++        // this frame's last submissions. At the pond the fence syncpoint rises 10 times a frame:
++        // _N=0 is the full frame wait, 10 or more the previous frame.
++        static const bool oot_slack = Common::PeSwitch("EDEN_UP_OOT_FRAME_SLACK");
++        // EDEN_UP_OOT_FRAME_CAP=1 (Ocarina only; overrides EDEN_UP_OOT_FRAME_WAIT, loses to
++        // _SLACK): wait for this frame's fence for at most EDEN_UP_OOT_FRAME_CAP_MS (default 30),
++        // then only for the previous frame, so the game starts the next frame while the GPU
++        // thread finishes this one.
++        static const bool oot_cap = Common::PeSwitch("EDEN_UP_OOT_FRAME_CAP");
+         constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+         int frames_ahead = frames_ahead_setting;
+         const u64 app_program_id = system.GetApplicationProcessProgramID();
++        const bool slack_wait = oot_slack && frames_ahead == -1 &&
++                                app_program_id == OcarinaOfTimeProgramId;
++        const bool cap_wait = !slack_wait && oot_cap && frames_ahead == -1 &&
++                              app_program_id == OcarinaOfTimeProgramId;
++        if (slack_wait || cap_wait) {
++            frames_ahead = 0;
++        }
+         if (frames_ahead == -1 && (app_program_id == DonkeyKongBananzaProgramId ||
+                                    (oot_wait && app_program_id == OcarinaOfTimeProgramId))) {
+             frames_ahead = 0;
+@@ -1902,6 +1920,10 @@
+             if (gpu_behind) {
+                 WaitForFrame(~w[22], w[24]);
+             }
++        } else if (slack_wait) {
++            WaitForFrameSlack(~w[22], w[24]);
++        } else if (cap_wait) {
++            WaitForFrameCapped(~w[22], w[24]);
+         } else if (frames_ahead == 0) {
+             WaitForFrame(~w[22], w[24]);
+         }
+@@ -1966,6 +1988,16 @@
+     } m_stats{};
+     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
+     u32 m_previous_fence_value{};
++    // EDEN_UP_OOT_FRAME_SLACK: presents that returned before their frame's fence, and how long after the
++    // return the fence came (added by the GPU thread's guest action). Created at first use.
++    struct EarlyTail {
++        std::atomic<long long> sum_us{}, max_us{};
++        std::atomic<u32> landed{};
++    };
++    std::shared_ptr<EarlyTail> m_early_tail;
++    u32 m_early_presents{}, m_early_returns{};
++    long long m_early_wait_us{};
++    u64 m_early_incs{}; // EDEN_UP_OOT_FRAME_SLACK: fence increments per frame, summed per 600
+ 
+     // The console flips one frame per 60 Hz vblank and keeps the rest queued, so a game can't
+     // present faster than that. Every slot is reported free here: hold each present until the
+@@ -2024,6 +2056,145 @@
+                 kernel, kernel.HardwareTimer().GetTick() + wait.count() + 2));
+         }
+         m_next_vblank += interval;
++    }
++
++    /// EDEN_UP_OOT_FRAME_SLACK: waits for the fence minus a few increments (never below the
++    /// previous frame's fence), then for the previous frame if it used another syncpoint. Logs
++    /// per 600 presents how many returned before the full fence and how much later it came.
++    void WaitForFrameSlack(u32 fence_id, u32 fence_value) {
++        static const u32 slack = [] {
++            const char* value = std::getenv("EDEN_UP_OOT_FRAME_SLACK_N");
++            const unsigned long n = value != nullptr ? std::strtoul(value, nullptr, 10) : 2UL;
++            return static_cast<u32>((std::min)(n, 1000UL));
++        }();
++        if (!m_early_tail) {
++            m_early_tail = std::make_shared<EarlyTail>();
++            LOG_INFO(Service, "EDEN_UP_OOT_FRAME_SLACK=1: Ocarina presents wait for their fence "
++                              "minus {} increments",
++                     slack);
++        }
++        auto& syncpoints = system.Host1x().GetSyncpointManager();
++        const auto start = std::chrono::steady_clock::now();
++        u32 target = fence_value;
++        if (fence_id < 192) {
++            const u32 floor = m_previous_fence_id == fence_id && m_previous_fence_value <= fence_value
++                                  ? m_previous_fence_value
++                                  : 0U;
++            // At most a quarter of this frame's increments: scenes with 3-4 a frame (menus,
++            // loading, some walks) keep most of the wait instead of dropping to the previous frame.
++            const u32 frame_incs = fence_value - floor;
++            m_early_incs += floor != 0U ? frame_incs : 0U;
++            target = fence_value - (std::min)(slack, frame_incs / 4U);
++        }
++        WaitForFrame(fence_id, target);
++        if (m_previous_fence_id != fence_id) {
++            WaitForFrame(m_previous_fence_id, m_previous_fence_value);
++        }
++        const auto returned = std::chrono::steady_clock::now();
++        m_early_wait_us +=
++            std::chrono::duration_cast<std::chrono::microseconds>(returned - start).count();
++        if (fence_id < 192 && !syncpoints.IsReadyGuest(fence_id, fence_value)) {
++            ++m_early_returns;
++            syncpoints.RegisterGuestAction(fence_id, fence_value, [tail = m_early_tail, returned] {
++                const long long late_us = std::chrono::duration_cast<std::chrono::microseconds>(
++                                              std::chrono::steady_clock::now() - returned)
++                                              .count();
++                tail->sum_us.fetch_add(late_us, std::memory_order_relaxed);
++                long long seen = tail->max_us.load(std::memory_order_relaxed);
++                while (late_us > seen && !tail->max_us.compare_exchange_weak(
++                                             seen, late_us, std::memory_order_relaxed)) {
++                }
++                tail->landed.fetch_add(1, std::memory_order_relaxed);
++            });
++        }
++        if (++m_early_presents == 600) {
++            const u32 landed = m_early_tail->landed.exchange(0, std::memory_order_relaxed);
++            const long long sum = m_early_tail->sum_us.exchange(0, std::memory_order_relaxed);
++            const long long max = m_early_tail->max_us.exchange(0, std::memory_order_relaxed);
++            LOG_INFO(Service,
++                     "EDEN_UP_OOT_FRAME_SLACK: last 600 presents waited {} us (fence minus up to {}, "
++                     "{:.1f} increments a frame); {} returned before the frame's fence, which came "
++                     "{} us later on average (max {})",
++                     m_early_wait_us / 600, slack, static_cast<double>(m_early_incs) / 600.0,
++                     m_early_returns, landed != 0 ? sum / landed : 0LL, max);
++            m_early_presents = 0;
++            m_early_returns = 0;
++            m_early_wait_us = 0;
++            m_early_incs = 0;
++        }
++    }
++
++    /// EDEN_UP_OOT_FRAME_CAP: waits for the fence for at most the cap, then for the previous
++    /// frame's fence. Logs per 600 presents how many returned before the frame's fence and how
++    /// much later it came.
++    void WaitForFrameCapped(u32 fence_id, u32 fence_value) {
++        static const long long cap_ms = [] {
++            const char* value = std::getenv("EDEN_UP_OOT_FRAME_CAP_MS");
++            const long n = value != nullptr ? std::strtol(value, nullptr, 10) : 30L;
++            return static_cast<long long>((std::clamp)(n, 1L, 4000L));
++        }();
++        if (!m_early_tail) {
++            m_early_tail = std::make_shared<EarlyTail>();
++            LOG_INFO(Service, "EDEN_UP_OOT_FRAME_CAP=1: Ocarina presents wait at most {} ms for "
++                              "their own fence",
++                     cap_ms);
++        }
++        auto& syncpoints = system.Host1x().GetSyncpointManager();
++        const auto start = std::chrono::steady_clock::now();
++        if (fence_id < 192 && !syncpoints.IsReadyGuest(fence_id, fence_value)) {
++            struct Wake {
++                std::mutex mutex;
++                std::condition_variable cv;
++                bool done{};
++            };
++            auto wake = std::make_shared<Wake>();
++            syncpoints.RegisterGuestAction(fence_id, fence_value, [wake] {
++                {
++                    std::scoped_lock lk{wake->mutex};
++                    wake->done = true;
++                }
++                wake->cv.notify_all();
++            });
++            const auto deadline = start + std::chrono::milliseconds{cap_ms};
++            std::unique_lock lk{wake->mutex};
++            while (!wake->done && system.IsPoweredOn() &&
++                   std::chrono::steady_clock::now() < deadline) {
++                wake->cv.wait_until(lk, deadline);
++            }
++        }
++        if (fence_id < 192 && !syncpoints.IsReadyGuest(fence_id, fence_value)) {
++            WaitForFrame(m_previous_fence_id, m_previous_fence_value);
++        }
++        const auto returned = std::chrono::steady_clock::now();
++        m_early_wait_us +=
++            std::chrono::duration_cast<std::chrono::microseconds>(returned - start).count();
++        if (fence_id < 192 && !syncpoints.IsReadyGuest(fence_id, fence_value)) {
++            ++m_early_returns;
++            syncpoints.RegisterGuestAction(fence_id, fence_value, [tail = m_early_tail, returned] {
++                const long long late_us = std::chrono::duration_cast<std::chrono::microseconds>(
++                                              std::chrono::steady_clock::now() - returned)
++                                              .count();
++                tail->sum_us.fetch_add(late_us, std::memory_order_relaxed);
++                long long seen = tail->max_us.load(std::memory_order_relaxed);
++                while (late_us > seen && !tail->max_us.compare_exchange_weak(
++                                             seen, late_us, std::memory_order_relaxed)) {
++                }
++                tail->landed.fetch_add(1, std::memory_order_relaxed);
++            });
++        }
++        if (++m_early_presents == 600) {
++            const u32 landed = m_early_tail->landed.exchange(0, std::memory_order_relaxed);
++            const long long sum = m_early_tail->sum_us.exchange(0, std::memory_order_relaxed);
++            const long long max = m_early_tail->max_us.exchange(0, std::memory_order_relaxed);
++            LOG_INFO(Service,
++                     "EDEN_UP_OOT_FRAME_CAP: last 600 presents waited {} us (cap {} ms); {} returned before "
++                     "the frame's fence, which came {} us later on average (max {})",
++                     m_early_wait_us / 600, cap_ms, m_early_returns,
++                     landed != 0 ? sum / landed : 0LL, max);
++            m_early_presents = 0;
++            m_early_returns = 0;
++            m_early_wait_us = 0;
++        }
+     }
+ 
+     /// Waits until the fence is reached. With `unless_gpu_waits`, gives up after a few ms once a

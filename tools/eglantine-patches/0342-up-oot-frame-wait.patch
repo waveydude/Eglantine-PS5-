@@ -1,0 +1,44 @@
+From f1c01abda97174bfcdd69f20a2c797e1b12679fd Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 05:02:46 +0100
+Subject: [PATCH] up: oot-frame-wait
+
+Source: a23be213d5
+Switch: EDEN_UP_OOT_FRAME_WAIT
+---
+ src/core/hle/service/nx2_gsv.h | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index 313d2c1..6fbdca7 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include "common/pe_switch.h"
+ #include <algorithm>
+ #include <array>
+ #include <thread>
+@@ -1868,10 +1869,15 @@ private:
+         // Donkey Kong Bananza's channels wait on each other every frame, so it always ran a frame
+         // ahead, where it rewrote memory the GPU thread hadn't read yet (misread commands, then
+         // a freeze or crash; rubberbanding while moving). Title 1 runs ahead without either.
++        // Ocarina of Time a frame ahead rewrote data the GPU thread still read for this frame, and
++        // the frame rendered with the next one's (one-frame white or overexposed flashes).
+         constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
++        static const bool oot_wait = Common::PeSwitch("EDEN_UP_OOT_FRAME_WAIT");
++        constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+         int frames_ahead = frames_ahead_setting;
+-        if (frames_ahead == -1 &&
+-            system.GetApplicationProcessProgramID() == DonkeyKongBananzaProgramId) {
++        const u64 app_program_id = system.GetApplicationProcessProgramID();
++        if (frames_ahead == -1 && (app_program_id == DonkeyKongBananzaProgramId ||
++                                   (oot_wait && app_program_id == OcarinaOfTimeProgramId))) {
+             frames_ahead = 0;
+         }
+         const auto entered = std::chrono::steady_clock::now();
+-- 
+2.54.0
+
