@@ -1,0 +1,187 @@
+Subject: [PATCH] EDEN_UP_AM_THREADS: Lichii #659: two extra AM service host threads (vi2/vdec/syncpt no longer wait behind vblank pacing), with Lichii's locks; threads start only with the switch
+
+--- a/src/core/hle/service/am/am.cpp
++++ b/src/core/hle/service/am/am.cpp
+@@ -4,6 +4,8 @@
+ // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include "common/logging.h"
++#include "common/pe_switch.h"
+ #include "core/hle/service/am/am.h"
+ #include "core/hle/service/am/button_poller.h"
+ #include "core/hle/service/am/event_observer.h"
+@@ -25,6 +27,16 @@
+         "appletAE", std::make_shared<IAllSystemAppletProxiesService>(system, window_system));
+     server_manager->RegisterNamedService(
+         "appletOE", std::make_shared<IApplicationProxyService>(system, window_system));
++    // EDEN_UP_AM_THREADS=1 (Lichii 72e9429daf, #659): two more host threads for this server. The
++    // Switch 2 graphics system (nx2:gsv, from ISelfController) and every session it hands out (vi2,
++    // vdecsvc, syncpt, gpu, nvsrv) are served here. vi2's present holds its thread until the next
++    // vblank (PaceToVblank, ~12-14 ms of each 16.7 ms frame), and with one thread every movie
++    // decoder call queued behind it (Lichii: Ocarina's title movie 10 s behind its audio, 4 s with
++    // the threads). Each service keeps its own lock (ServiceFrameworkBase::LockService).
++    if (Common::PeSwitch("EDEN_UP_AM_THREADS")) {
++        LOG_INFO(Service_AM, "EDEN_UP_AM_THREADS: serving AM and nx2:gsv on 3 host threads");
++        server_manager->StartAdditionalHostThreads("am", 2);
++    }
+     ServerManager::RunServer(std::move(server_manager));
+ }
+ 
+--- a/src/core/hle/service/server_manager.cpp
++++ b/src/core/hle/service/server_manager.cpp
+@@ -264,6 +264,10 @@
+ 
+ Result ServerManager::LoopProcess() {
+     SCOPE_EXIT {
++        // Join the additional host threads before returning, so state the caller keeps on its
++        // stack for the services (AM's WindowSystem) outlives any request they are still handling
++        // (Lichii 72e9429daf). Without additional threads this is empty.
++        m_threads.clear();
+         m_stopped.Set();
+     };
+ 
+--- a/src/core/hle/service/hle_ipc.h
++++ b/src/core/hle/service/hle_ipc.h
+@@ -7,8 +7,10 @@
+ #pragma once
+ 
+ #include <array>
++#include <atomic>
+ #include <functional>
+ #include <memory>
++#include <mutex>
+ #include <optional>
+ #include <span>
+ #include <string>
+@@ -101,6 +103,7 @@
+     }
+ 
+     void ConvertToDomain() {
++        std::scoped_lock lk{domain_mutex};
+         domain_handlers = {session_handler};
+         is_domain = true;
+     }
+@@ -110,6 +113,7 @@
+     }
+ 
+     std::size_t DomainHandlerCount() const {
++        std::scoped_lock lk{domain_mutex};
+         return domain_handlers.size();
+     }
+ 
+@@ -126,20 +130,28 @@
+     }
+ 
+     void CloseDomainHandler(std::size_t index) {
+-        if (index < DomainHandlerCount()) {
+-            domain_handlers[index] = nullptr;
+-        } else {
+-            ASSERT_MSG(false, "Unexpected handler index {}", index);
++        SessionRequestHandlerPtr closed; // destroyed after the lock is released
++        {
++            std::scoped_lock lk{domain_mutex};
++            if (index < domain_handlers.size()) {
++                closed = std::move(domain_handlers[index]);
++            } else {
++                ASSERT_MSG(false, "Unexpected handler index {}", index);
++            }
+         }
+     }
+ 
+     SessionRequestHandlerWeakPtr DomainHandler(std::size_t index) const {
+-        ASSERT_MSG(index < DomainHandlerCount(), "Unexpected handler index {}", index);
++        std::scoped_lock lk{domain_mutex};
++        ASSERT_MSG(index < domain_handlers.size(), "Unexpected handler index {}", index);
+         return domain_handlers.at(index);
+     }
+ 
+-    void AppendDomainHandler(SessionRequestHandlerPtr&& handler) {
++    /// Returns the new handler's object id.
++    std::size_t AppendDomainHandler(SessionRequestHandlerPtr&& handler) {
++        std::scoped_lock lk{domain_mutex};
+         domain_handlers.emplace_back(std::move(handler));
++        return domain_handlers.size();
+     }
+ 
+     void SetSessionHandler(SessionRequestHandlerPtr&& handler) {
+@@ -169,9 +181,12 @@
+ 
+ private:
+     bool convert_to_domain{};
+-    bool is_domain{};
++    std::atomic<bool> is_domain{};
+     bool is_initialized_for_sm{};
+     SessionRequestHandlerPtr session_handler;
++    // Sessions cloned from one domain share this manager and may be served on different threads
++    // (EDEN_UP_AM_THREADS, bsdsocket's extra threads).
++    mutable std::mutex domain_mutex;
+     std::vector<SessionRequestHandlerPtr> domain_handlers;
+ 
+ private:
+--- a/src/core/hle/service/hle_ipc.cpp
++++ b/src/core/hle/service/hle_ipc.cpp
+@@ -323,8 +323,8 @@
+         current_offset = domain_offset - static_cast<u32>(outgoing_domain_objects.size());
+         for (auto& object : outgoing_domain_objects) {
+             if (object) {
+-                GetManager()->AppendDomainHandler(std::move(object));
+-                cmd_buf[current_offset++] = static_cast<u32_le>(GetManager()->DomainHandlerCount());
++                cmd_buf[current_offset++] =
++                    static_cast<u32_le>(GetManager()->AppendDomainHandler(std::move(object)));
+             } else {
+                 cmd_buf[current_offset++] = 0;
+             }
+--- a/src/core/hle/service/am/service/common_state_getter.cpp
++++ b/src/core/hle/service/am/service/common_state_getter.cpp
+@@ -108,6 +108,7 @@
+ Result ICommonStateGetter::ReceiveMessage(Out<AppletMessage> out_applet_message) {
+     LOG_DEBUG(Service_AM, "called");
+ 
++    std::scoped_lock lk{m_applet->lock};
+     if (!m_applet->lifecycle_manager.PopMessage(system.Kernel(), out_applet_message)) {
+         LOG_ERROR(Service_AM, "Tried to pop message but none was available!");
+         R_THROW(AM::ResultNoMessages);
+@@ -322,6 +323,7 @@
+ 
+ Result ICommonStateGetter::EnableStartupLogoDisappearedMessage() {
+     LOG_WARNING(Service_AM, "(STUBBED) called");
++    std::scoped_lock lk{m_applet->lock};
+     m_applet->lifecycle_manager.PushUnorderedMessage(system.Kernel(), AppletMessage::StartupLogoDisappeared);
+     R_SUCCEED();
+ }
+--- a/src/core/hle/service/am/service/application_functions.cpp
++++ b/src/core/hle/service/am/service/application_functions.cpp
+@@ -498,12 +498,14 @@
+ 
+ Result IApplicationFunctions::ClearUserChannel() {
+     LOG_DEBUG(Service_AM, "called");
++    std::scoped_lock lk{m_applet->lock};
+     m_applet->user_channel_launch_parameter.clear();
+     R_SUCCEED();
+ }
+ 
+ Result IApplicationFunctions::UnpopToUserChannel(SharedPointer<IStorage> storage) {
+     LOG_DEBUG(Service_AM, "called");
++    std::scoped_lock lk{m_applet->lock};
+     m_applet->user_channel_launch_parameter.push_back(storage->GetData());
+     R_SUCCEED();
+ }
+--- a/src/core/hle/service/am/service/process_winding_controller.cpp
++++ b/src/core/hle/service/am/service/process_winding_controller.cpp
+@@ -70,6 +70,7 @@
+ 
+ Result IProcessWindingController::PushContext(SharedPointer<IStorage> context) {
+     LOG_INFO(Service_AM, "called");
++    std::scoped_lock lk{m_applet->lock};
+     m_applet->context_stack.push(context);
+     R_SUCCEED();
+ }
+@@ -77,6 +78,7 @@
+ Result IProcessWindingController::PopContext(Out<SharedPointer<IStorage>> out_context) {
+     LOG_INFO(Service_AM, "called");
+ 
++    std::scoped_lock lk{m_applet->lock};
+     if (m_applet->context_stack.empty()) {
+         LOG_ERROR(Service_AM, "Context stack is empty");
+         R_THROW(ResultUnknown);

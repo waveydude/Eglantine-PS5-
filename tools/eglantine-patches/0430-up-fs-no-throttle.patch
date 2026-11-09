@@ -1,0 +1,40 @@
+Subject: [PATCH] EDEN_UP_FS_NO_THROTTLE: Lichii #659: no 40 MB/s IStorage::Read throttle for Switch 2 titles; off by default
+
+--- a/src/core/hle/service/filesystem/fsp/fs_i_storage.cpp
++++ b/src/core/hle/service/filesystem/fsp/fs_i_storage.cpp
+@@ -8,6 +8,8 @@
+ #include <chrono>
+ #include <thread>
+ 
++#include "common/pe_switch.h"
++#include "common/settings.h"
+ #include "core/file_sys/errors.h"
+ #include "core/hle/service/cmif_serialization.h"
+ #include "core/hle/service/filesystem/fsp/fs_i_storage.h"
+@@ -35,13 +37,20 @@
+     R_UNLESS(length >= 0, FileSys::ResultInvalidSize);
+     R_UNLESS(offset >= 0, FileSys::ResultInvalidOffset);
+ 
+-    const auto now = std::chrono::steady_clock::now();
+-    if (now < next_read_tick) {
+-        std::this_thread::sleep_for(next_read_tick - now);
++    // EDEN_UP_FS_NO_THROTTLE=1 (Lichii 72e9429daf, #659): no 40 MB/s Switch 1 card throttle for
++    // Switch 2 titles. Ocarina of Time streams its movies with 150-460 reads a second (EDEN_NX2_IPC_SUMMARY,
++    // run15), and fsp-srv has one host thread, so every sleep here also holds all other fs reads,
++    // the boot loader's included. Switch 1 titles keep the throttle (Eden cbd4cf2d8c, Mario Strikers).
++    static const bool no_throttle = Common::PeSwitch("EDEN_UP_FS_NO_THROTTLE");
++    if (!no_throttle || !Settings::CurrentProgramIsSwitch2()) {
++        const auto now = std::chrono::steady_clock::now();
++        if (now < next_read_tick) {
++            std::this_thread::sleep_for(next_read_tick - now);
++        }
++        next_read_tick = std::chrono::steady_clock::now() +
++                         std::chrono::nanoseconds{std::min(length, MaxChargedReadSize) *
++                                                  1'000'000'000 / ReadBytesPerSecond};
+     }
+-    next_read_tick = std::chrono::steady_clock::now() +
+-                     std::chrono::nanoseconds{std::min(length, MaxChargedReadSize) *
+-                                              1'000'000'000 / ReadBytesPerSecond};
+ 
+     // Read the data from the Storage backend
+     backend->Read(out_bytes.data(), length, offset);

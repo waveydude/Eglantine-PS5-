@@ -1,0 +1,137 @@
+Subject: [PATCH] EDEN_UP_VDEC_BUSY + EDEN_UP_MOVIE_CLOCK: Lichii #659/#809: vdec refuses input packets with busy from 24 queued, holds the refused one; movie clock does not jump ahead (with EDEN_UP_MOVIE_PACE); off by default
+
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -2832,6 +2832,9 @@
+ 
+     static constexpr u32 NoSyncpoint = ~0U;
+     static constexpr size_t MaxQueuedInputs = 8;
++    // EDEN_UP_VDEC_BUSY: packets other than end of stream are refused (nn::codec 3603, busy) from
++    // this many queued on, 3x the ready watermark (Lichii 72e9429daf, #659).
++    static constexpr size_t RefuseInputsAt = MaxQueuedInputs * 3;
+     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
+     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
+     // Movie pacing (see DropOvertakenFrames): a longer gap between acquires is a pause, a longer
+@@ -3025,17 +3028,75 @@
+             const auto data = ctx.ReadBufferA(0);
+             input.data.assign(data.begin(), data.end());
+         }
++        bool refused = false;
+         {
+             std::scoped_lock lk{m_mutex};
+-            m_inputs.push_back(std::move(input));
+-            m_stream_ended = false;
+-            m_ready->room.store(!end && m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
++            if (BusyEnabled()) {
++                refused = !QueueOrHold(std::move(input), end);
++            } else {
++                m_inputs.push_back(std::move(input));
++            }
++            if (!refused) {
++                m_stream_ended = false;
++                m_ready->room.store(!end && m_inputs.size() < MaxQueuedInputs,
++                                    std::memory_order_relaxed);
++            }
+         }
+         m_cv.notify_one();
++        if (refused) {
++            // nn::codec's module (111) is HwOpus in ErrorModule; 3603 = busy, retry after the
++            // submission-ready event. (3604, 0x1c286f, is 213's empty ring.)
++            constexpr Result ResultDecoderBusy{ErrorModule::HwOpus, 3603};
++            IPC::ResponseBuilder rb{ctx, 2};
++            rb.PushRaw<u32>(ResultDecoderBusy.raw);
++            return;
++        }
+         const u64 id = ++m_submitted;
+         TipcReplyWords(ctx, {static_cast<u32>(id), static_cast<u32>(id >> 32)});
+     }
+ 
++    // EDEN_UP_VDEC_BUSY=1 (Lichii 72e9429daf #659 + 89fecaa577 #809): the SDK answers busy when the
++    // decoder can't take a packet, and the client retries after the submission-ready event. Taking
++    // every packet let Ocarina of Time queue a whole movie: it feeds packets until one is refused,
++    // ~240-360 submits a second against 60 frames (run15), each an IPC on the service thread that
++    // also holds every present until vblank, and the movie's pictures came at 21-35 fps until all
++    // of it was in. End of stream is never refused.
++    static bool BusyEnabled() {
++        static const bool enabled = Common::PeSwitch("EDEN_UP_VDEC_BUSY");
++        return enabled;
++    }
++
++    // Queues a packet; false: answer busy (m_mutex held). A refused packet is held, not lost: a
++    // client that sends it again (Ocarina of Time) gets it taken once, and one that ignores the
++    // result and moves on (Mario Tennis Fever, ~23 packets in 4 ms when its menu clip loops) gets
++    // it queued ahead of its next packet, so VP9 never decodes against a missing reference.
++    bool QueueOrHold(Input input, bool end) {
++        if (m_held_input) {
++            if (m_held_input->pts != input.pts || m_held_input->data != input.data) {
++                m_inputs.push_back(std::move(*m_held_input));
++            }
++            m_held_input.reset();
++        }
++        if (!end && m_inputs.size() >= RefuseInputsAt) {
++            if (m_inputs_refused++ == 0) {
++                LOG_INFO(Service, "{} input queue full ({} packets, {} submitted): refusing busy",
++                         GetServiceName(), m_inputs.size(), m_submitted);
++            }
++            m_held_input = std::move(input);
++            return false;
++        }
++        m_inputs.push_back(std::move(input));
++        return true;
++    }
++
++    void LogRefusals(std::string_view why) {
++        if (m_inputs_refused != 0) {
++            LOG_INFO(Service, "{} {}: {} packets refused busy since the last", GetServiceName(), why,
++                     m_inputs_refused);
++            m_inputs_refused = 0;
++        }
++    }
++
+     // Flush (8) and Stop (207): drop queued input and frames not yet in an image. Images already
+     // handed out keep their place, so the sync values stay in step with the client's ring.
+     void Flush(HLERequestContext& ctx) {
+@@ -3043,6 +3104,8 @@
+         {
+             std::scoped_lock lk{m_mutex};
+             m_inputs.clear();
++            m_held_input.reset();
++            LogRefusals(ctx.GetCommand() == 8 ? "flush" : "stop");
+             // Images handed back after the end of the stream hold no frame for what follows.
+             std::erase_if(m_outputs, [](const Output& output) { return output.after_end; });
+             m_flush = true;
+@@ -3063,6 +3126,7 @@
+         Log(ctx, "finalize");
+         {
+             std::scoped_lock lk{m_mutex};
++            LogRefusals("finalize");
+             CompleteHandedFences();
+             m_clock_offset.reset();
+         }
+@@ -3082,11 +3146,16 @@
+ 
+     // Starts or corrects the movie clock from a frame the client just acquired (m_mutex held).
+     // The clock never runs behind a frame the client already shows.
++    // EDEN_UP_MOVIE_CLOCK=1 (Lichii 89fecaa577, #809): a frame acquired ahead of the clock doesn't
++    // move it; the clock starts from the first acquire and runs in real time (restarting as before
++    // after a pause, a loop or a lag over 3 s). Kirby Air Riders takes frames before it shows
++    // them, and following those acquires ran the clock ahead: 563 of 588 frames dropped late.
+     void AnchorClock(u64 pts) {
++        static const bool real_time = Common::PeSwitch("EDEN_UP_MOVIE_CLOCK");
+         const s64 now = HostTimeUs();
+         const s64 offset = now - static_cast<s64>(pts);
+         if (!m_clock_offset || now - m_last_acquire > PauseGap || pts < m_last_acquired_pts ||
+-            offset < *m_clock_offset || offset - *m_clock_offset > MaxCatchUp) {
++            (!real_time && offset < *m_clock_offset) || offset - *m_clock_offset > MaxCatchUp) {
+             m_clock_offset = offset;
+         }
+         m_last_acquire = now;
+@@ -3421,6 +3490,8 @@
+     u64 m_frame_interval{16667}; ///< us, from consecutive decoded frames
+     u64 m_last_decoded_pts{};
+     u32 m_dropped_in_a_row{};
++    std::optional<Input> m_held_input; ///< EDEN_UP_VDEC_BUSY: the last refused packet
++    u64 m_inputs_refused{};            ///< EDEN_UP_VDEC_BUSY: refusals since the last log line
+     std::deque<Input> m_inputs;
+     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
+     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
