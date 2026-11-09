@@ -1263,10 +1263,38 @@ POOL_PRESSURE = r'''    const auto PoolPressure = [this]() -> int {
             }
             const auto free_memory = ::Eden::Performance::graphics_memory_free.load(std::memory_order_relaxed);
             const u64 free_bytes = free_memory ? free_memory() : ~u64{0};
-            if ((refusal_frame != 0 && frame_tick - refusal_frame < 120) || free_bytes < critical_bytes) {
-                return 2;
+            // How fast the pool is falling, sampled every 250 ms or more (headless/texture_pool_pressure.h).
+            static u64 sampled_free = 0, falling_per_s = 0;
+            static auto sampled_at = std::chrono::steady_clock::now();
+            if (const auto now = std::chrono::steady_clock::now(); now - sampled_at >= std::chrono::milliseconds{250}) {
+                const auto ns = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - sampled_at).count());
+                falling_per_s = free_bytes != ~u64{0} && sampled_free != 0 && sampled_free > free_bytes
+                                    ? static_cast<u64>(double(sampled_free - free_bytes) * 1e9 / double(ns))
+                                    : 0;
+                sampled_free = free_bytes != ~u64{0} ? free_bytes : 0;
+                sampled_at = now;
             }
-            return free_bytes < short_bytes ? 1 : 0;
+            // EDEN_NX2_TC_ADAPTIVE=0: the fixed marks, as before.
+            static const bool adaptive = [] {
+                const char* value = std::getenv("EDEN_NX2_TC_ADAPTIVE");
+                return value == nullptr || value[0] != '0';
+            }();
+            const ::Eden::TexturePool::Inputs in{free_bytes, total_used_memory, short_bytes, critical_bytes,
+                                                 refusal_frame != 0 && frame_tick - refusal_frame < 120,
+                                                 falling_per_s};
+            const int level = adaptive ? ::Eden::TexturePool::Pressure(in) : ::Eden::TexturePool::FixedPressure(in);
+            static int last_level = 0;
+            static unsigned changes = 0;
+            if (level != last_level) {
+                last_level = level;
+                if (changes++ < 64) {
+                    LOG_INFO(HW_GPU, "Texture pool pressure {} ({}): {} MiB free, images {} MiB, falling {} MiB/s, marks {}/{} MiB",
+                             level, adaptive ? "adaptive" : "fixed", free_bytes == ~u64{0} ? 0 : free_bytes >> 20,
+                             total_used_memory >> 20, falling_per_s >> 20,
+                             ::Eden::TexturePool::ShortMark(in) >> 20, ::Eden::TexturePool::CriticalMark(in) >> 20);
+                }
+            }
+            return level;
         }
     };
 '''
@@ -1372,7 +1400,7 @@ for signature, index in (
     texture_costs.append((anchor, anchor + scope))
 adapt('src/video_core/texture_cache/texture_cache.h',
       'vulkan-cache/video_core/texture_cache/texture_cache.h', [
-    ('namespace VideoCommon {', '#include "performance.h"\n#include "common/scope_exit.h"\n'
+    ('namespace VideoCommon {', '#include <chrono>\n#include "performance.h"\n#include "texture_pool_pressure.h"\n#include "common/scope_exit.h"\n'
      '#ifdef PS5_NATIVE\n'
      'extern "C" bool eden_try_resident_guest_write(void*, std::size_t, void (*)(void*), void*);\n'
      '#endif\nnamespace Vulkan { class TextureCacheRuntime; }\n\nnamespace VideoCommon {'),
