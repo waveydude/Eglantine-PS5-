@@ -64,10 +64,6 @@ int sceKernelDebugOutText(int, const char*);
 }
 #endif
 
-// Threads of the guest memory service name themselves for the crash report and the thread dump
-// (headless/crash_report.cpp). Weak: a check built without the frontend links, and skips it.
-extern "C" void eden_crash_name_thread(const char* name) __attribute__((weak));
-
 namespace Common {
 namespace {
 // The header sits in the page before the data. Blocks of at least LargePage start their data

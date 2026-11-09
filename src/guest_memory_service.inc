@@ -1320,7 +1320,6 @@ bool scanner_stop = false;
 std::thread keeper;
 
 void ReserveKeeper() {
-    if (::eden_crash_name_thread) ::eden_crash_name_thread("CramKeeper");  // crash report, thread dump
     std::unique_lock lock{scanner_mutex};
     while (!scanner_stop) {
         scanner_wake.wait_for(lock, std::chrono::milliseconds(100), [] { return scanner_stop; });
@@ -1466,7 +1465,6 @@ void SwapTick(SparseRange& range, std::size_t& hand, std::vector<std::pair<std::
 
 std::thread swapper;
 void SwapLoop(SparseRange* range) {
-    if (::eden_crash_name_thread) ::eden_crash_name_thread("GuestSwapper");  // crash report, thread dump
     std::vector<std::pair<std::int64_t, std::size_t>> cold;
     cold.reserve((range->end - range->begin.load(std::memory_order_relaxed)) / SparseSlot);
     std::size_t hand = 0;
@@ -2077,7 +2075,6 @@ void MeasureFinePages(SparseRange& range) noexcept {
 }
 
 void ScannerLoop(SparseRange* range) {
-    if (::eden_crash_name_thread) ::eden_crash_name_thread("CramScanner");  // crash report, thread dump
     auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     std::unique_lock lock{scanner_mutex};
     while (!scanner_stop) {
