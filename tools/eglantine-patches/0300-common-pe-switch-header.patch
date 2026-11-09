@@ -1,0 +1,23 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] common/pe_switch.h: Common::PeSwitch (exact "1" enables an experimental switch)
+
+Upstream (Vampinity ocarina-test-2) adds this header in 0310-pe-gc-evictions, which is not ported here;
+0342, 0408, 0411, 0429-0431 include it. Header only, unchanged.
+---
+diff --git a/src/common/pe_switch.h b/src/common/pe_switch.h
+new file mode 100644
+index 0000000..b3a6612
+--- /dev/null
++++ b/src/common/pe_switch.h
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++#pragma once
++#include <cstdlib>
++
++namespace Common {
++// Callers cache this at first use; only an exact "1" enables an experimental PE port.
++inline bool PeSwitch(const char* name) noexcept {
++    const char* value = std::getenv(name);
++    return value != nullptr && value[0] == '1' && value[1] == '\0';
++}
++} // namespace Common
