@@ -1,0 +1,24 @@
+Subject: [PATCH] transform feedback: leave out a buffer whose varying count is larger than the table (pond desync freeze/crash at ~122 s)
+diff --git a/src/video_core/transform_feedback.cpp b/src/video_core/transform_feedback.cpp
+--- a/src/video_core/transform_feedback.cpp
++++ b/src/video_core/transform_feedback.cpp
+@@ -70,6 +70,19 @@
+     for (size_t buffer = 0; buffer < state.layouts.size(); ++buffer) {
+         const auto& locations = state.varyings[buffer];
+         const auto& layout = state.layouts[buffer];
++        // The varyings table holds 32 words of 4 attributes: 128 varyings per buffer. A larger
++        // count is junk register state (Ocarina's pond, after a pushbuffer desync left
++        // varying_count near 0x80000000); walking it read up to ~1 GiB past the table and
++        // faulted on GPUBack ~33 s later (T64, eboot+0x172aa47). Leave such a buffer out.
++        const u32 max_varyings = static_cast<u32>(locations.size() * 4);
++        if (layout.varying_count > max_varyings) {
++            static std::atomic<bool> reported_count{};
++            if (!reported_count.exchange(true, std::memory_order_relaxed)) {
++                LOG_WARNING(Render, "TFB buffer {} varying count {} above {}: left out (logged once)",
++                            buffer, layout.varying_count, max_varyings);
++            }
++            continue;
++        }
+         const u32 varying_count = layout.varying_count;
+         u32 highest = 0;
+         for (u32 offset = 0; offset < varying_count; ++offset) {

@@ -1,0 +1,19 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] dma_pusher.cpp: include <utility> and common/pe_switch.h
+
+Prerequisite of 0408/0411 (upstream got both includes from 0286/0405, which are not ported here).
+---
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -8,7 +8,9 @@
+ #include <atomic>
+ #include <cstdlib>
+ #include <cstdio>
+-
++#include <utility>
++
++#include "common/pe_switch.h"
+ #include "common/scope_exit.h"
+ #include "common/settings.h"
+ #include "core/core.h"

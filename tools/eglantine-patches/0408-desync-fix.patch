@@ -1,0 +1,554 @@
+Subject: [PATCH] dma_pusher: after a semaphore-wait resume keep the submit copy of a command list the game has already reshaped (pond desync), EDEN_NX2_DESYNC_FIX=1, Ocarina only
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -8,6 +8,8 @@
+ #include <atomic>
+ #include <cstdlib>
+ #include <cstdio>
++#include <cstring>
++#include <string>
+ #include <utility>
+ 
+ #include "common/pe_switch.h"
+@@ -133,7 +135,160 @@
+                 fetch_dropped_words.load(std::memory_order_relaxed),
+                 Tegra::g_nx2_new_written_pages.load(std::memory_order_relaxed));
+ }
++
++// How ProcessCommands would walk an entry's words from word `start` with `carry` words of an open
++// method wanted there (the refresh check: EDEN_NX2_DESYNC_FIX and its log). With `other` (the
++// same entry's words from elsewhere), also how many of the walk's header words `other` holds
++// otherwise: an inline header's value is data, its mode, subchannel and method are not. Matches
++// ProcessCommands with EDEN_NX2_JUNK_GUARD, PARK_SPLIT_METHODS and SPLIT_PARSE_CHECK off (the fix
++// stays off with any of them set).
++struct ShapeWalk {
++    u32 end = 0;          ///< Words of a method still wanted at the end (the next entry's carry)
++    u32 headers = 0;      ///< Header words walked
++    u32 header_diffs = 0; ///< Of those, words `other` holds otherwise
++    u32 dropped = 0;      ///< Nonzero words in a mode ProcessCommands drops (data read as a header)
++    u32 zero_headers = 0; ///< Zero header words where `other` holds a nonzero word (unwritten)
++};
++
++ShapeWalk WalkCommandShape(std::span<const CommandHeader> words, size_t start, u32 carry,
++                           std::span<const CommandHeader> other = {}) {
++    ShapeWalk walk;
++    size_t i = (std::min)(start, words.size());
++    const size_t carried = (std::min)(size_t{carry}, words.size() - i);
++    i += carried;
++    carry -= static_cast<u32>(carried);
++    while (i < words.size()) {
++        const CommandHeader header = words[i];
++        ++walk.headers;
++        if (i < other.size()) {
++            const u32 mask = header.mode == SubmissionMode::Inline ? 0xE000FFFFU : ~0U;
++            walk.header_diffs += ((header.argument ^ other[i].argument) & mask) != 0 ? 1 : 0;
++            walk.zero_headers += header.argument == 0 && other[i].argument != 0 ? 1 : 0;
++        }
++        ++i;
++        switch (header.mode) {
++        case SubmissionMode::Increasing:
++        case SubmissionMode::NonIncreasing:
++        case SubmissionMode::IncreaseOnce: {
++            const u32 count = header.method_count;
++            const size_t taken = (std::min)(size_t{count}, words.size() - i);
++            i += taken;
++            carry = count - static_cast<u32>(taken);
++            break;
++        }
++        case SubmissionMode::Inline:
++            break;
++        default:
++            walk.dropped += header.argument != 0 ? 1 : 0;
++            break;
++        }
++    }
++    walk.end = carry;
++    return walk;
++}
++
++// How the refresh check judged an entry whose memory differs from its copy (see RefreshSnapshot).
++enum class RefreshVerdict {
++    DataOnly,    // same header words: memory taken
++    Kept,        // reshaped, the copy walks clean: copy kept (fix on)
++    WouldKeep,   // the same, fix off or gated out: memory taken (as T63)
++    KeptForList, // data words only, after a reshape earlier in the list: copy kept (fix on)
++    CopyBroken,  // reshaped, the copy drops words and memory doesn't: memory taken
++    BothBroken,  // reshaped, both drop words: memory taken (as T63)
++    Unwritten,   // the copy is zeros where memory has commands (submitted before written)
++};
++
++constexpr const char* RefreshVerdictName(RefreshVerdict verdict) {
++    switch (verdict) {
++    case RefreshVerdict::DataOnly:
++        return "data words only, took memory";
++    case RefreshVerdict::Kept:
++        return "reshaped, kept the submit copy (DESYNC_FIX)";
++    case RefreshVerdict::WouldKeep:
++        return "reshaped, took memory (fix off: would keep the copy)";
++    case RefreshVerdict::KeptForList:
++        return "data words only after a reshape in this list, kept the submit copy (DESYNC_FIX)";
++    case RefreshVerdict::CopyBroken:
++        return "reshaped, the copy drops words and memory doesn't, took memory";
++    case RefreshVerdict::BothBroken:
++        return "reshaped, both drop words, took memory (as T63)";
++    case RefreshVerdict::Unwritten:
++        return "copy never written (zeros), took memory";
++    }
++    return "?";
++}
++
++// The refresh check's rule for an entry whose memory differs from its copy from word `start` on,
++// with `carry` words of an open method wanted there (RefreshSnapshot). `list_reshaped`: an entry
++// earlier in the list, from the resume point on, kept its copy for a reshape. Fills both walks.
++RefreshVerdict JudgeRefresh(std::span<const CommandHeader> copy, std::span<const CommandHeader> memory,
++                            size_t start, u32 carry, bool fix, bool list_reshaped,
++                            ShapeWalk& copy_walk, ShapeWalk& memory_walk) {
++    copy_walk = WalkCommandShape(copy, start, carry, memory);
++    memory_walk = WalkCommandShape(memory, start, carry, copy);
++    const bool copy_zeros =
++        std::all_of(copy.begin() + (std::min)(start, copy.size()), copy.end(),
++                    [](CommandHeader word) { return word.argument == 0; });
++    // Zeros where memory has commands: submitted before it was written (upstream 256b1dc346).
++    if (copy_zeros || (copy_walk.zero_headers != 0 && memory_walk.dropped == 0)) {
++        return RefreshVerdict::Unwritten;
++    }
++    const bool reshaped = copy_walk.header_diffs != 0 || memory_walk.header_diffs != 0 ||
++                          copy_walk.end != memory_walk.end;
++    if (!reshaped) {
++        return list_reshaped && fix ? RefreshVerdict::KeptForList : RefreshVerdict::DataOnly;
++    }
++    if (copy_walk.dropped == 0) {
++        return fix ? RefreshVerdict::Kept : RefreshVerdict::WouldKeep;
++    }
++    return memory_walk.dropped == 0 ? RefreshVerdict::CopyBroken : RefreshVerdict::BothBroken;
++}
++
++// Refresh check log budget: per resume a summary line and up to 4 entry lines (reshaped entries
++// first), for the first 512 resumes with a differing entry, then every 256th; entry lines stop
++// at 4096 overall.
++constexpr u64 RefreshCheckEventsLogged = 512;
++constexpr u32 RefreshCheckDetailsPerEvent = 4;
++constexpr u64 RefreshCheckDetailsTotal = 4096;
++std::atomic<u64> refresh_check_events{};
++std::atomic<u64> refresh_check_details{};
++
++bool RefreshCheckEventLogged(u64 event) {
++    return event <= RefreshCheckEventsLogged || (event & 0xff) == 0;
++}
+ } // Anonymous namespace
++
++// EDEN_NX2_DESYNC_FIX=1 (exact "1"): see DmaPusher::RefreshSnapshot. Only for Ocarina of Time on
++// Switch 2: Mario Kart World (after a present) and Pokopia submit lists before they write them
++// (upstream 256b1dc346), so a submit copy there can be an older frame that walks clean, and keeping
++// it would bring back their wrong-frame and fence-hang bugs. The walk matches the parser only with
++// the junk guard and split-method parking off, so the fix stays off with any of them set.
++bool DmaPusher::DesyncFixActive() const {
++    static const bool wanted = Common::PeSwitch("EDEN_NX2_DESYNC_FIX");
++    if (!wanted) {
++        return false;
++    }
++    static const bool parser_switches = [] {
++        const char* guard = std::getenv("EDEN_NX2_JUNK_GUARD");
++        const bool clash = (guard != nullptr && guard[0] == '1') ||
++                           std::getenv("EDEN_NX2_PARK_SPLIT_METHODS") != nullptr ||
++                           SplitCheckMode() != 0;
++        if (clash) {
++            LOG_WARNING(HW_GPU, "EDEN_NX2_DESYNC_FIX=1 stays off: JUNK_GUARD, PARK_SPLIT_METHODS "
++                                "or SPLIT_PARSE_CHECK is set, and its walk doesn't model them");
++        }
++        return clash;
++    }();
++    constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
++    const bool title = Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
++                       system.GetApplicationProcessProgramID() == OcarinaOfTimeProgramId;
++    if (static std::atomic<bool> reported{}; !title && !reported.exchange(true)) {
++        LOG_WARNING(HW_GPU, "EDEN_NX2_DESYNC_FIX=1 stays off: not Ocarina of Time on Switch 2 "
++                            "(program {:#018x})",
++                    system.GetApplicationProcessProgramID());
++    }
++    return !parser_switches && title;
++}
+ 
+ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Control::ChannelState& channel_state_)
+     : system{system_}
+@@ -267,13 +422,43 @@
+     // as this frame's commands (methods on unbound subchannels, garbage QMDs, then a channel
+     // waiting forever on a release it never got). The acquire is released now, so the commands
+     // are written and the memory not yet reused: copy them here. EDEN_NX2_RESNAPSHOT=0: off.
++    // The front list holds the entry that suspended: the parse goes on there, at its resume word,
++    // with the method count it had. The refresh check (EDEN_NX2_DESYNC_FIX and its log) walks the
++    // stream from that point through every queued list, the injected ones too.
++    bool resume_checked = false; // the resumed entry's copy was judged with the fix on
+     if (ResnapshotEnabled() && suspensions.load(std::memory_order_relaxed) != suspensions_before) {
+         const u64 now = suspensions.load(std::memory_order_acquire);
++        RefreshCheck check;
++        check.fix = DesyncFixActive();
++        check.carry = dma_state.method_count;
+         for (CommandList& list : dma_pushbuffer) {
++            const bool front = check.list_index == 0;
++            const size_t first_entry = front ? dma_pushbuffer_subindex : 0;
++            const size_t first_word = front ? command_resume_offset : 0;
+             if (!list.submitted_offsets.empty()) {
+-                RefreshSnapshot(list, now);
+-            }
+-        }
++                // Copied before this suspension (even count): the submit copy can be judged.
++                resume_checked = resume_checked ||
++                                 (front && check.fix && (list.snapshot_suspensions & 1) == 0);
++                RefreshSnapshot(list, now, &check, first_entry, first_word);
++            } else if (!list.prefetch_command_list.empty()) {
++                // A driver-injected wait or increment list: a method still open eats its words
++                // (dma_state is never reset between lists), and its fence may never signal.
++                const std::span<const CommandHeader> words{list.prefetch_command_list};
++                if (check.carry_known && check.carry != 0 && check.injected_carry == 0) {
++                    check.injected_carry = check.carry;
++                    check.injected_list = check.list_index;
++                }
++                if (check.carry_known) {
++                    check.carry =
++                        WalkCommandShape(words, (std::min)(first_word, words.size()), check.carry)
++                            .end;
++                }
++            } else if (!list.command_lists.empty()) {
++                check.carry_known = false; // no copies (PB_SNAPSHOT=0): memory at the parse
++            }
++            ++check.list_index;
++        }
++        ReportRefreshCheck(check);
+     }
+ 
+     CommandList& command_list = dma_pushbuffer.front();
+@@ -412,7 +597,13 @@
+         // safe read below would flush (with the split, the front can't tell: it reads memory
+         // unflushed anyway). Entries on pages the GPU writes (culling) always take the flushing
+         // read: their words at submit time are an older frame's.
+-        const bool submitted = command_resume_offset == 0 &&
++        // EDEN_NX2_DESYNC_FIX=1: a resumed entry parses its copy from its resume word too, once
++        // this resume's refresh judged it (RefreshSnapshot: memory's words, or the submit copy
++        // when memory holds other commands). Off, a resumed entry reads memory, and
++        // after an acquire in Ocarina's pond that held a later frame's commands (run 306: entry
++        // 3808 resumed at word 831 read 22 of them and left a method open into entry 3809).
++        const bool resume_from_copy = command_resume_offset != 0 && resume_checked;
++        const bool submitted = (command_resume_offset == 0 || resume_from_copy) &&
+                                dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
+                                command_list.submitted_offsets[dma_pushbuffer_subindex] <
+                                    command_list.submitted_words.size() &&
+@@ -446,7 +637,8 @@
+                     command_list.submitted_offsets[dma_pushbuffer_subindex],
+                 header.size};
+             RecordParsedEntry(header, commands);
+-            command_resume_offset += ProcessCommands(commands, 0);
++            command_resume_offset +=
++                ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+         } else if (use_safe) {
+             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
+             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
+@@ -893,7 +1085,32 @@
+     }
+ }
+ 
+-void DmaPusher::RefreshSnapshot(CommandList& list, u64 now) {
++// The entries' sizes were fixed when the list was submitted, and so were the commands they hold:
++// memory can differ by now for three reasons. The game patched words in place before it released
++// an acquire (data words: the stream keeps its header words; Hyrule Warriors: Age of
++// Imprisonment), it submitted the list before it wrote it (Mario Kart World, Pokopia: upstream
++// 256b1dc346; those lists are copied during a suspension or are zeros at submit), or it already
++// recorded a later frame over the same command ring while the GPU thread ran frames behind
++// (Ocarina's pond, runs 162/247/282/293/298/299/306). The later recording's header words sit
++// elsewhere: a method runs past an entry's end into an unrelated entry (a call entry elsewhere in
++// memory), the parse slips a word, and the stream turns to junk.
++//
++// Without `check` (Push): memory's words, as T63. With it (a resume, Step), each entry from the
++// resume point on whose memory differs from its copy is walked both ways from the carry the stream
++// has there, and judged (RefreshVerdict):
++// - copy zeros where memory has commands: never written, memory;
++// - same header words: data only, memory; with EDEN_NX2_DESYNC_FIX, the copy once an entry earlier
++//   in this list was kept for a reshape (no later-frame data mixed into this frame's commands);
++// - other header words and the copy walks clean: with EDEN_NX2_DESYNC_FIX the copy, else memory;
++// - other header words, the copy drops words, memory doesn't: memory (the copy is the stale one);
++// - both drop words: memory, as T63, logged.
++// Lists copied during a suspension (odd count: 256b1dc346's lists), GPU-written and deferred
++// entries, and everything after a carry the walk can't know, take memory as T63 and are only
++// counted. Logged per resume (ReportRefreshCheck), bounded.
++void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, RefreshCheck* check,
++                                size_t first_entry, size_t first_word) {
++    // Copied before this suspension began, or at an earlier resume: a copy that can be judged.
++    const bool judged_list = check != nullptr && (list.snapshot_suspensions & 1) == 0;
+     list.snapshot_suspensions = now;
+     if (FetchCountMode() != 0) {
+         // The words as submitted, for CountFetchedEntry. A deferred entry's slot holds none.
+@@ -903,16 +1120,189 @@
+         ++list.refreshes;
+         fetch_refreshed_lists.fetch_add(1, std::memory_order_relaxed);
+     }
++    bool list_reshaped = false; // an entry from the resume point on was kept for a reshape
++    // Counts a differing entry; the first of this resume numbers the resume for the log.
++    const auto note_change = [&](size_t i, u64 address, size_t size, size_t start) {
++        if (++check->differing == 1) {
++            check->event = refresh_check_events.fetch_add(1, std::memory_order_relaxed) + 1;
++            check->first_change = fmt::format("list +{} entry {} of {} at {:#x}+{:#x} word {}",
++                                              check->list_index, i, list.command_lists.size(),
++                                              address, size, start);
++        }
++    };
+     for (size_t i = 0; i < list.command_lists.size() && i < list.submitted_offsets.size(); ++i) {
+         const CommandListHeader& entry = list.command_lists[i];
+         const u32 offset = list.submitted_offsets[i];
+-        if (size_t{offset} + entry.size > list.submitted_words.size()) {
++        const size_t size = entry.size;
++        CommandHeader* const copy = size_t{offset} + size > list.submitted_words.size()
++                                        ? nullptr
++                                        : list.submitted_words.data() + offset;
++        if (check == nullptr || i < first_entry) {
++            // Push, or parsed before the suspension (never parsed again): as T63.
++            if (copy != nullptr) {
++                memory_manager.ReadBlockUnsafe(entry.addr, copy, size * sizeof(u32));
++            }
+             continue;
+         }
+-        memory_manager.ReadBlockUnsafe(entry.addr, list.submitted_words.data() + offset,
+-                                       entry.size * sizeof(u32));
++        const size_t start = i == first_entry ? (std::min)(first_word, size) : 0;
++        if (copy == nullptr) {
++            // Empty at submit (DEFER_EMPTY), read at the parse: mostly the 2 or 3 GPU-written
++            // words of a macro the entry before began. Known only while it is all data.
++            const size_t left = size - start;
++            if (check->carry_known && check->carry >= left) {
++                check->carry -= static_cast<u32>(left);
++            } else {
++                check->carry_known = false;
++            }
++            continue;
++        }
++        refresh_scratch.resize(size);
++        memory_manager.ReadBlockUnsafe(entry.addr, refresh_scratch.data(), size * sizeof(u32));
++        const std::span<const CommandHeader> memory{refresh_scratch.data(), size};
++        const std::span<const CommandHeader> submitted{copy, size};
++        const bool same = std::memcmp(copy + start, refresh_scratch.data() + start,
++                                      (size - start) * sizeof(u32)) == 0;
++        // A deferred entry's slot holds no words yet; a GPU-written entry is parsed from the
++        // GPU's words, not this copy.
++        if (same || !judged_list || !check->carry_known ||
++            std::ranges::binary_search(list.deferred_entries, static_cast<u32>(i)) ||
++            IsGpuWrittenCommands(entry.addr, size * sizeof(u32))) {
++            std::memcpy(copy, refresh_scratch.data(), size * sizeof(u32));
++            if (check->carry_known) {
++                check->carry = WalkCommandShape(memory, start, check->carry).end;
++            }
++            if (!same) {
++                note_change(i, u64{entry.addr}, size, start);
++                ++check->unchecked;
++            }
++            continue;
++        }
++        const u32 carry_in = check->carry;
++        ShapeWalk copy_walk;
++        ShapeWalk memory_walk;
++        const RefreshVerdict verdict = JudgeRefresh(submitted, memory, start, carry_in, check->fix,
++                                                    list_reshaped, copy_walk, memory_walk);
++        switch (verdict) {
++        case RefreshVerdict::DataOnly:
++            ++check->data_only;
++            break;
++        case RefreshVerdict::Kept:
++            ++check->kept;
++            list_reshaped = true;
++            break;
++        case RefreshVerdict::WouldKeep:
++            ++check->would_keep;
++            break;
++        case RefreshVerdict::KeptForList:
++            ++check->kept_for_list;
++            break;
++        case RefreshVerdict::CopyBroken:
++            ++check->copy_broken;
++            break;
++        case RefreshVerdict::BothBroken:
++            ++check->both_broken;
++            break;
++        case RefreshVerdict::Unwritten:
++            ++check->unwritten;
++            break;
++        }
++        note_change(i, u64{entry.addr}, size, start);
++        const bool keep_copy =
++            verdict == RefreshVerdict::Kept || verdict == RefreshVerdict::KeptForList;
++        check->carry = keep_copy ? copy_walk.end : memory_walk.end;
++
++        const bool data_only =
++            verdict == RefreshVerdict::DataOnly || verdict == RefreshVerdict::KeptForList;
++        if (!data_only && check->later_list.empty()) {
++            check->later_list = LaterListOverlapping(list, entry.addr, u64{size} * sizeof(u32));
++        }
++        // Reshaped entries use the whole budget, data-only ones its first half.
++        const u32 budget = data_only ? RefreshCheckDetailsPerEvent / 2 : RefreshCheckDetailsPerEvent;
++        if (RefreshCheckEventLogged(check->event) && check->details < budget &&
++            refresh_check_details.fetch_add(1, std::memory_order_relaxed) <
++                RefreshCheckDetailsTotal) {
++            ++check->details;
++            size_t differing = 0;
++            for (size_t w = start; w < size; ++w) {
++                differing += copy[w].argument != refresh_scratch[w].argument ? 1 : 0;
++            }
++            const auto word = [&](std::span<const CommandHeader> words, size_t at) {
++                return at < words.size() ? words[at].argument : 0U;
++            };
++            const bool next_adjacent =
++                i + 1 < list.command_lists.size() &&
++                list.command_lists[i + 1].addr == entry.addr + size * sizeof(u32);
++            LOG_WARNING(HW_GPU,
++                        "Refresh check {} entry: list +{} entry {} of {} at {:#x}+{:#x} from word "
++                        "{}, {} words carried in: {} words differ; header words differ {} (copy "
++                        "walk, {} headers) / {} (memory walk, {} headers); drops {} (copy) / {} "
++                        "(memory); ends wanting {} (copy) / {} (memory), next entry adjacent {}: "
++                        "{}; copy {:08x} {:08x} {:08x} {:08x}, memory {:08x} {:08x} {:08x} {:08x}",
++                        check->event, check->list_index, i, list.command_lists.size(),
++                        u64{entry.addr}, size, start, carry_in, differing, copy_walk.header_diffs,
++                        copy_walk.headers, memory_walk.header_diffs, memory_walk.headers,
++                        copy_walk.dropped, memory_walk.dropped, copy_walk.end, memory_walk.end,
++                        next_adjacent, RefreshVerdictName(verdict), word(submitted, start),
++                        word(submitted, start + 1), word(submitted, start + 2),
++                        word(submitted, start + 3), word(memory, start), word(memory, start + 1),
++                        word(memory, start + 2), word(memory, start + 3));
++        }
++        if (!keep_copy) {
++            std::memcpy(copy, refresh_scratch.data(), size * sizeof(u32));
++        }
+     }
+     list.deferred_entries.clear();
++}
++
++void DmaPusher::ReportRefreshCheck(const RefreshCheck& check) const {
++    if (check.differing == 0 || !RefreshCheckEventLogged(check.event)) {
++        return;
++    }
++    const std::string end =
++        check.carry_known ? fmt::format("{}", check.carry) : std::string{"unknown"};
++    const std::string injected =
++        check.injected_carry != 0
++            ? fmt::format("{} words into list +{}", check.injected_carry, check.injected_list)
++            : std::string{"none"};
++    LOG_WARNING(HW_GPU,
++                "Refresh check {}: resume at entry {} word {} with {} words wanted, {} lists, fix "
++                "{}: {} entries differ: {} data only, {} kept (reshaped), {} kept (rest of the "
++                "list), {} would keep (fix off), {} copy broken, {} both broken, {} never "
++                "written, {} not judged; first {}; later queued list on the first reshaped: {}; "
++                "carry into an injected list: {}; carry at the end: {}",
++                check.event, dma_pushbuffer_subindex, command_resume_offset,
++                dma_state.method_count, check.list_index, check.fix ? "on" : "off",
++                check.differing, check.data_only, check.kept, check.kept_for_list,
++                check.would_keep, check.copy_broken, check.both_broken, check.unwritten,
++                check.unchecked, check.first_change,
++                check.later_list.empty() ? std::string{"-"} : check.later_list, injected, end);
++}
++
++std::string DmaPusher::LaterListOverlapping(const CommandList& list, GPUVAddr address,
++                                            u64 bytes) const {
++    // `list` is queued (a refresh after a resume) or not yet (a refresh in Push: none is later).
++    size_t later = 0;
++    bool after = false;
++    for (const CommandList& queued : dma_pushbuffer) {
++        if (&queued == &list) {
++            after = true;
++            continue;
++        }
++        if (!after) {
++            continue;
++        }
++        ++later;
++        for (size_t j = 0; j < queued.command_lists.size(); ++j) {
++            const CommandListHeader& other = queued.command_lists[j];
++            const GPUVAddr other_address = other.addr;
++            const u64 other_bytes = u64{other.size} * sizeof(u32);
++            if (other_address < address + bytes && address < other_address + other_bytes) {
++                return fmt::format("list +{} entry {} of {} at {:#x}+{:#x}", later, j,
++                                   queued.command_lists.size(), other_address, u64{other.size});
++            }
++        }
++    }
++    return after ? fmt::format("none of {} queued after", later) : std::string{"none queued after"};
+ }
+ 
+ void DmaPusher::RefreshDeferredEntries(CommandList& list) {
+@@ -1110,11 +1500,13 @@
+ u32 DmaPusher::FetchReasonOf(const CommandList& list, bool submitted, bool gpu_written) const {
+     // In the order of Step's `submitted`.
+     const size_t index = dma_pushbuffer_subindex;
++    // First: with EDEN_NX2_DESYNC_FIX a resumed entry parses its copy (`submitted`), and is still
++    // counted as resumed. Off, `submitted` is never true for one, so the order changes nothing.
++    if (command_resume_offset != 0) {
++        return FetchResumed;
++    }
+     if (submitted) {
+         return list.refreshes != 0 ? FetchRefreshedCopy : FetchSubmitCopy;
+-    }
+-    if (command_resume_offset != 0) {
+-        return FetchResumed;
+     }
+     if (index >= list.submitted_offsets.size()) {
+         return FetchNoCopy;
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -11,6 +11,7 @@
+ #include <condition_variable>
+ #include <optional>
+ #include <span>
++#include <string>
+ #include <vector>
+ #include <boost/container/small_vector.hpp>
+ #include <deque>
+@@ -227,10 +228,50 @@
+     u64 list_fast_since{};
+     /// EDEN_NX2_FETCH_RECHECK=1: logs how the words the parser got for a hit differ from the copy.
+     void NoteFetchRecheckWords(u64 hit, std::span<const CommandHeader> commands, const char* how);
+-    /// Copies the list's words from memory again, as of suspension count `now`.
+-    void RefreshSnapshot(CommandList& list, u64 now);
++    /// One resume's walk of the queued stream, for the refresh check (EDEN_NX2_DESYNC_FIX and its
++    /// always-on log). The parse goes on at the front list's entry and word, with `carry` words of
++    /// an open method wanted there; each list hands its end carry to the next.
++    struct RefreshCheck {
++        u64 event = 0;            ///< Resumes with a differing entry so far (this one's number)
++        bool fix = false;         ///< EDEN_NX2_DESYNC_FIX on, and gated to this title
++        bool carry_known = true;  ///< False after a list or entry whose words the parse reads later
++        u32 carry = 0;            ///< Words of an open method wanted where the walk is now
++        u32 list_index = 0;       ///< The list being walked (0 = front)
++        u32 differing = 0;        ///< Entries whose words differ from their copy
++        u32 data_only = 0;        ///< Only data words differ: took memory
++        u32 kept = 0;             ///< Reshaped, the copy walks clean: kept the copy
++        u32 would_keep = 0;       ///< The same with the fix off or gated out: took memory
++        u32 kept_for_list = 0;    ///< Data words only, after a reshape in the list: kept the copy
++        u32 copy_broken = 0;      ///< Reshaped, the copy drops words and memory doesn't: memory
++        u32 both_broken = 0;      ///< Reshaped, both drop words: took memory (as T63)
++        u32 unwritten = 0;        ///< The copy was never written (zeros): took memory
++        u32 unchecked = 0;        ///< Differs, not judged (GPU-written, deferred, copied during a
++                                  ///< suspension, or the carry unknown): took memory (as T63)
++        u32 details = 0;          ///< Per-entry lines logged for this resume
++        u32 injected_carry = 0;   ///< First nonzero carry into an injected list (eats its words)
++        u32 injected_list = 0;    ///< That list's index
++        std::string first_change; ///< The first differing entry
++        std::string later_list;   ///< A later queued list on the first reshaped entry's words
++    };
++    /// Copies the list's words from memory again, as of suspension count `now`. With `check` (a
++    /// resume, Step), also judges each entry from `first_entry`/`first_word` on whose memory
++    /// differs from its copy (DmaPusher.cpp, RefreshSnapshot). Without (Push): as T63.
++    void RefreshSnapshot(CommandList& list, u64 now, RefreshCheck* check = nullptr,
++                         size_t first_entry = 0, size_t first_word = 0);
+     /// Copies the list's deferred entries (CommandList::deferred_entries) from memory.
+     void RefreshDeferredEntries(CommandList& list);
++
++    /// EDEN_NX2_DESYNC_FIX=1 (exact "1", off unless set), Ocarina of Time on Switch 2 only: a
++    /// refresh after a resume keeps an entry's submit copy when memory holds other commands (the
++    /// game recorded a later frame there) and the copy walks clean, and a resumed entry parses its
++    /// copy instead of memory. Off or another title: as T63.
++    bool DesyncFixActive() const;
++    std::vector<CommandHeader> refresh_scratch; ///< RefreshSnapshot: one entry's words in memory
++    /// The queued list and entry, after `list`, whose words overlap [address, address + bytes):
++    /// for the refresh log only.
++    std::string LaterListOverlapping(const CommandList& list, GPUVAddr address, u64 bytes) const;
++    /// Logs a resume's refresh check (one summary line, bounded).
++    void ReportRefreshCheck(const RefreshCheck& check) const;
+ 
+     /// EDEN_NX2_RESNAPSHOT=0 turns snapshot refreshes off.
+     static bool ResnapshotEnabled() {

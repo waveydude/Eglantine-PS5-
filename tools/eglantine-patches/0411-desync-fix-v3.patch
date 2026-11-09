@@ -1,0 +1,410 @@
+Subject: [PATCH] desync fix v3: judge later queued lists, log why entries are not judged, startup line (EDEN_NX2_DESYNC_FIX=1/2)
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -258,34 +258,60 @@
+ }
+ } // Anonymous namespace
+ 
+-// EDEN_NX2_DESYNC_FIX=1 (exact "1"): see DmaPusher::RefreshSnapshot. Only for Ocarina of Time on
+-// Switch 2: Mario Kart World (after a present) and Pokopia submit lists before they write them
+-// (upstream 256b1dc346), so a submit copy there can be an older frame that walks clean, and keeping
+-// it would bring back their wrong-frame and fence-hang bugs. The walk matches the parser only with
+-// the junk guard and split-method parking off, so the fix stays off with any of them set.
++// EDEN_NX2_DESYNC_FIX=1 (exact "1"): see DmaPusher::RefreshSnapshot. =2: the same, except lists
++// copied during a suspension take memory as T63 (judged for the log only). Read once.
++int DmaPusher::DesyncFixMode() {
++    static const int mode = [] {
++        if (Common::PeSwitch("EDEN_NX2_DESYNC_FIX")) {
++            return 1;
++        }
++        const char* value = std::getenv("EDEN_NX2_DESYNC_FIX");
++        return value != nullptr && value[0] == '2' && value[1] == '\0' ? 2 : 0;
++    }();
++    return mode;
++}
++
++namespace {
++// The walk matches the parser only with the junk guard, split-method parking and the split parse
++// check off: with any of them set the fix stays off (logged once, from the first DmaPusher).
++bool DesyncFixParserClash(int split_check_mode) {
++    static const bool clash = [split_check_mode] {
++        const char* guard = std::getenv("EDEN_NX2_JUNK_GUARD");
++        const bool clash_now = (guard != nullptr && guard[0] == '1') ||
++                               std::getenv("EDEN_NX2_PARK_SPLIT_METHODS") != nullptr ||
++                               split_check_mode != 0;
++        if (clash_now) {
++            LOG_WARNING(HW_GPU, "EDEN_NX2_DESYNC_FIX={} stays off: JUNK_GUARD, PARK_SPLIT_METHODS "
++                                "or SPLIT_PARSE_CHECK is set, and its walk doesn't model them",
++                        DmaPusher::DesyncFixMode());
++        }
++        return clash_now;
++    }();
++    return clash;
++}
++} // Anonymous namespace
++
++// Only for Ocarina of Time on Switch 2: Mario Kart World (after a present) and Pokopia submit
++// lists before they write them (upstream 256b1dc346), so a submit copy there can be an older frame
++// that walks clean, and keeping it would bring back their wrong-frame and fence-hang bugs.
+ bool DmaPusher::DesyncFixActive() const {
+-    static const bool wanted = Common::PeSwitch("EDEN_NX2_DESYNC_FIX");
+-    if (!wanted) {
++    if (DesyncFixMode() == 0) {
+         return false;
+     }
+-    static const bool parser_switches = [] {
+-        const char* guard = std::getenv("EDEN_NX2_JUNK_GUARD");
+-        const bool clash = (guard != nullptr && guard[0] == '1') ||
+-                           std::getenv("EDEN_NX2_PARK_SPLIT_METHODS") != nullptr ||
+-                           SplitCheckMode() != 0;
+-        if (clash) {
+-            LOG_WARNING(HW_GPU, "EDEN_NX2_DESYNC_FIX=1 stays off: JUNK_GUARD, PARK_SPLIT_METHODS "
+-                                "or SPLIT_PARSE_CHECK is set, and its walk doesn't model them");
+-        }
+-        return clash;
+-    }();
++    const bool parser_switches = DesyncFixParserClash(SplitCheckMode());
+     constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+     const bool title = Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
+                        system.GetApplicationProcessProgramID() == OcarinaOfTimeProgramId;
+     if (static std::atomic<bool> reported{}; !title && !reported.exchange(true)) {
+-        LOG_WARNING(HW_GPU, "EDEN_NX2_DESYNC_FIX=1 stays off: not Ocarina of Time on Switch 2 "
++        LOG_WARNING(HW_GPU, "EDEN_NX2_DESYNC_FIX={} stays off: not Ocarina of Time on Switch 2 "
+                             "(program {:#018x})",
+-                    system.GetApplicationProcessProgramID());
++                    DesyncFixMode(), system.GetApplicationProcessProgramID());
++    }
++    if (static std::atomic<bool> reported{};
++        title && !parser_switches && !reported.exchange(true)) {
++        LOG_WARNING(HW_GPU, "EDEN_NX2_DESYNC_FIX={} active: Ocarina of Time on Switch 2, first "
++                            "resume after a suspension",
++                    DesyncFixMode());
+     }
+     return !parser_switches && title;
+ }
+@@ -296,7 +322,17 @@
+     , channel_state{channel_state_}
+     , signal_sync{false}
+     , synced{false}
+-{}
++{
++    // Proves the switch was read even in a run with no refresh to judge. The title gate is checked
++    // at the first resume ("active" or "stays off" then).
++    if (static std::atomic<bool> reported{}; DesyncFixMode() != 0 && !reported.exchange(true)) {
++        LOG_WARNING(HW_GPU, "EDEN_NX2_DESYNC_FIX={} on (refresh check v3: later queued lists "
++                            "judged, lost carry restarts at 0 per list, lists copied during a "
++                            "suspension {}); Ocarina of Time on Switch 2 only",
++                    DesyncFixMode(), DesyncFixMode() == 1 ? "judged" : "as T63");
++        DesyncFixParserClash(SplitCheckMode());
++    }
++}
+ 
+ DmaPusher::~DmaPusher() = default;
+ 
+@@ -430,15 +466,41 @@
+         const u64 now = suspensions.load(std::memory_order_acquire);
+         RefreshCheck check;
+         check.fix = DesyncFixActive();
++        check.fix_suspended = check.fix && DesyncFixMode() == 1;
+         check.carry = dma_state.method_count;
+         for (CommandList& list : dma_pushbuffer) {
+             const bool front = check.list_index == 0;
+             const size_t first_entry = front ? dma_pushbuffer_subindex : 0;
+             const size_t first_word = front ? command_resume_offset : 0;
+             if (!list.submitted_offsets.empty()) {
+-                // Copied before this suspension (even count): the submit copy can be judged.
+-                resume_checked = resume_checked ||
+-                                 (front && check.fix && (list.snapshot_suspensions & 1) == 0);
++                // The parser keeps an open method across lists (Step's pop_front leaves dma_state
++                // as it is), so a known carry goes on into this list. A lost one restarts at 0 at
++                // the list's first entry: lists end on a method boundary unless a method runs
++                // across them (logged: "lists entered with a method open" counts how often one
++                // does, from known carries), and a
++                // restart that assumes wrong only changes this resume's verdicts, never sizes.
++                if (!front && check.carry_known) {
++                    // How often a method really runs into a list: what the restart assumes away.
++                    ++check.list_starts;
++                    if (check.carry != 0 && check.list_starts_open++ == 0) {
++                        check.list_open_carry = check.carry;
++                        check.list_open_list = check.list_index;
++                    }
++                } else if (!front) {
++                    check.carry = 0;
++                    check.carry_known = true;
++                    if (!check.carry_assumed) {
++                        check.restart_list = check.list_index;
++                    }
++                    check.carry_assumed = true;
++                    ++check.restarts;
++                }
++                // Copied before this suspension (even count), or during it with =1: the copy the
++                // resumed entry parses holds the words its refresh chose.
++                resume_checked =
++                    resume_checked ||
++                    (front && check.fix &&
++                     ((list.snapshot_suspensions & 1) == 0 || check.fix_suspended));
+                 RefreshSnapshot(list, now, &check, first_entry, first_word);
+             } else if (!list.prefetch_command_list.empty()) {
+                 // A driver-injected wait or increment list: a method still open eats its words
+@@ -1104,13 +1166,20 @@
+ // - other header words and the copy walks clean: with EDEN_NX2_DESYNC_FIX the copy, else memory;
+ // - other header words, the copy drops words, memory doesn't: memory (the copy is the stale one);
+ // - both drop words: memory, as T63, logged.
+-// Lists copied during a suspension (odd count: 256b1dc346's lists), GPU-written and deferred
+-// entries, and everything after a carry the walk can't know, take memory as T63 and are only
+-// counted. Logged per resume (ReportRefreshCheck), bounded.
++// Every queued list is judged (a lost carry restarts at 0 at each submitted list, in Step). Lists
++// copied during a suspension (odd count: 256b1dc346's lists) keep their copy only with
++// EDEN_NX2_DESYNC_FIX=1 (Ocarina: the never-written verdict covers a list submitted before it was
++// written); with =2 or the fix off they are judged for the log and take memory. GPU-written and
++// deferred entries, and entries after a carry lost within a list, take memory as T63 and are
++// counted by reason (a detail line when their header words differ). Logged per resume
++// (ReportRefreshCheck), bounded.
+ void DmaPusher::RefreshSnapshot(CommandList& list, u64 now, RefreshCheck* check,
+                                 size_t first_entry, size_t first_word) {
+-    // Copied before this suspension began, or at an earlier resume: a copy that can be judged.
+-    const bool judged_list = check != nullptr && (list.snapshot_suspensions & 1) == 0;
++    // Copied during a suspension (odd count) rather than before this one began or at an earlier
++    // resume. With the fix on, such a list keeps copies only with =1 (fix_suspended).
++    const bool suspended_copy = (list.snapshot_suspensions & 1) != 0;
++    const bool list_fix =
++        check != nullptr && check->fix && (!suspended_copy || check->fix_suspended);
+     list.snapshot_suspensions = now;
+     if (FetchCountMode() != 0) {
+         // The words as submitted, for CountFetchedEntry. A deferred entry's slot holds none.
+@@ -1163,24 +1232,77 @@
+         const bool same = std::memcmp(copy + start, refresh_scratch.data() + start,
+                                       (size - start) * sizeof(u32)) == 0;
+         // A deferred entry's slot holds no words yet; a GPU-written entry is parsed from the
+-        // GPU's words, not this copy.
+-        if (same || !judged_list || !check->carry_known ||
+-            std::ranges::binary_search(list.deferred_entries, static_cast<u32>(i)) ||
+-            IsGpuWrittenCommands(entry.addr, size * sizeof(u32))) {
++        // GPU's words, not this copy; after a carry lost within this list the walk can't know
++        // where the methods start.
++        const char* unjudged = nullptr;
++        if (!same) {
++            if (std::ranges::binary_search(list.deferred_entries, static_cast<u32>(i))) {
++                unjudged = "deferred";
++                ++check->unchecked_deferred;
++            } else if (IsGpuWrittenCommands(entry.addr, size * sizeof(u32))) {
++                unjudged = "GPU-written";
++                ++check->unchecked_gpu;
++            } else if (!check->carry_known) {
++                unjudged = "carry unknown";
++                ++check->unchecked_carry;
++            }
++        }
++        if (same || unjudged != nullptr) {
++            if (unjudged != nullptr) {
++                note_change(i, u64{entry.addr}, size, start);
++                ++check->unchecked;
++                // Only differing header words make the copy and memory parse differently: those
++                // get a line (from the carry, or from 0 when it is unknown).
++                const u32 carry_from = check->carry_known ? check->carry : 0;
++                const ShapeWalk copy_walk = WalkCommandShape(submitted, start, carry_from, memory);
++                const ShapeWalk memory_walk = WalkCommandShape(memory, start, carry_from, submitted);
++                const bool reshaped = copy_walk.header_diffs != 0 ||
++                                      memory_walk.header_diffs != 0 ||
++                                      copy_walk.end != memory_walk.end;
++                if (reshaped && RefreshCheckEventLogged(check->event) &&
++                    check->unjudged_details < RefreshCheckDetailsPerEvent / 2 &&
++                    check->details < RefreshCheckDetailsPerEvent + RefreshCheckDetailsPerEvent / 2 &&
++                    refresh_check_details.fetch_add(1, std::memory_order_relaxed) <
++                        RefreshCheckDetailsTotal) {
++                    ++check->details;
++                    ++check->unjudged_details;
++                    size_t differing = 0;
++                    for (size_t w = start; w < size; ++w) {
++                        differing += copy[w].argument != refresh_scratch[w].argument ? 1 : 0;
++                    }
++                    const auto word = [&](std::span<const CommandHeader> words, size_t at) {
++                        return at < words.size() ? words[at].argument : 0U;
++                    };
++                    LOG_WARNING(HW_GPU,
++                                "Refresh check {} unjudged: list +{} entry {} of {} at {:#x}+{:#x} "
++                                "from word {}, not judged ({}), took memory; list copied {} the "
++                                "suspension: {} words differ; walked from {} words carried in{}: "
++                                "header words differ {} (copy walk) / {} (memory walk); drops {} "
++                                "(copy) / {} (memory); ends wanting {} (copy) / {} (memory); copy "
++                                "{:08x} {:08x} {:08x} {:08x}, memory {:08x} {:08x} {:08x} {:08x}",
++                                check->event, check->list_index, i, list.command_lists.size(),
++                                u64{entry.addr}, size, start, unjudged,
++                                suspended_copy ? "during" : "before", differing, carry_from,
++                                check->carry_known ? (check->carry_assumed ? " (assumed)" : "")
++                                                   : " (carry unknown, 0 assumed)",
++                                copy_walk.header_diffs, memory_walk.header_diffs,
++                                copy_walk.dropped, memory_walk.dropped, copy_walk.end,
++                                memory_walk.end, word(submitted, start), word(submitted, start + 1),
++                                word(submitted, start + 2), word(submitted, start + 3),
++                                word(memory, start), word(memory, start + 1),
++                                word(memory, start + 2), word(memory, start + 3));
++                }
++            }
+             std::memcpy(copy, refresh_scratch.data(), size * sizeof(u32));
+             if (check->carry_known) {
+                 check->carry = WalkCommandShape(memory, start, check->carry).end;
+             }
+-            if (!same) {
+-                note_change(i, u64{entry.addr}, size, start);
+-                ++check->unchecked;
+-            }
+             continue;
+         }
+         const u32 carry_in = check->carry;
+         ShapeWalk copy_walk;
+         ShapeWalk memory_walk;
+-        const RefreshVerdict verdict = JudgeRefresh(submitted, memory, start, carry_in, check->fix,
++        const RefreshVerdict verdict = JudgeRefresh(submitted, memory, start, carry_in, list_fix,
+                                                     list_reshaped, copy_walk, memory_walk);
+         switch (verdict) {
+         case RefreshVerdict::DataOnly:
+@@ -1210,15 +1332,21 @@
+         const bool keep_copy =
+             verdict == RefreshVerdict::Kept || verdict == RefreshVerdict::KeptForList;
+         check->carry = keep_copy ? copy_walk.end : memory_walk.end;
++        if (suspended_copy) {
++            ++check->suspended_judged;
++            check->suspended_kept += keep_copy ? 1 : 0;
++            check->suspended_memory += verdict == RefreshVerdict::WouldKeep ? 1 : 0;
++        }
+ 
+         const bool data_only =
+             verdict == RefreshVerdict::DataOnly || verdict == RefreshVerdict::KeptForList;
+         if (!data_only && check->later_list.empty()) {
+             check->later_list = LaterListOverlapping(list, entry.addr, u64{size} * sizeof(u32));
+         }
+-        // Reshaped entries use the whole budget, data-only ones its first half.
++        // Reshaped entries use the whole budget, data-only ones its first half (lines for
++        // unjudged entries don't count against it).
+         const u32 budget = data_only ? RefreshCheckDetailsPerEvent / 2 : RefreshCheckDetailsPerEvent;
+-        if (RefreshCheckEventLogged(check->event) && check->details < budget &&
++        if (RefreshCheckEventLogged(check->event) && check->details - check->unjudged_details < budget &&
+             refresh_check_details.fetch_add(1, std::memory_order_relaxed) <
+                 RefreshCheckDetailsTotal) {
+             ++check->details;
+@@ -1234,12 +1362,18 @@
+                 list.command_lists[i + 1].addr == entry.addr + size * sizeof(u32);
+             LOG_WARNING(HW_GPU,
+                         "Refresh check {} entry: list +{} entry {} of {} at {:#x}+{:#x} from word "
+-                        "{}, {} words carried in: {} words differ; header words differ {} (copy "
++                        "{}, {} words carried in{}, list copied {} the suspension: {} words "
++                        "differ; header words differ {} (copy "
+                         "walk, {} headers) / {} (memory walk, {} headers); drops {} (copy) / {} "
+                         "(memory); ends wanting {} (copy) / {} (memory), next entry adjacent {}: "
+                         "{}; copy {:08x} {:08x} {:08x} {:08x}, memory {:08x} {:08x} {:08x} {:08x}",
+                         check->event, check->list_index, i, list.command_lists.size(),
+-                        u64{entry.addr}, size, start, carry_in, differing, copy_walk.header_diffs,
++                        u64{entry.addr}, size, start, carry_in,
++                        check->carry_assumed
++                            ? fmt::format(" (assumed: restarted at 0 at list +{})",
++                                          check->restart_list)
++                            : std::string{},
++                        suspended_copy ? "during" : "before", differing, copy_walk.header_diffs,
+                         copy_walk.headers, memory_walk.header_diffs, memory_walk.headers,
+                         copy_walk.dropped, memory_walk.dropped, copy_walk.end, memory_walk.end,
+                         next_adjacent, RefreshVerdictName(verdict), word(submitted, start),
+@@ -1259,22 +1393,39 @@
+         return;
+     }
+     const std::string end =
+-        check.carry_known ? fmt::format("{}", check.carry) : std::string{"unknown"};
++        check.carry_known
++            ? fmt::format("{}{}", check.carry, check.carry_assumed ? " (assumed)" : "")
++            : std::string{"unknown"};
+     const std::string injected =
+         check.injected_carry != 0
+             ? fmt::format("{} words into list +{}", check.injected_carry, check.injected_list)
+             : std::string{"none"};
++    const std::string restarts =
++        check.restarts != 0
++            ? fmt::format("{} lists (first list +{})", check.restarts, check.restart_list)
++            : std::string{"none"};
++    const std::string list_open =
++        check.list_starts_open != 0
++            ? fmt::format("{} of {} (first {} words into list +{})", check.list_starts_open,
++                          check.list_starts, check.list_open_carry, check.list_open_list)
++            : fmt::format("0 of {}", check.list_starts);
+     LOG_WARNING(HW_GPU,
+                 "Refresh check {}: resume at entry {} word {} with {} words wanted, {} lists, fix "
+                 "{}: {} entries differ: {} data only, {} kept (reshaped), {} kept (rest of the "
+                 "list), {} would keep (fix off), {} copy broken, {} both broken, {} never "
+-                "written, {} not judged; first {}; later queued list on the first reshaped: {}; "
++                "written, {} not judged ({} carry unknown, {} deferred, {} GPU-written); in lists "
++                "copied during the suspension: {} judged, {} kept, {} would keep but took memory; "
++                "carry restarted at 0: {}; later lists entered with a method open: {}; first {}; "
++                "later queued list on the first reshaped: {}; "
+                 "carry into an injected list: {}; carry at the end: {}",
+                 check.event, dma_pushbuffer_subindex, command_resume_offset,
+-                dma_state.method_count, check.list_index, check.fix ? "on" : "off",
+-                check.differing, check.data_only, check.kept, check.kept_for_list,
+-                check.would_keep, check.copy_broken, check.both_broken, check.unwritten,
+-                check.unchecked, check.first_change,
++                dma_state.method_count, check.list_index,
++                !check.fix ? "off" : check.fix_suspended ? "on" : "on (=2)", check.differing,
++                check.data_only, check.kept, check.kept_for_list, check.would_keep,
++                check.copy_broken, check.both_broken, check.unwritten, check.unchecked,
++                check.unchecked_carry, check.unchecked_deferred, check.unchecked_gpu,
++                check.suspended_judged, check.suspended_kept, check.suspended_memory, restarts,
++                list_open, check.first_change,
+                 check.later_list.empty() ? std::string{"-"} : check.later_list, injected, end);
+ }
+ 
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -230,12 +230,21 @@
+     void NoteFetchRecheckWords(u64 hit, std::span<const CommandHeader> commands, const char* how);
+     /// One resume's walk of the queued stream, for the refresh check (EDEN_NX2_DESYNC_FIX and its
+     /// always-on log). The parse goes on at the front list's entry and word, with `carry` words of
+-    /// an open method wanted there; each list hands its end carry to the next.
++    /// an open method wanted there; each list hands its end carry to the next (the parser keeps a
++    /// method open across lists). A carry lost before a submitted list restarts at 0 there.
+     struct RefreshCheck {
+         u64 event = 0;            ///< Resumes with a differing entry so far (this one's number)
+         bool fix = false;         ///< EDEN_NX2_DESYNC_FIX on, and gated to this title
++        bool fix_suspended = false; ///< fix, and =1: lists copied during a suspension too
+         bool carry_known = true;  ///< False after a list or entry whose words the parse reads later
++        bool carry_assumed = false; ///< The carry comes from a restart at 0 (restart_list)
+         u32 carry = 0;            ///< Words of an open method wanted where the walk is now
++        u32 restarts = 0;         ///< Submitted lists where a lost carry restarted at 0
++        u32 restart_list = 0;     ///< The first of them
++        u32 list_starts = 0;      ///< Later submitted lists entered with a known carry
++        u32 list_starts_open = 0; ///< Of those, with a method still open (nonzero carry)
++        u32 list_open_carry = 0;  ///< The first such carry, and its list
++        u32 list_open_list = 0;
+         u32 list_index = 0;       ///< The list being walked (0 = front)
+         u32 differing = 0;        ///< Entries whose words differ from their copy
+         u32 data_only = 0;        ///< Only data words differ: took memory
+@@ -245,9 +254,15 @@
+         u32 copy_broken = 0;      ///< Reshaped, the copy drops words and memory doesn't: memory
+         u32 both_broken = 0;      ///< Reshaped, both drop words: took memory (as T63)
+         u32 unwritten = 0;        ///< The copy was never written (zeros): took memory
+-        u32 unchecked = 0;        ///< Differs, not judged (GPU-written, deferred, copied during a
+-                                  ///< suspension, or the carry unknown): took memory (as T63)
++        u32 unchecked = 0;        ///< Differs, not judged: took memory (as T63). By reason:
++        u32 unchecked_carry = 0;  ///< the carry unknown (an empty-at-submit entry before it)
++        u32 unchecked_deferred = 0; ///< a deferred entry (no words in its slot yet)
++        u32 unchecked_gpu = 0;    ///< on GPU-written pages (parsed from the GPU's words)
++        u32 suspended_judged = 0; ///< Judged entries in lists copied during a suspension
++        u32 suspended_kept = 0;   ///< Of those, kept the copy (EDEN_NX2_DESYNC_FIX=1)
++        u32 suspended_memory = 0; ///< Of those, would keep but took memory (fix off, or =2)
+         u32 details = 0;          ///< Per-entry lines logged for this resume
++        u32 unjudged_details = 0; ///< Of those, lines for unjudged entries
+         u32 injected_carry = 0;   ///< First nonzero carry into an injected list (eats its words)
+         u32 injected_list = 0;    ///< That list's index
+         std::string first_change; ///< The first differing entry
+@@ -264,8 +279,11 @@
+     /// EDEN_NX2_DESYNC_FIX=1 (exact "1", off unless set), Ocarina of Time on Switch 2 only: a
+     /// refresh after a resume keeps an entry's submit copy when memory holds other commands (the
+     /// game recorded a later frame there) and the copy walks clean, and a resumed entry parses its
+-    /// copy instead of memory. Off or another title: as T63.
++    /// copy instead of memory. =1 judges lists copied during a suspension too; =2 leaves those
++    /// as T63 (memory). Off or another title: as T63.
+     bool DesyncFixActive() const;
++    /// The switch's value: 0 (off: unset or anything but exact "1" or "2"), 1 or 2.
++    static int DesyncFixMode();
+     std::vector<CommandHeader> refresh_scratch; ///< RefreshSnapshot: one entry's words in memory
+     /// The queued list and entry, after `list`, whose words overlap [address, address + bytes):
+     /// for the refresh log only.

@@ -1,0 +1,30 @@
+Subject: [PATCH] texture upload: skip a null guest span instead of reading address 0 (pond desync crash)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 9ae54b6..f75cafa 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2671,6 +2671,23 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging)
+ 
+     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(
+         *gpu_memory, gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
++    if (swizzle_data.data() == nullptr) {
++        // guest_size_bytes is 0 (GuestMemory::Read returns no span then) while ImageInfo still
++        // describes levels: a garbage render target whose u32 size wrapped, made from junk
++        // methods after a pushbuffer desync. UnswizzleTexture would read through the null span
++        // (SIGSEGV at address 0 on GPUBack: run196 T49, run282 T61). Leave it unfilled.
++        static u32 empty_uploads{};
++        if (empty_uploads++ < 16) {
++            LOG_ERROR(HW_GPU,
++                      "Image at {:#x} ({}x{}x{}, {} layers, format {}) has no guest bytes: "
++                      "not uploaded",
++                      gpu_addr, image.info.size.width, image.info.size.height,
++                      image.info.size.depth, image.info.resources.layers,
++                      static_cast<u32>(image.info.format));
++        }
++        runtime.TransitionImageLayout(image);
++        return;
++    }
+     if (True(image.flags & ImageFlagBits::Converted)) {
+         unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
+         auto copies = UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, unswizzle_data_buffer);

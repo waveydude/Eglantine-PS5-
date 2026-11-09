@@ -1,0 +1,463 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] Ocarina parser lifetime and macro atomicity: the split decision is made on the words the
+ parser runs, a failed front macro sends nothing, an undefined render condition skips its draws, device
+ addresses past the device space read as unmapped
+
+Found from crash-20261108-203326 (Ocarina, 109 s, SIGSEGV in GPUBack, ReadBlockImpl):
+
+1. DmaPusher::SplitContinuesHere read guest memory (ReadBlockUnsafe) to decide whether an entry
+   continues the method the entry before left open, while Step parses the submit copy, a flushed
+   read or the list copy. The game refills its command ring; the decision and the parse could see
+   different words, and a fresh header was taken as the data of an open method (the log shows a
+   macro called with the single parameter a0040e02, a header). DecideSplitOnWords decides on the
+   span ProcessCommands will run (EDEN_NX2_SPLIT_PARSE_CHECK, unchanged otherwise).
+2. EDEN_NX2_DESYNC_FIX (0408/0411) stays off with EDEN_NX2_SPLIT_PARSE_CHECK set; it now runs with
+   it (it stays off with JUNK_GUARD / PARK_SPLIT_METHODS, whose parses its walk does not model).
+3. Maxwell3D::FrontRunMacro held the macro's register writes in MacroWriteBuffer until the call
+   ends well: a failed call (parameter FIFO underflow) used to leave its earlier writes in the front's
+   state and on the back's queue. DMA reads and shadow-RAM Replay/control writes go straight through
+   (they cannot be taken back); the failure line says how many writes were discarded and sent.
+4. A render-condition mode no hardware defines skips its draws for Ocarina (EDEN_NX2_BAD_COND_SKIP
+   =0/1) instead of drawing with the rest of the garbage state. Other titles are unchanged.
+5. DeviceMemoryManager::GetPointer / WalkBlock / ReadBlock check the device address space; a GPU page
+   table entry past it (stale or corrupt) read tracked_entries out of bounds and returned a wild
+   pointer. MemoryManager::ReadBlockImpl logs the first 16 such reads with the GPU address. This
+   contains the fault; it does not explain how the entry came to be wrong (see the crash report).
+---
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -272,18 +272,24 @@
+ }
+ 
+ namespace {
+-// The walk matches the parser only with the junk guard, split-method parking and the split parse
+-// check off: with any of them set the fix stays off (logged once, from the first DmaPusher).
++// The walk matches the parser only with the junk guard and split-method parking off: with either
++// set the fix stays off (logged once, from the first DmaPusher). EDEN_NX2_SPLIT_PARSE_CHECK no
++// longer counts (local change): it parks an entry only when the entry reads as a fresh stream and
++// not as the method's data, which the walk takes as a fresh stream too; it now decides on the same
++// words the walk judges, and the fix is what keeps those words from being a refilled ring's.
+ bool DesyncFixParserClash(int split_check_mode) {
+     static const bool clash = [split_check_mode] {
+         const char* guard = std::getenv("EDEN_NX2_JUNK_GUARD");
+         const bool clash_now = (guard != nullptr && guard[0] == '1') ||
+-                               std::getenv("EDEN_NX2_PARK_SPLIT_METHODS") != nullptr ||
+-                               split_check_mode != 0;
++                               std::getenv("EDEN_NX2_PARK_SPLIT_METHODS") != nullptr;
+         if (clash_now) {
+-            LOG_WARNING(HW_GPU, "EDEN_NX2_DESYNC_FIX={} stays off: JUNK_GUARD, PARK_SPLIT_METHODS "
+-                                "or SPLIT_PARSE_CHECK is set, and its walk doesn't model them",
++            LOG_WARNING(HW_GPU, "EDEN_NX2_DESYNC_FIX={} stays off: JUNK_GUARD or PARK_SPLIT_METHODS "
++                                "is set, and its walk doesn't model them",
+                         DmaPusher::DesyncFixMode());
++        } else if (split_check_mode != 0) {
++            LOG_WARNING(HW_GPU, "EDEN_NX2_DESYNC_FIX={} runs with EDEN_NX2_SPLIT_PARSE_CHECK={}: the "
++                                "walk takes an entry that reads as a fresh stream as one",
++                        DmaPusher::DesyncFixMode(), split_check_mode);
+         }
+         return clash_now;
+     }();
+@@ -600,20 +606,10 @@
+                 }
+                 if (park_split_methods) {
+                     ResolveSplitMethod(header.addr);
+-                } else if (SplitCheckMode() != 0) {
+-                    // EDEN_NX2_SPLIT_PARSE_CHECK: park only an entry that does not read as the
+-                    // continuation but does read as a fresh stream (run 162), otherwise continue
+-                    // as before (run 165: parking every non-adjacent entry hung the first load).
+-                    const bool parked_here = std::ranges::any_of(parked_methods, [&](const ParkedMethod& p) {
+-                        return p.resume_address == header.addr;
+-                    });
+-                    if (dma_state.method_count != 0 && header.addr != split_method_end &&
+-                        !SplitContinuesHere(header)) {
+-                        ResolveSplitMethod(header.addr);
+-                    } else if (dma_state.method_count == 0 && parked_here) {
+-                        ResolveSplitMethod(header.addr);
+-                    }
+                 }
++                // EDEN_NX2_SPLIT_PARSE_CHECK is decided in DecideSplitOnWords, once the words this
++                // entry will be parsed from are known (the submit copy, a flushed read or the list
++                // copy), so the decision and the parse see the same words.
+             }
+             if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
+                 CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex]);
+@@ -699,12 +695,14 @@
+                     command_list.submitted_offsets[dma_pushbuffer_subindex],
+                 header.size};
+             RecordParsedEntry(header, commands);
++            DecideSplitOnWords(header, commands);
+             command_resume_offset +=
+                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+         } else if (use_safe) {
+             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
+             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
+             RecordParsedEntry(header, commands);
++            DecideSplitOnWords(header, commands);
+             command_resume_offset +=
+                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
+         } else if (!ListDrainFull() &&
+@@ -712,6 +710,7 @@
+             const std::span<const CommandHeader> commands{command_headers.data(), header.size};
+             entry_trace.source = 2;
+             RecordParsedEntry(header, commands);
++            DecideSplitOnWords(header, commands);
+             if (recheck_hit != 0) {
+                 NoteFetchRecheckWords(recheck_hit, commands, "through the list copies");
+             }
+@@ -722,6 +721,7 @@
+             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
+             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
+             RecordParsedEntry(header, commands);
++            DecideSplitOnWords(header, commands);
+             if (recheck_hit != 0) {
+                 NoteFetchRecheckWords(recheck_hit, commands, "after a flush");
+             }
+@@ -927,10 +927,41 @@
+     return mode;
+ }
+ 
+-bool DmaPusher::SplitContinuesHere(const CommandListHeader& header) {
++// The decision whether an entry continues the method the entry before left open, made on the words
++// the parser will run. It used to read guest memory (ReadBlockUnsafe) while Step parsed the submit
++// copy, the flushed read or the list copy: the game refills its command ring, so after a
++// semaphore wait the two could disagree, and an entry that read as a fresh stream in the copy was
++// taken as the method's data, its header fed to a macro as a parameter (Ocarina, 109 s,
++// "Native MME failed: consumed=1/1, parameters=a0040e02", then a render-condition assert and
++// SIGSEGV in GPUBack).
++void DmaPusher::DecideSplitOnWords(const CommandListHeader& header,
++                                   std::span<const CommandHeader> commands) {
++    if (command_resume_offset != 0) {
++        return; // a resumed entry continues its own parse
++    }
++    if (g_nx2_ampere && SplitCheckMode() != 0 &&
++        std::getenv("EDEN_NX2_PARK_SPLIT_METHODS") == nullptr) {
++        // EDEN_NX2_SPLIT_PARSE_CHECK: park only an entry that does not read as the continuation
++        // but does read as a fresh stream (run 162), otherwise continue as before (run 165:
++        // parking every non-adjacent entry hung the first load).
++        const bool parked_here = std::ranges::any_of(parked_methods, [&](const ParkedMethod& p) {
++            return p.resume_address == header.addr;
++        });
++        if (dma_state.method_count != 0 && header.addr != split_method_end &&
++            !SplitContinuesHere(header, commands)) {
++            ResolveSplitMethod(header.addr);
++        } else if (dma_state.method_count == 0 && parked_here) {
++            ResolveSplitMethod(header.addr);
++        }
++    }
++}
++
++bool DmaPusher::SplitContinuesHere(const CommandListHeader& header,
++                                   std::span<const CommandHeader> commands) {
+     std::array<u32, 64> words{};
+-    const size_t read = std::min<size_t>(header.size, words.size());
+-    memory_manager.ReadBlockUnsafe(header.addr, words.data(), read * sizeof(u32));
++    const size_t read = std::min<size_t>({size_t{header.size}, commands.size(), words.size()});
++    std::transform(commands.begin(), commands.begin() + read, words.begin(),
++                   [](const CommandHeader& word) { return word.argument; });
+     const std::span<const u32> window{words.data(), read};
+     const bool continues = SplitReadsAsContinuation(window, header.size, dma_state.method_count);
+     if (static u32 logged{}; SplitCheckMode() >= 2 && logged < 64) {
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -349,7 +349,8 @@
+     static int SplitCheckMode();
+     /// Whether the entry reads as the continuation of the method the entry before left unfinished
+     /// (true), or as a fresh stream the carried words would misparse (false: park it).
+-    bool SplitContinuesHere(const CommandListHeader& header);
++    bool SplitContinuesHere(const CommandListHeader& header, std::span<const CommandHeader> commands);
++    void DecideSplitOnWords(const CommandListHeader& header, std::span<const CommandHeader> commands);
+ 
+     // Debug aid: hashes of the words of the last entries as they were parsed.
+     struct ParsedEntry {
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -848,7 +848,25 @@
+         }
+         default: {
+             UNIMPLEMENTED_MSG("Uninplemented Condition Mode!");
+-            execute_on = true;
++            // A mode no hardware defines is garbage in the register, written by a macro or a
++            // method read from a misparsed stream: the draws that follow would run with whatever
++            // else the stream left (Ocarina, 109 s: the next pipeline read its texture table from
++            // a garbage address). Skipped for Ocarina of Time (EDEN_NX2_BAD_COND_SKIP=0/1
++            // overrides); other titles draw as before.
++            static const bool skip = [] {
++                const char* const value = std::getenv("EDEN_NX2_BAD_COND_SKIP");
++                if (value != nullptr) {
++                    return value[0] == '1';
++                }
++                return Settings::GetCurrentProgramID() == 0x0400486024DEC000ULL;
++            }();
++            static std::atomic<u32> reported{};
++            if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
++                LOG_ERROR(HW_GPU, "Render condition mode {:#x} is not defined: {}",
++                          static_cast<u32>(regs.render_enable.mode),
++                          skip ? "draws skipped" : "draws run");
++            }
++            execute_on = !skip;
+             break;
+         }
+         }
+@@ -1307,28 +1325,59 @@
+         }
+         engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
+         const size_t parameter_count = fs.parameters.size();
++        // The call's register writes are held until it ends well (MacroWriteBuffer). Reads see them.
++        MacroWriteBuffer pending;
++        const auto commit_pending = [&] {
++            pending.Commit([&](u32 address, u32 value) {
++                FrontWrite(split, fs, address, value, true, true);
++            });
++        };
+         const auto result = engine.native_jit->Execute(
+             start, fs.parameters, std::span<u32>{native_data_ram},
+-            [&fs](u32 address) { return address < Regs::NUM_REGS ? fs.regs[address] : 0U; },
++            [&fs, &pending](u32 address) {
++                u32 value;
++                if (pending.Overlay(address, value)) {
++                    return value;
++                }
++                return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
++            },
+             [&](u32 address, u32 value) {
+                 if (address >= MacroRegistersStart) {
+                     return false;
+                 }
+-                FrontWrite(split, fs, address, value, true, true);
+-                // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
+-                if (address == 0x157 || address == 0x158) {
+-                    FrontDmaRead(split, fs, method, address, value);
++                // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO) read
++                // guest memory and cannot be taken back; the shadow RAM modes change what a write
++                // stores, so a write under Replay or to its control register goes straight through.
++                const bool dma_read = address == 0x157 || address == 0x158;
++                if (dma_read || fs.control == Regs::ShadowRamControl::Replay ||
++                    address == MAXWELL3D_REG_INDEX(shadow_ram_control)) {
++                    commit_pending();
++                    FrontWrite(split, fs, address, value, true, true);
++                    if (dma_read) {
++                        FrontDmaRead(split, fs, method, address, value);
++                    }
++                } else {
++                    pending.Add(address, value);
+                 }
+                 return true;
+             });
+-        if (!result.success) {
++        if (result.success) {
++            commit_pending();
++        } else {
++            const size_t discarded = pending.Discard();
+             engine.native_execution_failed = true;
+             fs.draw_pending = false;
+-            // fs.parameters still holds the call's words (the JIT reads them in place); words a
+-            // MME_DMA_READ_FIFOED appended during the call follow them.
+-            LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}{}",
+-                      start, result.consumed, parameter_count, result.error,
+-                      FailedMacroParameters(start, fs.parameters));
++            static std::atomic<u32> failures{};
++            if (failures.fetch_add(1, std::memory_order_relaxed) < 64) {
++                // fs.parameters still holds the call's words (the JIT reads them in place); words a
++                // MME_DMA_READ_FIFOED appended during the call follow them.
++                LOG_ERROR(HW_GPU,
++                          "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}, "
++                          "{} register writes discarded, {} already sent{}{}",
++                          start, result.consumed, parameter_count, result.error, discarded,
++                          pending.Committed(), pending.Committed() != 0 ? " (before a DMA read)" : "",
++                          FailedMacroParameters(start, fs.parameters));
++            }
+         }
+     }
+     fs.parameters.clear();
+diff --git a/src/video_core/split_macro_state.h b/src/video_core/split_macro_state.h
+--- a/src/video_core/split_macro_state.h
++++ b/src/video_core/split_macro_state.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <cstddef>
++#include <cstdint>
+ #include <span>
+ #include <utility>
+ #include <vector>
+@@ -63,4 +64,62 @@
+            !ReadsAsCommands(words, entry_words, 0);
+ }
+ 
++
++// The register writes of one native macro call on the split front, held until the call ends well.
++// A macro the front cannot finish (its parameter FIFO ran dry: the stream was misread upstream)
++// would otherwise leave the registers it had written so far in the front's state and on the
++// back's queue, and the back would draw with half a macro's state (Ocarina, 109 s: a garbage
++// render-condition mode, then a descriptor table read from a garbage address). Reads by the macro
++// itself see its own pending writes (Overlay). A write the call cannot take back (the DMA reads,
++// and any write while the shadow RAM replays or changes mode) is Committed first, with everything
++// before it, and the call is marked `irreversible`.
++class MacroWriteBuffer {
++public:
++    void Add(std::uint32_t address, std::uint32_t value) {
++        writes.emplace_back(address, value);
++    }
++    bool Overlay(std::uint32_t address, std::uint32_t& value) const {
++        for (auto it = writes.rbegin(); it != writes.rend(); ++it) {
++            if (it->first == address) {
++                value = it->second;
++                return true;
++            }
++        }
++        return false;
++    }
++    template <typename Write>
++    std::size_t Commit(Write&& write) {
++        const std::size_t count = writes.size();
++        for (const auto& [address, value] : writes) {
++            write(address, value);
++        }
++        writes.clear();
++        committed += count;
++        return count;
++    }
++    std::size_t Discard() {
++        const std::size_t count = writes.size();
++        writes.clear();
++        return count;
++    }
++    std::size_t Pending() const {
++        return writes.size();
++    }
++    std::size_t Committed() const {
++        return committed;
++    }
++
++private:
++    std::vector<std::pair<std::uint32_t, std::uint32_t>> writes;
++    std::size_t committed{};
++};
++
++// Whether a device-address range lies inside the device address space [0, device_as_size): the
++// check DeviceMemoryManager::GetPointer lacked (a stale GPU page table entry gave it an address
++// past the table, and tracked_entries[index] was read out of bounds).
++constexpr bool DeviceRangeInside(std::uint64_t address, std::uint64_t size,
++                                 std::uint64_t device_as_size) {
++    return address < device_as_size && size <= device_as_size - address;
++}
++
+ } // namespace Tegra
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -5,6 +5,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdlib>
+ #include <array>
+ #include <vector>
+@@ -425,6 +426,24 @@
+     }
+ }
+ 
++// A GPU page table entry that names a device address outside the device address space is stale or
++// corrupt. The read is zero-filled (DeviceMemoryManager::GetPointer refuses it); the first ones are
++// logged with the GPU address, so a descriptor table read from a wild address is visible in the log
++// instead of ending the process (Ocarina, 109 s: SIGSEGV in GPUBack, ReadBlockImpl, 22,368 bytes).
++static void NoteDeviceRangeOutside(GPUVAddr gpu_addr, std::size_t size, std::size_t page_index,
++                                   DAddr dev_addr, std::size_t amount) {
++    if (MaxwellDeviceMemoryManager::InDeviceSpace(dev_addr, amount)) [[likely]] {
++        return;
++    }
++    static std::atomic<u32> reported{};
++    if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
++        LOG_ERROR(HW_GPU,
++                  "GPU read {:#x}+{:#x}: page {:#x} maps to device address {:#x}, outside the device "
++                  "address space; the bytes read as zero",
++                  u64{gpu_addr}, u64{size}, u64{page_index}, u64{dev_addr});
++    }
++}
++
+ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) const {
+     auto set_to_zero = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
+         std::memset(dest_buffer, 0, copy_amount);
+@@ -432,6 +451,7 @@
+     };
+     auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+         const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
++        NoteDeviceRangeOutside(gpu_src_addr, size, page_index, dev_addr_base, copy_amount);
+         if (!unsafe) {
+             rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
+         }
+@@ -445,6 +465,7 @@
+     };
+     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+         const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
++        NoteDeviceRangeOutside(gpu_src_addr, size, page_index, dev_addr_base, copy_amount);
+         if (!unsafe) {
+             rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
+         }
+diff --git a/src/core/device_memory_manager.inc b/src/core/device_memory_manager.inc
+--- a/src/core/device_memory_manager.inc
++++ b/src/core/device_memory_manager.inc
+@@ -397,6 +397,12 @@
+ template <typename Traits>
+ template <typename T>
+ T* DeviceMemoryManager<Traits>::GetPointer(DAddr address) {
++    // tracked_entries has one entry per page of the device address space: an address past it (a
++    // stale or garbage GPU page table entry, see MemoryManager::ReadBlockImpl) read garbage and
++    // gave a wild pointer (Ocarina, 109 s: SIGSEGV in GPUBack reading a texture table).
++    if (address >= device_as_size) [[unlikely]] {
++        return nullptr;
++    }
+     const size_t index = address >> Memory::YUZU_PAGEBITS;
+     const size_t offset = address & Memory::YUZU_PAGEMASK;
+     auto phys_addr = tracked_entries[index].compressed_physical_ptr;
+@@ -408,6 +414,9 @@
+ template <typename Traits>
+ template <typename T>
+ const T* DeviceMemoryManager<Traits>::GetPointer(DAddr address) const {
++    if (address >= device_as_size) [[unlikely]] {
++        return nullptr;
++    }
+     const size_t index = address >> Memory::YUZU_PAGEBITS;
+     const size_t offset = address & Memory::YUZU_PAGEMASK;
+     auto phys_addr = tracked_entries[index].compressed_physical_ptr;
+@@ -438,6 +447,12 @@
+     std::size_t page_index = addr >> Memory::YUZU_PAGEBITS;
+     std::size_t page_offset = addr & Memory::YUZU_PAGEMASK;
+     while (remaining_size) {
++        if ((page_index << Memory::YUZU_PAGEBITS) >= device_as_size) [[unlikely]] {
++            // Past the device address space: nothing is mapped there (tracked_entries ends).
++            on_unmapped(remaining_size, u64((page_index << Memory::YUZU_PAGEBITS) + page_offset));
++            increment(remaining_size);
++            return;
++        }
+         const size_t next_pages = std::size_t(tracked_entries[page_index].continuity_tracker+1);
+         const std::size_t copy_amount = (std::min)((next_pages << Memory::YUZU_PAGEBITS) - page_offset, remaining_size);
+         const auto current_vaddr = u64((page_index << Memory::YUZU_PAGEBITS) + page_offset);
+@@ -462,7 +477,7 @@
+ void DeviceMemoryManager<Traits>::ReadBlock(DAddr address, void* dest_pointer, size_t size) {
+     device_inter->FlushRegion(address, size);
+     const std::size_t page_offset = address & Memory::YUZU_PAGEMASK;
+-    if (size <= Memory::YUZU_PAGESIZE - page_offset) {
++    if (size <= Memory::YUZU_PAGESIZE - page_offset && address < device_as_size) {
+         const DAddr guest_page = address & ~static_cast<DAddr>(Memory::YUZU_PAGEMASK);
+         TranslationCache& cache = Translations();
+         for (const TranslationEntry& entry : cache.slots) {
+diff --git a/src/core/device_memory_manager.h b/src/core/device_memory_manager.h
+--- a/src/core/device_memory_manager.h
++++ b/src/core/device_memory_manager.h
+@@ -70,6 +70,11 @@
+     void TrackContinuity(DAddr address, VAddr virtual_address, size_t size, Asid asid) {
+         std::scoped_lock lk(mapping_guard);
+         TrackContinuityImpl(address, virtual_address, size, asid);
++    }
++
++    /// Whether [address, address + size) lies in the device address space the tracking tables cover.
++    static constexpr bool InDeviceSpace(DAddr address, size_t size) {
++        return address < device_as_size && size <= device_as_size - address;
+     }
+ 
+     // Write / Read

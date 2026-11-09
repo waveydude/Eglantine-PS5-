@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Regression test suite for Ocarina of Time / Switch 2 pushbuffer split and MME parked macro state.
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -95,8 +96,115 @@ static void TestMacroParkingAndResume() {
     std::puts("  -> PASS: production macro state preserves guest addresses and dirty state");
 }
 
+// ---- crash-20261108-203326 (Ocarina, 109 s) -------------------------------------------------------
+// Real values from that crash's eden_log.txt: "Native MME (JIT, split front) failed: start=0x21,
+// consumed=1/1, error=parameter FIFO underflow, parameters=a0040e02". a0040e02 is a header word
+// (IncreaseOnce, method 0xe02, 4 words): it was handed to the macro as its only parameter.
+// Entry 42's words (above) hold the same header followed by its four real words. What is
+// synthetic below is marked: the "live" words (a reshaped ring) and the carry of 1.
+
+// What the parser does with an entry that "continues" an open method: its first `carry` words are
+// the method's data.
+static std::vector<u32> MethodDataTaken(std::span<const u32> entry, u32 carry, bool continues) {
+    if (!continues) {
+        return {};
+    }
+    return std::vector<u32>(entry.begin(), entry.begin() + std::min<std::size_t>(carry, entry.size()));
+}
+
+static void TestDecisionUsesTheWordsTheParserRuns() {
+    std::puts("[TEST 4] split decision on the parse words, not on memory the game refilled...");
+    const std::array<u32, 8> parse_copy = {0xa0040e02, 0x00000008, 0x00000000, 0x34dce500,
+                                           0x03500022, 0xa0040e02, 0x00000004, 0x00000000};
+    // SYNTHETIC: the ring after the game reused it - inline headers only, which read as commands
+    // after any first word, so the entry looks like a continuation.
+    const std::array<u32, 8> live_refilled = {0xa0040e02, 0x80000e3a, 0x80000e3a, 0x80000e3a,
+                                              0x80000e3a, 0x80000e3a, 0x80000e3a, 0x80000e3a};
+    const u32 carry = 1; // SYNTHETIC: the open method wanted its last word
+    assert(ReadsAsCommands(parse_copy, 8, 0) && "the copy is a fresh stream");
+    assert(!ReadsAsCommands(parse_copy, 8, carry) && "...and not a continuation");
+    assert(ReadsAsCommands(live_refilled, 8, carry) && "the refilled ring reads as a continuation");
+
+    const bool old_decision = SplitReadsAsContinuation(live_refilled, 8, carry); // memory (old)
+    const bool new_decision = SplitReadsAsContinuation(parse_copy, 8, carry);     // parse words
+    assert(old_decision && !new_decision && "old and new decisions differ on this ring");
+
+    // Old: the header reaches the macro as its single parameter - the logged failure.
+    const auto old_params = MethodDataTaken(parse_copy, carry, old_decision);
+    assert((old_params == std::vector<u32>{0xa0040e02}));
+    // New: parked; the entry parses from its header, the macro gets its four words.
+    assert(MethodDataTaken(parse_copy, carry, new_decision).empty());
+    std::puts("  -> PASS: the old decision hands macro 0x21 the header a0040e02; the new one parks");
+}
+
+static void TestMacroWritesAreAtomic() {
+    std::puts("[TEST 5] a failed front macro sends none of its register writes...");
+    constexpr u32 render_enable_mode = 0x1555; // SYNTHETIC register numbers
+    constexpr u32 tex_header_limit = 0x1c8d;
+    std::vector<std::pair<u32, u32>> sent;
+    const auto send = [&](u32 a, u32 v) { sent.emplace_back(a, v); };
+
+    // Complete call: everything goes, in order, once.
+    {
+        Tegra::MacroWriteBuffer buffer;
+        buffer.Add(0x100, 1);
+        buffer.Add(0x101, 2);
+        u32 seen = 0;
+        assert(buffer.Overlay(0x101, seen) && seen == 2 && "the macro reads its own writes");
+        assert(!buffer.Overlay(0x102, seen));
+        assert(buffer.Commit(send) == 2 && buffer.Pending() == 0);
+        assert((sent == std::vector<std::pair<u32, u32>>{{0x100, 1}, {0x101, 2}}));
+    }
+    // Short call (parameter FIFO underflow after the writes derived from garbage): nothing is sent.
+    sent.clear();
+    {
+        Tegra::MacroWriteBuffer buffer;
+        buffer.Add(render_enable_mode, 0xdeadbeef);
+        buffer.Add(tex_header_limit, 0x5760 / 32 - 1);
+        assert(buffer.Discard() == 2 && buffer.Pending() == 0);
+        assert(buffer.Commit(send) == 0 && sent.empty());
+    }
+    // A DMA read is a commit point: what came before is sent, what follows is discarded.
+    sent.clear();
+    {
+        Tegra::MacroWriteBuffer buffer;
+        buffer.Add(0x154, 0x21);
+        buffer.Add(0x155, 0x80040e00);
+        buffer.Commit(send); // MME_DMA_READ about to run
+        buffer.Add(render_enable_mode, 0xdeadbeef); // written from the unmapped read's zeros
+        assert(buffer.Discard() == 1);
+        assert(sent.size() == 2 && buffer.Committed() == 2);
+    }
+    // The last write to a register wins on read, committed or not.
+    {
+        Tegra::MacroWriteBuffer buffer;
+        buffer.Add(7, 1);
+        buffer.Add(7, 9);
+        u32 seen = 0;
+        assert(buffer.Overlay(7, seen) && seen == 9);
+    }
+    std::puts("  -> PASS: complete calls commit in order; short calls leave no state behind");
+}
+
+static void TestDeviceRangeBounds() {
+    std::puts("[TEST 6] device address range checks...");
+    constexpr std::uint64_t size = 1ULL << 34;
+    assert(Tegra::DeviceRangeInside(0, 1, size));
+    assert(Tegra::DeviceRangeInside(size - 0x20, 0x20, size));
+    assert(!Tegra::DeviceRangeInside(size - 0x20, 0x21, size));
+    assert(!Tegra::DeviceRangeInside(size, 1, size));
+    // The crash: the page table gave an address near 0x53c7a53c020 (fault address of the report).
+    assert(!Tegra::DeviceRangeInside(0x053c7a53c020ULL, 0x5760, size));
+    assert(!Tegra::DeviceRangeInside(~0ULL, 0x20, size) && "no overflow");
+    std::puts("  -> PASS: the faulting address is outside the device address space");
+}
+
 int main() {
     TestEntry42FreshStreamSplit();
     TestSubroutineContinuationNotParked();
     TestMacroParkingAndResume();
+    TestDecisionUsesTheWordsTheParserRuns();
+    TestMacroWritesAreAtomic();
+    TestDeviceRangeBounds();
+    std::puts("ALL PASS");
 }
