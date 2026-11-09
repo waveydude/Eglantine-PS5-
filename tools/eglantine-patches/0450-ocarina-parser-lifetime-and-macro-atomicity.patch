@@ -1,6 +1,6 @@
 From: EglantinePS5 <noreply@eglantineps5.local>
 Subject: [PATCH] Ocarina parser lifetime and macro atomicity: the split decision is made on the words the
- parser runs, a failed front macro sends nothing, an undefined render condition skips its draws, device
+ parser runs, a failed front macro reports the writes it sent, an undefined render condition skips its draws, device
  addresses past the device space read as unmapped
 
 Found from crash-20261108-203326 (Ocarina, 109 s, SIGSEGV in GPUBack, ReadBlockImpl):
@@ -13,10 +13,9 @@ Found from crash-20261108-203326 (Ocarina, 109 s, SIGSEGV in GPUBack, ReadBlockI
    span ProcessCommands will run (EDEN_NX2_SPLIT_PARSE_CHECK, unchanged otherwise).
 2. EDEN_NX2_DESYNC_FIX (0408/0411) stays off with EDEN_NX2_SPLIT_PARSE_CHECK set; it now runs with
    it (it stays off with JUNK_GUARD / PARK_SPLIT_METHODS, whose parses its walk does not model).
-3. Maxwell3D::FrontRunMacro held the macro's register writes in MacroWriteBuffer until the call
-   ends well: a failed call (parameter FIFO underflow) used to leave its earlier writes in the front's
-   state and on the back's queue. DMA reads and shadow-RAM Replay/control writes go straight through
-   (they cannot be taken back); the failure line says how many writes were discarded and sent.
+3. Maxwell3D::FrontRunMacro's failure line says how many register writes the failed call already sent.
+   (Holding the writes back until the call succeeds was tried and removed: FrontWrite has side effects the
+   macro reads back - const_buffer.offset, load_mme pointers - and a macro looping on them hung at boot.)
 4. A render-condition mode no hardware defines skips its draws for Ocarina (EDEN_NX2_BAD_COND_SKIP
    =0/1) instead of drawing with the rest of the garbage state. Other titles are unchanged.
 5. DeviceMemoryManager::GetPointer / WalkBlock / ReadBlock check the device address space; a GPU page
@@ -201,56 +200,28 @@ diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxw
              break;
          }
          }
-@@ -1307,28 +1325,59 @@
+@@ -1307,6 +1325,11 @@
          }
          engine.native_jit->Prepare(engine.native_code, engine.native_code_generation);
          const size_t parameter_count = fs.parameters.size();
-+        // The call's register writes are held until it ends well (MacroWriteBuffer). Reads see them.
-+        MacroWriteBuffer pending;
-+        const auto commit_pending = [&] {
-+            pending.Commit([&](u32 address, u32 value) {
-+                FrontWrite(split, fs, address, value, true, true);
-+            });
-+        };
++        // Register writes go to the front state and the back as the macro makes them: FrontWrite
++        // has side effects later instructions read back (const_buffer.offset advances with each
++        // const_buffer.buffer word, load_mme pointers advance), so holding writes back made a
++        // macro that loops on those registers spin forever (boot hang, 8 Nov runs 1 and 2).
++        size_t writes_sent = 0;
          const auto result = engine.native_jit->Execute(
              start, fs.parameters, std::span<u32>{native_data_ram},
--            [&fs](u32 address) { return address < Regs::NUM_REGS ? fs.regs[address] : 0U; },
-+            [&fs, &pending](u32 address) {
-+                u32 value;
-+                if (pending.Overlay(address, value)) {
-+                    return value;
-+                }
-+                return address < Regs::NUM_REGS ? fs.regs[address] : 0U;
-+            },
-             [&](u32 address, u32 value) {
-                 if (address >= MacroRegistersStart) {
+             [&fs](u32 address) { return address < Regs::NUM_REGS ? fs.regs[address] : 0U; },
+@@ -1315,6 +1338,7 @@
                      return false;
                  }
--                FrontWrite(split, fs, address, value, true, true);
--                // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
--                if (address == 0x157 || address == 0x158) {
--                    FrontDmaRead(split, fs, method, address, value);
-+                // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO) read
-+                // guest memory and cannot be taken back; the shadow RAM modes change what a write
-+                // stores, so a write under Replay or to its control register goes straight through.
-+                const bool dma_read = address == 0x157 || address == 0x158;
-+                if (dma_read || fs.control == Regs::ShadowRamControl::Replay ||
-+                    address == MAXWELL3D_REG_INDEX(shadow_ram_control)) {
-+                    commit_pending();
-+                    FrontWrite(split, fs, address, value, true, true);
-+                    if (dma_read) {
-+                        FrontDmaRead(split, fs, method, address, value);
-+                    }
-+                } else {
-+                    pending.Add(address, value);
-                 }
-                 return true;
-             });
--        if (!result.success) {
-+        if (result.success) {
-+            commit_pending();
-+        } else {
-+            const size_t discarded = pending.Discard();
+                 FrontWrite(split, fs, address, value, true, true);
++                ++writes_sent;
+                 // MME_DMA_READ (into data RAM) and MME_DMA_READ_FIFOED (into the load FIFO).
+                 if (address == 0x157 || address == 0x158) {
+                     FrontDmaRead(split, fs, method, address, value);
+@@ -1324,11 +1348,16 @@
+         if (!result.success) {
              engine.native_execution_failed = true;
              fs.draw_pending = false;
 -            // fs.parameters still holds the call's words (the JIT reads them in place); words a
@@ -264,9 +235,8 @@ diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxw
 +                // MME_DMA_READ_FIFOED appended during the call follow them.
 +                LOG_ERROR(HW_GPU,
 +                          "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}, "
-+                          "{} register writes discarded, {} already sent{}{}",
-+                          start, result.consumed, parameter_count, result.error, discarded,
-+                          pending.Committed(), pending.Committed() != 0 ? " (before a DMA read)" : "",
++                          "{} register writes already sent{}",
++                          start, result.consumed, parameter_count, result.error, writes_sent,
 +                          FailedMacroParameters(start, fs.parameters));
 +            }
          }
@@ -283,59 +253,10 @@ diff --git a/src/video_core/split_macro_state.h b/src/video_core/split_macro_sta
  #include <span>
  #include <utility>
  #include <vector>
-@@ -63,4 +64,62 @@
+@@ -63,4 +64,13 @@
             !ReadsAsCommands(words, entry_words, 0);
  }
  
-+
-+// The register writes of one native macro call on the split front, held until the call ends well.
-+// A macro the front cannot finish (its parameter FIFO ran dry: the stream was misread upstream)
-+// would otherwise leave the registers it had written so far in the front's state and on the
-+// back's queue, and the back would draw with half a macro's state (Ocarina, 109 s: a garbage
-+// render-condition mode, then a descriptor table read from a garbage address). Reads by the macro
-+// itself see its own pending writes (Overlay). A write the call cannot take back (the DMA reads,
-+// and any write while the shadow RAM replays or changes mode) is Committed first, with everything
-+// before it, and the call is marked `irreversible`.
-+class MacroWriteBuffer {
-+public:
-+    void Add(std::uint32_t address, std::uint32_t value) {
-+        writes.emplace_back(address, value);
-+    }
-+    bool Overlay(std::uint32_t address, std::uint32_t& value) const {
-+        for (auto it = writes.rbegin(); it != writes.rend(); ++it) {
-+            if (it->first == address) {
-+                value = it->second;
-+                return true;
-+            }
-+        }
-+        return false;
-+    }
-+    template <typename Write>
-+    std::size_t Commit(Write&& write) {
-+        const std::size_t count = writes.size();
-+        for (const auto& [address, value] : writes) {
-+            write(address, value);
-+        }
-+        writes.clear();
-+        committed += count;
-+        return count;
-+    }
-+    std::size_t Discard() {
-+        const std::size_t count = writes.size();
-+        writes.clear();
-+        return count;
-+    }
-+    std::size_t Pending() const {
-+        return writes.size();
-+    }
-+    std::size_t Committed() const {
-+        return committed;
-+    }
-+
-+private:
-+    std::vector<std::pair<std::uint32_t, std::uint32_t>> writes;
-+    std::size_t committed{};
-+};
 +
 +// Whether a device-address range lies inside the device address space [0, device_as_size): the
 +// check DeviceMemoryManager::GetPointer lacked (a stale GPU page table entry gave it an address

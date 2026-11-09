@@ -137,55 +137,6 @@ static void TestDecisionUsesTheWordsTheParserRuns() {
     std::puts("  -> PASS: the old decision hands macro 0x21 the header a0040e02; the new one parks");
 }
 
-static void TestMacroWritesAreAtomic() {
-    std::puts("[TEST 5] a failed front macro sends none of its register writes...");
-    constexpr u32 render_enable_mode = 0x1555; // SYNTHETIC register numbers
-    constexpr u32 tex_header_limit = 0x1c8d;
-    std::vector<std::pair<u32, u32>> sent;
-    const auto send = [&](u32 a, u32 v) { sent.emplace_back(a, v); };
-
-    // Complete call: everything goes, in order, once.
-    {
-        Tegra::MacroWriteBuffer buffer;
-        buffer.Add(0x100, 1);
-        buffer.Add(0x101, 2);
-        u32 seen = 0;
-        assert(buffer.Overlay(0x101, seen) && seen == 2 && "the macro reads its own writes");
-        assert(!buffer.Overlay(0x102, seen));
-        assert(buffer.Commit(send) == 2 && buffer.Pending() == 0);
-        assert((sent == std::vector<std::pair<u32, u32>>{{0x100, 1}, {0x101, 2}}));
-    }
-    // Short call (parameter FIFO underflow after the writes derived from garbage): nothing is sent.
-    sent.clear();
-    {
-        Tegra::MacroWriteBuffer buffer;
-        buffer.Add(render_enable_mode, 0xdeadbeef);
-        buffer.Add(tex_header_limit, 0x5760 / 32 - 1);
-        assert(buffer.Discard() == 2 && buffer.Pending() == 0);
-        assert(buffer.Commit(send) == 0 && sent.empty());
-    }
-    // A DMA read is a commit point: what came before is sent, what follows is discarded.
-    sent.clear();
-    {
-        Tegra::MacroWriteBuffer buffer;
-        buffer.Add(0x154, 0x21);
-        buffer.Add(0x155, 0x80040e00);
-        buffer.Commit(send); // MME_DMA_READ about to run
-        buffer.Add(render_enable_mode, 0xdeadbeef); // written from the unmapped read's zeros
-        assert(buffer.Discard() == 1);
-        assert(sent.size() == 2 && buffer.Committed() == 2);
-    }
-    // The last write to a register wins on read, committed or not.
-    {
-        Tegra::MacroWriteBuffer buffer;
-        buffer.Add(7, 1);
-        buffer.Add(7, 9);
-        u32 seen = 0;
-        assert(buffer.Overlay(7, seen) && seen == 9);
-    }
-    std::puts("  -> PASS: complete calls commit in order; short calls leave no state behind");
-}
-
 static void TestDeviceRangeBounds() {
     std::puts("[TEST 6] device address range checks...");
     constexpr std::uint64_t size = 1ULL << 34;
@@ -204,7 +155,6 @@ int main() {
     TestSubroutineContinuationNotParked();
     TestMacroParkingAndResume();
     TestDecisionUsesTheWordsTheParserRuns();
-    TestMacroWritesAreAtomic();
     TestDeviceRangeBounds();
     std::puts("ALL PASS");
 }
