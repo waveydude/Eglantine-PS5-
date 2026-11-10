@@ -1,0 +1,17 @@
+Subject: [PATCH] common: release task captures before reporting completion
+
+Port the worker cleanup ordering from zortos293/Lichii#1105 and #939.
+Keep capture destruction outside queue_mutex.
+
+diff --git a/src/common/thread_worker.h b/src/common/thread_worker.h
+--- a/src/common/thread_worker.h
++++ b/src/common/thread_worker.h
+@@ -78,6 +78,8 @@ class StatefulThreadWorker {
+                     } else {
+                         task();
+                     }
++                    // Draining an executed task includes releasing its captured resources.
++                    task = {};
+                     ++work_done;
+                 }
+             }
