@@ -1,0 +1,39 @@
+Subject: [PATCH] aco/ps5: retry scratch growth with a smaller block
+
+Crash 20261109-200243 reached ACO with a 1 MiB largest free block.
+The allocator asked for 4 MiB to hold the next small node and then
+dereferenced the failed allocation. Keep normal growth when it fits.
+On PS5 retry with a smaller block that can still hold the request.
+
+diff --git a/src/amd/compiler/aco_util.h b/src/amd/compiler/aco_util.h
+--- a/src/amd/compiler/aco_util.h
++++ b/src/amd/compiler/aco_util.h
+@@ -277,9 +277,25 @@ public:
+       size_t total_size = buffer->data_size + sizeof(Buffer);
+       do {
+          total_size *= 2;
+       } while (total_size - sizeof(Buffer) < size);
+-      Buffer* next = buffer;
+-      buffer = (Buffer*)malloc(total_size);
+-      buffer->next = next;
++      Buffer* grown = (Buffer*)malloc(total_size);
++#ifdef RADV_PS5
++      if (!grown) {
++         const size_t fallback_sizes[] = {64 * 1024, initial_size};
++         for (size_t preferred : fallback_sizes) {
++            const size_t smaller = MAX2(preferred, size + sizeof(Buffer));
++            if (smaller >= total_size)
++               continue;
++            total_size = smaller;
++            grown = (Buffer*)malloc(total_size);
++            if (grown)
++               break;
++         }
++      }
++      if (!grown)
++         abort();
++#endif
++      grown->next = buffer;
++      buffer = grown;
+       buffer->data_size = total_size - sizeof(Buffer);
+       buffer->current_idx = 0;
