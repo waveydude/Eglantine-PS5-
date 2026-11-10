@@ -40,6 +40,18 @@ heap = heap[:begin] + (root / 'headless/heap_arenas.inc').read_text() + heap[end
 MOCK = r'''
 // A stand-in for the console: mspaces over caller memory, and the range the heap grows in.
 #define _GNU_SOURCE
+// The heap uses two x86 instructions (the console is x86): on another host, a pause that does
+// nothing and a cycle count from the monotonic clock.
+#if !defined(__x86_64__)
+#include <time.h>
+#define __builtin_ia32_pause() ((void)0)
+static inline unsigned long long eden_test_cycles(void) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (unsigned long long)now.tv_sec * 1000000000ull + (unsigned long long)now.tv_nsec;
+}
+#define __builtin_ia32_rdtsc() eden_test_cycles()
+#endif
 #include <assert.h>
 #include <errno.h>
 #include <pthread.h>
@@ -563,6 +575,30 @@ int main(int argc, char **argv) {
         __wrap_free(pieces);
         assert(atomic_load(&split_blocks) == 0 && eden_heap_large_held(&blocks_alive) == 0);
         assert(eden_heap_committed() == before_split);  // the heap's pieces did not grow for it
+        // EDEN_HEAP_LARGE_KIB=256: more blocks of their own than the 1024 entries the table had
+        // (full at the Castle Town gate). Every one has its own memory, is found again by address
+        // (usable size, realloc in place) and goes back; then the threshold is as before.
+        eden_heap_set_large(256);
+        enum { Many = 1500 };
+        const size_t each = (size_t)260 << 10;
+        static unsigned char *many[Many];
+        for (int i = 0; i < Many; ++i) {
+            many[i] = __wrap_malloc(each);
+            assert(many[i] != NULL);
+            many[i][0] = (unsigned char)i;
+            many[i][each - 1] = (unsigned char)(i >> 3);
+        }
+        assert(eden_heap_large_held(&blocks_alive) == Many * each && blocks_alive == Many);
+        assert(eden_heap_committed() == before_split);   // none of them took room in the pieces
+        assert(__wrap_malloc_usable_size(many[Many - 1]) == each);
+        assert(__wrap_realloc(many[Many - 1], each - 4096) == many[Many - 1]); // found: kept in place
+        for (int i = 0; i < Many; ++i)
+            assert(many[i][0] == (unsigned char)i && many[i][each - 1] == (unsigned char)(i >> 3));
+        for (int i = Many - 1; i >= 0; i -= 2) __wrap_free(many[i]);      // out of order
+        for (int i = Many - 2; i >= 0; i -= 2) __wrap_free(many[i]);
+        assert(eden_heap_large_held(&blocks_alive) == 0 && blocks_alive == 0);
+        eden_heap_set_large(32768);
+        printf("%d blocks of 260 KiB with memory of their own, past the old 1024 entries\n", Many);
     }
     // Fill the heap with blocks under the large size: the limit is its 6 GiB (3 GiB taken whole),
     // past the old 3 GiB, and running out returns NULL without damage.
