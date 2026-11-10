@@ -1,0 +1,249 @@
+Subject: [PATCH] PS5: bound GPU ASTC-to-BC transcode scratch by layer
+
+Adapt the layer batching from PS5_Lichii 8e90019d574daa10eb4a814842a40c2ca1c3a147.
+Enable with EDEN_NX2_TRANSCODE_BATCH_LAYERS=1. Preserve the existing CPU fallback and staging refusal path.
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -5214,7 +5214,22 @@
+     if (wait_for_memory && staging_buffer_pool.RefusedJustNow()) {
+         upload_refused = true;
+         return;
++    }
++    // A single scratch image and BC buffer are reused for the layer batches.
++    static const bool batch_layers = Common::PeSwitch("EDEN_NX2_TRANSCODE_BATCH_LAYERS");
++    u64 layer_decode_bytes = 0;
++    for (u32 level = 0; level < levels; ++level) {
++        layer_decode_bytes += u64{(std::max)(width >> level, 1U)} *
++                              (std::max)(height >> level, 1U) * 4;
+     }
++    const bool aligned_layers = info.layer_stride % device.GetStorageBufferAlignment() == 0;
++    const u32 batch = batch_layers && layers > 1 && info.layer_stride != 0 && aligned_layers &&
++                              info.num_samples == 1 && layer_decode_bytes != 0 &&
++                              False(image.flags & ImageFlagBits::Rescaled)
++                          ? static_cast<u32>(std::clamp<u64>((u64{64} << 20) / layer_decode_bytes,
++                                                            1, layers))
++                          : layers;
++    const bool split = batch < layers;
+     static const bool bounded = Common::PeSwitch("EDEN_PE_TRANSCODE_BOUND");
+     if (bounded) {
+         const auto bytes = [](const PendingTranscode& t) {
+@@ -5225,11 +5240,7 @@
+             }
+             return result;
+         };
+-        u64 incoming{};
+-        for (u32 level = 0; level < levels; ++level) {
+-            incoming += u64{(std::max)(width >> level, 1U)} *
+-                        (std::max)(height >> level, 1U) * 4 * layers;
+-        }
++        const u64 incoming = layer_decode_bytes * batch;
+         static const u64 limit = [] {
+             const char* value = std::getenv("EDEN_PS5_TRANSCODE_PENDING_MIB");
+             return value ? std::strtoull(value, nullptr, 10) << 20 : u64{256} << 20;
+@@ -5263,7 +5274,7 @@
+     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
+     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
+     const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
+-        return t.width == width && t.height == height && t.levels == levels && t.layers == layers;
++        return t.width == width && t.height == height && t.levels == levels && t.layers == batch;
+     });
+     PendingTranscode pending;
+     if (reusable != free_transcodes.end()) {
+@@ -5282,7 +5293,7 @@
+                 .format = DecodeFormat,
+                 .extent = {width, height, 1},
+                 .mipLevels = levels,
+-                .arrayLayers = layers,
++                .arrayLayers = batch,
+                 .samples = VK_SAMPLE_COUNT_1_BIT,
+                 .tiling = VK_IMAGE_TILING_OPTIMAL,
+                 .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+@@ -5307,7 +5318,7 @@
+             .width = width,
+             .height = height,
+             .levels = levels,
+-            .layers = layers,
++            .layers = batch,
+             .unused_frames = 0,
+         };
+         for (u32 level = 0; level < levels; ++level) {
+@@ -5315,70 +5326,118 @@
+                 MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
+         }
+     }
+-    astc_decoder_pass->AssembleInto(
+-        info, 0, image.guest_size_bytes,
+-        ASTCDecoderPass::Target{
+-            .image = *pending.image,
+-            .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+-            .initialized = false,
+-            .level_view = [&pending](s32 level) { return *pending.views[level]; },
+-            .wait = true,
+-        },
+-        map, swizzles);
+-
+-    // Encode every level into one buffer, then copy it into the image.
+     const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
+                      Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
+     const u64 block_bytes = bc3 ? 16 : 8;
+-    boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
+-    u64 total = 0;
+-    for (u32 level = 0; level < levels; ++level) {
+-        const u32 level_width = (std::max)(width >> level, 1U);
+-        const u32 level_height = (std::max)(height >> level, 1U);
+-        const u32 blocks_x = Common::DivCeil(level_width, 4U);
+-        const u32 blocks_y = Common::DivCeil(level_height, 4U);
+-        const u64 size = u64{blocks_x} * blocks_y * layers * block_bytes;
+-        copies.push_back({
+-            .buffer_offset = total,
+-            .buffer_size = size,
+-            .buffer_row_length = blocks_x * 4,
+-            .buffer_image_height = blocks_y * 4,
+-            .image_subresource{
+-                .base_level = static_cast<s32>(level),
+-                .base_layer = 0,
+-                .num_layers = static_cast<s32>(layers),
+-            },
+-            .image_offset{0, 0, 0},
+-            .image_extent{level_width, level_height, 1},
++    std::optional<StagingBufferRef> output;
++    VideoCommon::ImageInfo batch_info = info;
++    for (u32 first = 0; first < layers; first += batch) {
++        const u32 count = (std::min)(batch, layers - first);
++        boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
++        u64 total = 0;
++        for (u32 level = 0; level < levels; ++level) {
++            const u32 level_width = (std::max)(width >> level, 1U);
++            const u32 level_height = (std::max)(height >> level, 1U);
++            const u32 blocks_x = Common::DivCeil(level_width, 4U);
++            const u32 blocks_y = Common::DivCeil(level_height, 4U);
++            const u64 size = u64{blocks_x} * blocks_y * count * block_bytes;
++            copies.push_back({
++                .buffer_offset = total,
++                .buffer_size = size,
++                .buffer_row_length = blocks_x * 4,
++                .buffer_image_height = blocks_y * 4,
++                .image_subresource{
++                    .base_level = static_cast<s32>(level),
++                    .base_layer = static_cast<s32>(first),
++                    .num_layers = static_cast<s32>(count),
++                },
++                .image_offset{0, 0, 0},
++                .image_extent{level_width, level_height, 1},
++            });
++            total += size;
++        }
++        if (split && first == 0) {
++            // Acquire the one output buffer before recording a partial upload.
++            output = staging_buffer_pool.TryRequest(total, MemoryUsage::DeviceLocal);
++            if (!output) {
++                upload_refused = true;
++                return;
++            }
++            // UploadMemory transitions only its copy range. Initialize all layers before any
++            // partial copy so subsequent batches start from GENERAL as UploadMemory expects.
++            TransitionImageLayout(image);
++            LOG_INFO(Render_Vulkan,
++                     "ASTC transcode split {}x{}x{} ({} mips) into {} layers per batch, "
++                     "decode scratch {} -> {} MiB, BC staging {} MiB per batch",
++                     width, height, layers, levels, batch, (layer_decode_bytes * layers) >> 20,
++                     (layer_decode_bytes * batch) >> 20, total >> 20);
++        } else if (first != 0) {
++            // The previous batch encoded from the image and copied from the BC buffer.
++            // Order both reads before the next batch overwrites that scratch.
++            scheduler.Record([](vk::CommandBuffer cmdbuf) {
++                const VkMemoryBarrier barrier{
++                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                    .pNext = nullptr,
++                    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
++                    .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++                };
++                cmdbuf.PipelineBarrier(
++                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
++                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, barrier);
++            });
++        }
++
++        batch_info.resources.layers = static_cast<s32>(count);
++        StagingBufferRef input = map;
++        const size_t layer_offset = size_t{first} * info.layer_stride;
++        input.offset += layer_offset;
++        const size_t input_size = split
++                                      ? (std::min)(size_t{count} * info.layer_stride,
++                                                   size_t{image.guest_size_bytes} - layer_offset)
++                                      : image.guest_size_bytes;
++        const u64 decode_tick = scheduler.CurrentTick();
++        astc_decoder_pass->AssembleInto(
++            batch_info, 0, input_size,
++            ASTCDecoderPass::Target{
++                .image = *pending.image,
++                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
++                .initialized = first != 0,
++                .level_view = [&pending](s32 level) { return *pending.views[level]; },
++                .wait = true,
++            },
++            input, swizzles);
++        if (split) {
++            // AssembleInto may submit. Keep both staging buffers busy until the last batch.
++            staging_buffer_pool.CarryTick(decode_tick, scheduler.CurrentTick());
++        }
++
++        if (!output) {
++            output = staging_buffer_pool.TryRequest(total, MemoryUsage::DeviceLocal);
++            if (!output) {
++                // The single-batch decode was recorded. Keep it alive and retry the upload later.
++                pending.tick = scheduler.CurrentTick();
++                pending_transcodes.emplace_back(std::move(pending));
++                upload_refused = true;
++                return;
++            }
++        }
++        for (u32 level = 0; level < levels; ++level) {
++            bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
++                                    copies[level].image_extent.height, count, bc3, output->buffer,
++                                    output->offset, total, copies[level].buffer_offset);
++        }
++        scheduler.Record([](vk::CommandBuffer cmdbuf) {
++            const VkMemoryBarrier barrier{
++                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++            };
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
+         });
+-        total += size;
++        image.UploadMemory(output->buffer, output->offset, copies);
+     }
+-    // Zelda ended here on 2026-11-06: Request throws when refused, a buffer only the GPU uses has
+-    // no smaller size to try, and nothing on the GPU thread catches it. Now the upload is done at the
+-    // image's next use instead. The decode is recorded: its image stays until the GPU is past it.
+-    const auto output = staging_buffer_pool.TryRequest(total, MemoryUsage::DeviceLocal);
+-    if (!output) {
+-        pending.tick = scheduler.CurrentTick();
+-        pending_transcodes.emplace_back(std::move(pending));
+-        upload_refused = true;
+-        return;
+-    }
+-    for (u32 level = 0; level < levels; ++level) {
+-        bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
+-                                copies[level].image_extent.height, layers, bc3, output->buffer,
+-                                output->offset, total, copies[level].buffer_offset);
+-    }
+-    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+-        const VkMemoryBarrier barrier{
+-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+-            .pNext = nullptr,
+-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+-        };
+-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                               0, barrier);
+-    });
+-    image.UploadMemory(output->buffer, output->offset, copies);
+     pending.tick = scheduler.CurrentTick();
+     pending_transcodes.push_back(std::move(pending));
+ }
