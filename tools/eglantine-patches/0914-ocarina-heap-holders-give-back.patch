@@ -1,0 +1,89 @@
+Subject: [PATCH] Shader IR pools and texture scratch give their memory back
+
+Port of the parts of PS5_Lichii 0230 (mihawk-99 70b85df4, "three heap holders give their
+memory back") that T85 lacks. Measured there on Ocarina (PC heap census): shader IR pools
+113 -> 24 MiB, texture upload scratch 120 -> 7.5 MiB.
+- A shader IR pool keeps at most 4 MiB between shaders.
+- The upload scratch buffers are also freed every 256 frames over 8 MiB (on top of
+  EDEN_TC_SCRATCH_KEEP_MIB), and the ASTC scan buffer after a scan over 8 MiB.
+Not ported: the descriptor update queue change. Here the queues are already a quarter of
+the size 0230 starts from (0x20000 and 0x8000 entries) and have no growth path to keep.
+Always on: a shader over 4 MiB of IR allocates again for the next one, which costs only
+time on those shaders.
+
+diff --git a/src/shader_recompiler/object_pool.h b/src/shader_recompiler/object_pool.h
+--- a/src/shader_recompiler/object_pool.h
++++ b/src/shader_recompiler/object_pool.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <memory>
+ #include <type_traits>
+ #include <utility>
+@@ -29,10 +30,13 @@
+         }
+         Chunk& root{chunks.front()};
+         if (root.used_objects == root.num_objects) {
+-            // Root chunk has been filled, squash allocations into it
++            // Root chunk has been filled, squash allocations into it, up to MaxKeptBytes: one
++            // huge shader otherwise left its whole IR allocated for the session (PS5_Lichii 0230:
++            // Ocarina kept 113 MiB in six translate workers' pools after the boot build).
++            const size_t kept{(std::max)(new_chunk_size, MaxKeptBytes / sizeof(Storage))};
+             const size_t total_objects{root.num_objects + new_chunk_size * (chunks.size() - 1)};
+             chunks.clear();
+-            chunks.emplace_back(total_objects);
++            chunks.emplace_back((std::min)(total_objects, kept));
+         } else {
+             root.Release();
+             chunks.resize(1);
+@@ -42,6 +46,8 @@
+     }
+ 
+ private:
++    static constexpr size_t MaxKeptBytes = 4 << 20;
++
+     struct NonTrivialDummy {
+         NonTrivialDummy() noexcept {}
+     };
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -261,6 +261,9 @@
+ 
+     static constexpr u32 LayerUploadMinSize = 64U << 20;
+     static constexpr size_t LargeScratchCapacity = 64U << 20;
++    /// What an upload scratch buffer may keep between the checks made every 256 frames, and
++    /// what the ASTC scan buffer may keep after a scan (PS5_Lichii 0230).
++    static constexpr size_t KeptScratchCapacity = 8U << 20;
+ 
+     /// Splits large 2D image uploads into smaller chunks, avoiding multi-hundred MiB staging buffers.
+     bool UploadInChunks(Image& image, u64 min_size = u64{64} << 20);
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -1052,8 +1052,11 @@
+         LOG_INFO(HW_GPU, "Upload scratch buffers keep at most {} MiB each", mib);
+         return static_cast<size_t>(mib) << 20;
+     }();
++    // Also every 256 frames over KeptScratchCapacity (PS5_Lichii 0230: Ocarina kept a 64 MiB one
++    // from its save load on).
+     for (auto* const scratch : {&swizzle_data_buffer, &unswizzle_data_buffer}) {
+-        if (scratch->capacity() > scratch_keep) {
++        if (scratch->capacity() > scratch_keep ||
++            (scratch->capacity() > KeptScratchCapacity && (frame_tick & 255) == 0)) {
+             scratch->release();
+         }
+     }
+@@ -4860,6 +4863,10 @@
+                 astc_scan_buffer.resize(scan_bytes);
+                 gpu_memory->ReadBlockUnsafe(gpu_addr, astc_scan_buffer.data(), scan_bytes);
+                 new_info.astc_opaque = AstcDataLooksOpaque(astc_scan_buffer);
++                if (astc_scan_buffer.capacity() > KeptScratchCapacity) {
++                    // PS5_Lichii 0230: Ocarina kept 56 MiB here after one scan.
++                    std::vector<u8>{}.swap(astc_scan_buffer);
++                }
+                 ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
+             }
+         }
