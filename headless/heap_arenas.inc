@@ -223,12 +223,23 @@ static atomic_size_t eden_heap_large_from = EDEN_HEAP_LARGE_REQUEST;
 static atomic_ullong eden_heap_mid_taken, eden_heap_mid_refused, eden_heap_mid_cycles, eden_heap_mid_taken_bytes;
 static atomic_size_t eden_heap_mid_bytes, eden_heap_mid_peak;
 static atomic_uint eden_heap_mid_count;
-void eden_heap_set_large(size_t mib) {
-  if (mib < 1u)
-    mib = 1u;
-  if (mib > 32u)
-    mib = 32u;
-  atomic_store_explicit(&eden_heap_large_from, mib << 20, memory_order_relaxed);
+/* Requests that do not go to an arena, by size, whichever way they went: under 1 MiB, under 2,
+ * under 8, under 32 (count and bytes). They say what a lower EDEN_HEAP_LARGE_KIB would cost. */
+static atomic_ullong eden_heap_class_count[4], eden_heap_class_bytes[4];
+static void eden_heap_class_note(size_t bytes) {
+  const unsigned kind = bytes < ((size_t)1 << 20) ? 0u : bytes < ((size_t)2 << 20) ? 1u : bytes < ((size_t)8 << 20) ? 2u : 3u;
+  atomic_fetch_add_explicit(&eden_heap_class_count[kind], 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_class_bytes[kind], bytes, memory_order_relaxed);
+}
+/* In KiB: 256 (the arenas take what is smaller) to 32768. EDEN_HEAP_LARGE_KIB, or
+ * EDEN_HEAP_LARGE_MIB in MiB. A block of 2 MiB or more is whole 2 MiB pages of the pool; a
+ * smaller one is 16 KiB pages, which leaves the pool in smaller pieces. */
+void eden_heap_set_large(size_t kib) {
+  if (kib < 256u)
+    kib = 256u;
+  if (kib > 32768u)
+    kib = 32768u;
+  atomic_store_explicit(&eden_heap_large_from, kib << 10, memory_order_relaxed);
 }
 /* The large blocks alive: address 0 marks a free entry, 1 one being filled in. */
 static struct {
@@ -1674,6 +1685,15 @@ void eden_heap_growth_report(void) {
           atomic_load_explicit(&eden_heap_mid_peak, memory_order_relaxed) >> 20,
           (unsigned long long)atomic_load_explicit(&eden_heap_mid_cycles, memory_order_relaxed) / 1000000u,
           atomic_load_explicit(&eden_heap_large_count, memory_order_relaxed));
+  fprintf(stderr, "EDEN_HEAP_CLASSES requests (count/MiB): under1M=%llu/%llu under2M=%llu/%llu under8M=%llu/%llu under32M=%llu/%llu\n",
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_count[0], memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_bytes[0], memory_order_relaxed) >> 20,
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_count[1], memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_bytes[1], memory_order_relaxed) >> 20,
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_count[2], memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_bytes[2], memory_order_relaxed) >> 20,
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_count[3], memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_heap_class_bytes[3], memory_order_relaxed) >> 20);
 }
 
 /* The room left in an mspace, found by asking it: blocks of `top` while it gives them, then of half
@@ -1816,6 +1836,8 @@ void eden_heap_arena_report(void) {
 
 static void *eden_heap_allocate(size_t count, size_t size, int zero) {
   const size_t bytes = count * size;
+  if (bytes >= EDEN_HEAP_SMALL_REQUEST && bytes < EDEN_HEAP_LARGE_REQUEST)
+    eden_heap_class_note(bytes);
   if (bytes >= atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed) && eden_heap_grows) {
     /* Memory of its own (it arrives zeroed). With every entry taken, or no memory left to take,
      * the heap's spaces: a piece committed earlier may still have the room. */

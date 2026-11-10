@@ -48,14 +48,20 @@ std::uint64_t EnvMib(const char* name) {
 //     instead of taking the pool's last pieces (eden_heap_split_pages): on 7 Nov (run T54, New
 //     Game) that left the pool's largest free block at 2 MiB and the pipeline builder threads
 //     starved. Smaller requests are not touched: they still go in pieces as before.
-extern "C" void eden_heap_set_large(std::size_t mib) __attribute__((weak));
+extern "C" void eden_heap_set_large(std::size_t kib) __attribute__((weak));
 extern "C" void eden_heap_pool_init(void) {
-    // EDEN_HEAP_LARGE_MIB=<n> (1 to 32): requests of n MiB or more get memory of their own, given
-    // back when they are freed (headless/heap_arenas.inc). Without it 32, as before.
-    if (const std::uint64_t mib = EnvMib("EDEN_HEAP_LARGE_MIB"); mib != 0 && eden_heap_set_large) {
-        eden_heap_set_large(static_cast<std::size_t>(mib));
-        std::fprintf(stderr, "EDEN_HEAP_LARGE_MIB requests of %llu MiB or more get memory of their own\n",
-                     static_cast<unsigned long long>(mib > 32 ? 32 : mib));
+    // EDEN_HEAP_LARGE_MIB=<n> (1 to 32) or EDEN_HEAP_LARGE_KIB=<n> (256 to 32768): requests of that
+    // size or more get memory of their own, given back when they are freed
+    // (headless/heap_arenas.inc). Without either 32 MiB, as before.
+    if (eden_heap_set_large) {
+        std::uint64_t kib = EnvMib("EDEN_HEAP_LARGE_KIB");
+        if (kib == 0) kib = EnvMib("EDEN_HEAP_LARGE_MIB") << 10;
+        if (kib != 0) {
+            kib = kib < 256 ? 256 : kib > 32768 ? 32768 : kib;
+            eden_heap_set_large(static_cast<std::size_t>(kib));
+            std::fprintf(stderr, "EDEN_HEAP_LARGE requests of %llu KiB or more get memory of their own\n",
+                         static_cast<unsigned long long>(kib));
+        }
     }
     if (const std::uint64_t mib = EnvMib("EDEN_BIG_IMAGE_RESERVE_MIB"); mib != 0)
         Common::TakeBigImageReserve(static_cast<std::size_t>(mib));
