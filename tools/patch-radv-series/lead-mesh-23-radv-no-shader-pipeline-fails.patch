@@ -1,0 +1,34 @@
+From: waveydude <23585435+waveydude@users.noreply.github.com>
+Subject: [PATCH] radv/ps5: a graphics pipeline with no vertex stage shader fails instead of being drawn
+
+With the pool short a compile or an upload gives no shader; the pipeline was returned and the
+first draw read a NULL shader in radv_get_vgt_shader_key (crash-20261109-191903).
+
+---
+diff --git a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipeline_graphics.c
+--- a/src/amd/vulkan/radv_pipeline_graphics.c
++++ b/src/amd/vulkan/radv_pipeline_graphics.c
+@@ -3205,6 +3205,23 @@
+    radv_graphics_shaders_create(device, cache, skip_shaders_cache, pipeline->base.shaders, binaries, debug,
+                                 &pipeline->base.gs_copy_shader, gs_copy_binary, &gs_copy_debug);
+ 
++   /* EglantinePS5: with the memory pool short a stage's compile or its upload gives no shader, and
++    * the pipeline was returned all the same: the first draw with it read the wave size of a NULL
++    * shader in radv_get_vgt_shader_key (Ocarina of Time leaving Kokiri Forest,
++    * crash-20261109-191903, after "pipeline ... has no shader, not cached"). A pipeline that is
++    * drawn with and has no shader for its vertices fails instead, as one whose compute shader is
++    * missing already does; the application then goes without that one pipeline. */
++   if (pipeline->base.type == RADV_PIPELINE_GRAPHICS && !pipeline->base.shaders[MESA_SHADER_VERTEX] &&
++       !pipeline->base.shaders[MESA_SHADER_TESS_EVAL] && !pipeline->base.shaders[MESA_SHADER_GEOMETRY] &&
++       !pipeline->base.shaders[MESA_SHADER_MESH] &&
++       (stages[MESA_SHADER_VERTEX].nir || stages[MESA_SHADER_MESH].nir || stages[MESA_SHADER_TESS_EVAL].nir ||
++        stages[MESA_SHADER_GEOMETRY].nir)) {
++      fprintf(stderr, "radv/ps5: graphics pipeline %016llx has no vertex stage shader (no memory?): failed\n",
++              (unsigned long long)pipeline->base.pipeline_hash);
++      result = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++      skip_shaders_cache = true;
++   }
++
+    if (gs_compute.used) {
+       /* Its compute shaders are not in the shaders cache: the pipeline is not
+        * either. */
