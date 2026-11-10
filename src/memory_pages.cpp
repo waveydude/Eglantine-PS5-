@@ -143,10 +143,11 @@ const Header& header_of(const void* pointer, std::size_t page) {
 // when it is first touched. A block from here is dense and zeroed. What must not be dense (the
 // guest page tables, the heap) uses the two families below.
 namespace {
-void* AllocatePagesAt(std::size_t size, [[maybe_unused]] std::uintptr_t hint) noexcept {
+void* AllocatePagesAt(std::size_t size, [[maybe_unused]] std::uintptr_t hint,
+                      [[maybe_unused]] bool retry_with_small_pages = false) noexcept {
     const long page = sysconf(_SC_PAGESIZE);
-    const std::size_t lead = page > 0 ? lead_size(size, static_cast<std::size_t>(page)) : 0;
-    const auto total = page > 0 ? allocation_size(size, page, lead) : 0;
+    std::size_t lead = page > 0 ? lead_size(size, static_cast<std::size_t>(page)) : 0;
+    auto total = page > 0 ? allocation_size(size, page, lead) : 0;
     if (!total) { errno = EINVAL; return nullptr; }
     void* base = nullptr;
     std::int64_t physical = -1;
@@ -154,6 +155,12 @@ void* AllocatePagesAt(std::size_t size, [[maybe_unused]] std::uintptr_t hint) no
     base = reinterpret_cast<void*>(hint);
     const auto limit = sceKernelGetDirectMemorySize();
     auto rc = sceKernelAllocateDirectMemory(0, limit, total, lead, 12, &physical);
+    if (rc != 0 && retry_with_small_pages && lead == LargePage) {
+        // A medium heap block can fit without the large-page alignment and padding.
+        lead = static_cast<std::size_t>(page);
+        total = allocation_size(size, lead, lead);
+        rc = sceKernelAllocateDirectMemory(0, limit, total, lead, 12, &physical);
+    }
     if (rc != 0) {
         std::fprintf(stderr, "Direct allocation failed: rc=%08x bytes=%zu limit=%lld\n",
                      unsigned(rc), total, static_cast<long long>(limit));
@@ -191,6 +198,14 @@ void* AllocateMemoryPages(std::size_t size) noexcept {
     return AllocatePagesAt(size, cpu_mapping_hint);
 #else
     return AllocatePagesAt(size, 0);
+#endif
+}
+
+void* AllocateHeapMemoryPages(std::size_t size) noexcept {
+#ifdef PS5_NATIVE
+    return AllocatePagesAt(size, cpu_mapping_hint, size < 32 * 1024 * 1024);
+#else
+    return AllocateMemoryPages(size);
 #endif
 }
 

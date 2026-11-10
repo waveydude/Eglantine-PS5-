@@ -7,6 +7,7 @@
 #include "common/sparse_large_vector.h"
 
 namespace Common {
+void* AllocateHeapMemoryPages(std::size_t size) noexcept;
 void* ReserveMemoryRange(std::size_t size) noexcept;
 void* ReserveAddressRange(std::size_t size) noexcept;
 bool CommitMemoryRange(void* address, std::size_t size) noexcept;
@@ -95,7 +96,7 @@ extern "C" void eden_heap_reserve_pages_free(void* base, std::size_t size) {
 
 // Reuse the qualified, owned direct-memory backend for the C mspace heap.
 extern "C" void* eden_heap_pages(std::size_t size) {
-    return Common::AllocateMemoryPages(size);
+    return Common::AllocateHeapMemoryPages(size);
 }
 extern "C" void eden_heap_pages_free(void* base, std::size_t size) {
     Common::FreeMemoryPages(base, size);
