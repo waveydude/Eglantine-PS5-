@@ -2801,6 +2801,15 @@ void Initialize() {
         "${PORT_BUILD_DIR}/app_heap.c")
     target_compile_definitions(eden-headless PRIVATE PS5_NATIVE=1
         $<$<BOOL:${EDEN_MKW_DIAGNOSTICS}>:EDEN_MKW_DIAGNOSTICS=1>)
+    # Graphics memory census (headless/gfx_census.cpp, EDEN_GFX_CENSUS=1): the VMA entry points go
+    # through its wrappers. Here and not in tools/link-headless-native.sh, which a build directory
+    # configured from another checkout takes from there. The --undefined pulls the census out of
+    # libvideo_core.a: lld does not take an archive member in for a --wrap target alone.
+    target_link_options(eden-headless PRIVATE
+        "LINKER:--undefined=__wrap_vmaCreateImage"
+        "LINKER:--wrap=vmaCreateAllocator,--wrap=vmaDestroyAllocator,--wrap=vmaCreateImage,--wrap=vmaCreateBuffer"
+        "LINKER:--wrap=vmaCreateBufferWithAlignment,--wrap=vmaAllocateMemory,--wrap=vmaAllocateMemoryForBuffer"
+        "LINKER:--wrap=vmaAllocateMemoryForImage,--wrap=vmaDestroyImage,--wrap=vmaDestroyBuffer,--wrap=vmaFreeMemory")
     set_property(TARGET eden-headless APPEND PROPERTY LINK_DEPENDS
         "${PORT_ROOT}/tools/link-headless-native.sh" "${PORT_ROOT}/tools/unwind.ld"
         "${PORT_ROOT}/tools/app-symbols.map")

@@ -38,6 +38,7 @@ list(APPEND video_sources "${PORT_BUILD_DIR}/vulkan_instance.cpp" "${PORT_BUILD_
     "${PORT_BUILD_DIR}/vulkan_rasterizer.cpp" "${PORT_BUILD_DIR}/vulkan_blit_screen.cpp"
     "${PORT_BUILD_DIR}/vulkan_window_adapt_pass.cpp" "${PORT_BUILD_DIR}/vulkan_renderer.cpp"
     "${PORT_BUILD_DIR}/vulkan_library.cpp" "${EDEN_PORT_DIR}/vulkan_surface.cpp" "${EDEN_PORT_DIR}/vulkan_allocator.cpp"
+    "${EDEN_PORT_DIR}/gfx_census.cpp"
     "${PORT_BUILD_DIR}/vulkan_present_manager.cpp" "${PORT_BUILD_DIR}/vulkan_swapchain.cpp"
     "${PORT_BUILD_DIR}/vulkan_query_cache.cpp")
 foreach(name vk_fence_manager vk_buffer_cache vk_texture_cache vk_descriptor_buffer vk_multi_range_buffer vk_compute_pass vk_graphics_pipeline vk_compute_pipeline vk_pipeline_cache)
