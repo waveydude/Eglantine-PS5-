@@ -1,0 +1,47 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] radv/ps5: a buffer the pool has no room for asks Eden for memory and tries again
+
+---
+diff --git a/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c b/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c
+@@ -287,10 +287,39 @@
+ }
+ 
+ static bool radv_ps5_memory_alloc_chunked(uint64_t bytes, uint64_t alignment, struct radv_ps5_memory *out);
++
++static bool radv_ps5_memory_alloc_once(uint64_t bytes, uint64_t alignment, bool window32,
++                                       struct radv_ps5_memory *out);
++
++/* Eden's way to give memory back to the pool the CPU and the GPU share (headless/performance.cpp):
++ * cold guest memory out to swap, the heap's empty pages, and the texture collector told to evict.
++ * Returns the bytes it gave back. Weak: a build without Eden fails as before. */
++uint64_t eden_radv_out_of_memory(uint64_t bytes) __attribute__((weak));
+ 
++/* A device-memory buffer the pool has no room for asks Eden for memory once and tries again,
++ * instead of failing. The failures this saves came from the driver's own buffers (command
++ * buffers, uploads): they surface at vkEndCommandBuffer, where the app can only stop (Ocarina,
++ * crash-20261108-222452, the pool empty at an area load with ~1 GB of cold guest memory held). */
+ bool
+ radv_ps5_memory_alloc(uint64_t bytes, uint64_t alignment, bool window32, struct radv_ps5_memory *out)
+ {
++   if (radv_ps5_memory_alloc_once(bytes, alignment, window32, out))
++      return true;
++   if (window32 || !eden_radv_out_of_memory)
++      return false;
++   const uint64_t freed = eden_radv_out_of_memory(bytes);
++   const bool placed = freed != 0 && radv_ps5_memory_alloc_once(bytes, alignment, window32, out);
++   static uint32_t reported;
++   if (p_atomic_inc_return(&reported) <= 64)
++      fprintf(stderr, "radv/ps5: no memory for %llu KiB: Eden gave back %llu MiB, %s\n",
++              (unsigned long long)(bytes >> 10), (unsigned long long)(freed >> 20),
++              placed ? "placed on the retry" : "still no memory");
++   return placed;
++}
++
++static bool
++radv_ps5_memory_alloc_once(uint64_t bytes, uint64_t alignment, bool window32, struct radv_ps5_memory *out)
++{
+    *out = (struct radv_ps5_memory){.physical = -1};
+    bytes = align64(MAX2(bytes, 1), RADV_PS5_PAGE_BYTES);
+    alignment = MAX2(alignment, PS5_KERNEL_DIRECT_ALIGNMENT);

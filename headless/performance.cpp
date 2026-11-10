@@ -1769,4 +1769,27 @@ extern "C" void eden_jit_compile(unsigned core, unsigned long long ns) {
     Eden::Performance::compilation[core].nanoseconds.fetch_add(ns, std::memory_order_relaxed);
 }
 
+#ifdef PS5_NATIVE
+// The driver found no memory for one of its buffers (tools/patch-radv-series/lead-mesh-22): give the
+// pool what can go at once, then the driver tries once more. Its own buffers (command buffers,
+// uploads) never reach the Vulkan allocator's refusal path (MemoryAllocator::ReleaseRefused), so
+// without this the session ended at vkEndCommandBuffer (Ocarina on 13.60, crash-20261108-222452).
+// Any thread, inside the driver: only memory work here, nothing that calls back into Vulkan.
+extern "C" std::size_t eden_guest_memory_reclaim(std::size_t want) __attribute__((weak));
+extern "C" std::uint64_t eden_radv_out_of_memory(std::uint64_t bytes) {
+    static std::mutex one_at_a_time;
+    const std::lock_guard lock{one_at_a_time};
+    Eden::Performance::graphics_refusals.fetch_add(1, std::memory_order_relaxed);
+    const std::uint64_t want = std::clamp<std::uint64_t>(bytes * 4, std::uint64_t{64} << 20, std::uint64_t{512} << 20);
+    std::uint64_t freed = Eden::Performance::TrimHeap("the driver found no memory");
+    if (freed < bytes && eden_guest_memory_reclaim)
+        freed += eden_guest_memory_reclaim(static_cast<std::size_t>(want));
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 64)
+        std::fprintf(stderr, "EDEN_RADV_OUT_OF_MEMORY %llu KiB asked: %llu MiB given back\n",
+                     static_cast<unsigned long long>(bytes >> 10), static_cast<unsigned long long>(freed >> 20));
+    return freed;
+}
+#endif
+
 #include "ordered_read_trace.inc"

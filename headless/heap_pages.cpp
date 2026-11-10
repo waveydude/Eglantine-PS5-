@@ -48,7 +48,15 @@ std::uint64_t EnvMib(const char* name) {
 //     instead of taking the pool's last pieces (eden_heap_split_pages): on 7 Nov (run T54, New
 //     Game) that left the pool's largest free block at 2 MiB and the pipeline builder threads
 //     starved. Smaller requests are not touched: they still go in pieces as before.
+extern "C" void eden_heap_set_large(std::size_t mib) __attribute__((weak));
 extern "C" void eden_heap_pool_init(void) {
+    // EDEN_HEAP_LARGE_MIB=<n> (1 to 32): requests of n MiB or more get memory of their own, given
+    // back when they are freed (headless/heap_arenas.inc). Without it 32, as before.
+    if (const std::uint64_t mib = EnvMib("EDEN_HEAP_LARGE_MIB"); mib != 0 && eden_heap_set_large) {
+        eden_heap_set_large(static_cast<std::size_t>(mib));
+        std::fprintf(stderr, "EDEN_HEAP_LARGE_MIB requests of %llu MiB or more get memory of their own\n",
+                     static_cast<unsigned long long>(mib > 32 ? 32 : mib));
+    }
     if (const std::uint64_t mib = EnvMib("EDEN_BIG_IMAGE_RESERVE_MIB"); mib != 0)
         Common::TakeBigImageReserve(static_cast<std::size_t>(mib));
     const char* const no_split = std::getenv("EDEN_BIG_IMAGE_NO_SPLIT");

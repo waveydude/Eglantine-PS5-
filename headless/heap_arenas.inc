@@ -209,7 +209,27 @@ static atomic_flag eden_heap_grow_lock = ATOMIC_FLAG_INIT;
 
 /* Requests of this size or more get memory of their own (eden_heap_pages), freed with them. */
 #define EDEN_HEAP_LARGE_REQUEST ((size_t)32 << 20)
-#define EDEN_HEAP_LARGE_BLOCKS 256u
+#define EDEN_HEAP_LARGE_BLOCKS 1024u
+/* EDEN_HEAP_LARGE_MIB=n in env.txt (1 to 32; without it 32, as before): requests of n MiB or more
+ * get memory of their own. A block of 8 to 32 MiB took room in a 32 MiB piece, and a piece goes
+ * back only with no block left in it: Ocarina of Time on a base console (crash-20261109-170104)
+ * ended with the pool at 0 while the heap held 1728 MiB with 644 MiB in use, 768 MiB of its
+ * growth asked by requests of 8 to 32 MiB. A block of its own goes back the moment it is freed.
+ * Its price is a mapping and a release for each (counted: EDEN_HEAP_MID, every 20 s) and the
+ * 2 MiB lead of a block of 2 MiB or more. Set from main after env.txt (eden_heap_set_large). */
+static atomic_size_t eden_heap_large_from = EDEN_HEAP_LARGE_REQUEST;
+/* Blocks under EDEN_HEAP_LARGE_REQUEST with memory of their own: taken, refused (those went to
+ * the heap's spaces), alive now and at most, and the cycles their mappings and releases took. */
+static atomic_ullong eden_heap_mid_taken, eden_heap_mid_refused, eden_heap_mid_cycles, eden_heap_mid_taken_bytes;
+static atomic_size_t eden_heap_mid_bytes, eden_heap_mid_peak;
+static atomic_uint eden_heap_mid_count;
+void eden_heap_set_large(size_t mib) {
+  if (mib < 1u)
+    mib = 1u;
+  if (mib > 32u)
+    mib = 32u;
+  atomic_store_explicit(&eden_heap_large_from, mib << 20, memory_order_relaxed);
+}
 /* The large blocks alive: address 0 marks a free entry, 1 one being filled in. */
 static struct {
   _Atomic uintptr_t address;
@@ -437,7 +457,29 @@ static int eden_heap_large_find(const void *address) {
 }
 
 /* A large block of its own (zeroed), or NULL: no entry free, or no memory. */
+static void *eden_heap_large_allocate_inner(size_t bytes);
 static void *eden_heap_large_allocate(size_t bytes) {
+  if (bytes >= EDEN_HEAP_LARGE_REQUEST)
+    return eden_heap_large_allocate_inner(bytes);
+  const unsigned long long start = __builtin_ia32_rdtsc();
+  void *block = eden_heap_large_allocate_inner(bytes);
+  atomic_fetch_add_explicit(&eden_heap_mid_cycles, __builtin_ia32_rdtsc() - start, memory_order_relaxed);
+  if (block == NULL) {
+    atomic_fetch_add_explicit(&eden_heap_mid_refused, 1, memory_order_relaxed);
+    return NULL;
+  }
+  atomic_fetch_add_explicit(&eden_heap_mid_taken, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_mid_taken_bytes, bytes, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_mid_count, 1, memory_order_relaxed);
+  const size_t now = atomic_fetch_add_explicit(&eden_heap_mid_bytes, bytes, memory_order_relaxed) + bytes;
+  size_t peak = atomic_load_explicit(&eden_heap_mid_peak, memory_order_relaxed);
+  while (now > peak &&
+         !atomic_compare_exchange_weak_explicit(&eden_heap_mid_peak, &peak, now, memory_order_relaxed, memory_order_relaxed)) {
+  }
+  return block;
+}
+
+static void *eden_heap_large_allocate_inner(size_t bytes) {
   for (unsigned i = 0; i < EDEN_HEAP_LARGE_BLOCKS; ++i) {
     uintptr_t expected = 0;
     if (!atomic_compare_exchange_strong_explicit(&eden_heap_large[i].address, &expected, 1, memory_order_acquire,
@@ -478,12 +520,19 @@ static void eden_heap_large_free(int entry) {
   /* The entry stops naming the address before the memory goes: the next large block may be
    * given the same address at once. */
   atomic_store_explicit(&eden_heap_large[entry].address, 1, memory_order_release);
+  const int mid = bytes < EDEN_HEAP_LARGE_REQUEST;
+  const unsigned long long start = mid ? __builtin_ia32_rdtsc() : 0;
   if (eden_heap_large[entry].split == 2)
     eden_heap_reserve_pages_free(block, bytes);
   else if (eden_heap_large[entry].split)
     eden_heap_split_pages_free(block, bytes);
   else
     eden_heap_pages_free(block, bytes);
+  if (mid) {
+    atomic_fetch_add_explicit(&eden_heap_mid_cycles, __builtin_ia32_rdtsc() - start, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&eden_heap_mid_bytes, bytes, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&eden_heap_mid_count, 1, memory_order_relaxed);
+  }
   atomic_fetch_sub_explicit(&eden_heap_large_bytes, bytes, memory_order_relaxed);
   atomic_fetch_sub_explicit(&eden_heap_large_count, 1, memory_order_release);
   atomic_store_explicit(&eden_heap_large[entry].address, 0, memory_order_release);
@@ -1613,6 +1662,18 @@ void eden_heap_growth_report(void) {
                            << (EDEN_HEAP_PIECE_SHIFT - 20),
                        atomic_load_explicit(&eden_heap_grew_largest[kind], memory_order_relaxed) >> 10);
   fprintf(stderr, "%s (MiB/largest KiB)\n", line);
+  /* Blocks under 32 MiB with memory of their own (EDEN_HEAP_LARGE_MIB). Cycles are the TSC's. */
+  fprintf(stderr, "EDEN_HEAP_MID from=%zuKiB taken=%llu taken_mib=%llu refused=%llu alive=%u alive_mib=%zu peak_mib=%zu "
+                  "cycles_m=%llu large_entries=%u\n",
+          atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed) >> 10,
+          (unsigned long long)atomic_load_explicit(&eden_heap_mid_taken, memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_heap_mid_taken_bytes, memory_order_relaxed) >> 20,
+          (unsigned long long)atomic_load_explicit(&eden_heap_mid_refused, memory_order_relaxed),
+          atomic_load_explicit(&eden_heap_mid_count, memory_order_relaxed),
+          atomic_load_explicit(&eden_heap_mid_bytes, memory_order_relaxed) >> 20,
+          atomic_load_explicit(&eden_heap_mid_peak, memory_order_relaxed) >> 20,
+          (unsigned long long)atomic_load_explicit(&eden_heap_mid_cycles, memory_order_relaxed) / 1000000u,
+          atomic_load_explicit(&eden_heap_large_count, memory_order_relaxed));
 }
 
 /* The room left in an mspace, found by asking it: blocks of `top` while it gives them, then of half
@@ -1755,7 +1816,7 @@ void eden_heap_arena_report(void) {
 
 static void *eden_heap_allocate(size_t count, size_t size, int zero) {
   const size_t bytes = count * size;
-  if (bytes >= EDEN_HEAP_LARGE_REQUEST && eden_heap_grows) {
+  if (bytes >= atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed) && eden_heap_grows) {
     /* Memory of its own (it arrives zeroed). With every entry taken, or no memory left to take,
      * the heap's spaces: a piece committed earlier may still have the room. */
     void *block = eden_heap_large_allocate(bytes);
@@ -1818,7 +1879,7 @@ static void *eden_realloc_inner(void *address, size_t size) {
     /* A large block keeps its memory while the new size still needs most of it. */
     if (size <= before && size >= before / 2)
       return address;
-  } else if (size < EDEN_HEAP_LARGE_REQUEST || !eden_heap_grows) {
+  } else if (size < atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed) || !eden_heap_grows) {
     void *owner = eden_heap_owner(address);
     void *result = sceLibcMspaceRealloc(owner, address, size);
     if (result) {
@@ -1903,7 +1964,7 @@ int __wrap_posix_memalign(void **address, size_t alignment, size_t size) {
   if (result != 0) {
     /* A large block's own memory starts on a page; the heap's spaces align anything. */
     void *block = NULL;
-    if (alignment <= 4096 && size >= EDEN_HEAP_LARGE_REQUEST && eden_heap_grows)
+    if (alignment <= 4096 && size >= atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed) && eden_heap_grows)
       block = eden_heap_large_allocate(size);
     if (block == NULL)
       block = eden_heap_main(EDEN_HEAP_ALIGNED, alignment, size);

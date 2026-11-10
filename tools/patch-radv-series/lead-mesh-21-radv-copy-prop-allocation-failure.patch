@@ -1,0 +1,59 @@
+Subject: [PATCH] nir: skip tracking a copy when its array cannot grow
+
+Copy propagation can continue without recording this entry. Writes still
+invalidate aliases before attempting to add the replacement entry.
+
+diff --git a/src/compiler/nir/nir_opt_copy_prop_vars.c b/src/compiler/nir/nir_opt_copy_prop_vars.c
+--- a/src/compiler/nir/nir_opt_copy_prop_vars.c
++++ b/src/compiler/nir/nir_opt_copy_prop_vars.c
+@@ -413,11 +413,12 @@
+    struct util_dynarray *copies_array =
+       copies_array_for_deref(state, copies, deref);
+ 
+-   struct copy_entry new_entry = {
+-      .dst = *deref,
+-   };
+-   util_dynarray_append(copies_array, new_entry);
+-   return util_dynarray_top_ptr(copies_array, struct copy_entry);
++   struct copy_entry *entry = util_dynarray_grow(copies_array, struct copy_entry, 1);
++   if (!entry)
++      return NULL;
++
++   *entry = (struct copy_entry){ .dst = *deref };
++   return entry;
+ }
+ 
+ /* Remove copy entry by swapping it with the last element and reducing the
+@@ -1223,8 +1224,9 @@
+          /* Update the entry with the value of the load.  This way
+           * we can potentially remove subsequent loads.
+           */
+-         value_set_from_value(&entry->src, &value, vec_index,
+-                              (1 << intrin->num_components) - 1);
++         if (entry)
++            value_set_from_value(&entry->src, &value, vec_index,
++                                 (1 << intrin->num_components) - 1);
+          break;
+       }
+ 
+@@ -1314,7 +1316,9 @@
+             unsigned wrmask = nir_intrinsic_write_mask(intrin);
+             struct copy_entry *entry =
+                get_entry_and_kill_aliases(state, copies, &vec_dst, wrmask);
+-            value_set_from_value(&entry->src, &value, vec_index, wrmask);
++            /* Alias invalidation is complete even if we cannot track the store. */
++            if (entry)
++               value_set_from_value(&entry->src, &value, vec_index, wrmask);
+          }
+ 
+          break;
+@@ -1396,7 +1400,8 @@
+ 
+          struct copy_entry *dst_entry =
+             get_entry_and_kill_aliases(state, copies, &dst, full_mask);
+-         value_set_from_value(&dst_entry->src, &value, 0, full_mask);
++         if (dst_entry)
++            value_set_from_value(&dst_entry->src, &value, 0, full_mask);
+          break;
+       }
+ 
