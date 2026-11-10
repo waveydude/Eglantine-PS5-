@@ -1,0 +1,31 @@
+From: waveydude <23585435+waveydude@users.noreply.github.com>
+Subject: [PATCH] radv/ps5: RADV_PS5_SCRATCH_WAVES_PER_CU sets the scratch waves a compute unit
+
+Unset, 32 as before. The scratch rings are waves times bytes a wave; at 32 a CU one compute
+shader made a 128 MiB ring on the console.
+
+---
+diff --git a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+--- a/src/amd/vulkan/radv_device.c
++++ b/src/amd/vulkan/radv_device.c
+@@ -1642,6 +1642,20 @@
+     */
+    uint32_t max_threads_per_block = 2048;
+    device->scratch_waves = MAX2(32 * pdev->info.num_cu, max_threads_per_block / 64);
++   {
++      /* EglantinePS5: RADV_PS5_SCRATCH_WAVES_PER_CU=<1..31> in env.txt (unset: 32, as before). The
++       * scratch rings are waves x bytes a wave, and on the console one compute shader's scratch
++       * made a 128 MiB ring (RADV_PS5_MEMORY rings=137984 KiB, the largest 131072) out of the pool
++       * the CPU and the GPU share, in a game that ran out of it (Ocarina of Time, Castle Town). The
++       * comment above recommends 4 a CU at most and measured ~2% between 4 and 32. Never under one
++       * thread group's waves, so the hardware can always start one. */
++      const unsigned long asked = (unsigned long)debug_get_num_option("RADV_PS5_SCRATCH_WAVES_PER_CU", 0);
++      if (asked >= 1 && asked < 32) {
++         device->scratch_waves = MAX2((uint32_t)asked * pdev->info.num_cu, max_threads_per_block / 64);
++         fprintf(stderr, "radv/ps5: scratch waves %u (%lu a CU of %u)\n", device->scratch_waves, asked,
++                 pdev->info.num_cu);
++      }
++   }
+ 
+    device->dispatch_initiator = S_00B800_COMPUTE_SHADER_EN(1);
+ 

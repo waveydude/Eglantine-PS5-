@@ -1,0 +1,131 @@
+Subject: [PATCH] PS5: retry a refused graphics pipeline once on its worker
+
+Independent implementation of the worker-side retry idea discussed by Vampinity in
+Eglantine-PS5 issue #21. Opt in with EDEN_NX2_GRAPHICS_PIPELINE_OOM_RETRY=1. On
+VK_ERROR_OUT_OF_HOST_MEMORY or _DEVICE_MEMORY from a pipeline worker, it asks the PS5 front
+end for memory as the driver does (eden_radv_out_of_memory: heap trim and cold guest memory),
+waits 16 ms and builds once more; a second failure goes on as before. Inline builds and other
+Vulkan errors keep their behaviour. Both outcomes are logged (at most 64 lines).
+
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -12,6 +12,12 @@
+ #include <iostream>
+ #include <optional>
+ #include <span>
++#ifdef PS5_NATIVE
++#include <chrono>
++#include <cstdint>
++#include <thread>
++#include "common/pe_switch.h"
++#endif
+ 
+ #include <boost/container/small_vector.hpp>
+ #include <boost/container/static_vector.hpp>
+@@ -47,6 +53,12 @@
+ #define LAMBDA_FORCEINLINE
+ #endif
+ 
++#ifdef PS5_NATIVE
++// headless/performance.cpp: what the driver calls when its own memory runs out (the heap's empty
++// pages, cold guest memory). Weak: a build without the PS5 front end retries without it.
++extern "C" std::uint64_t eden_radv_out_of_memory(std::uint64_t bytes) __attribute__((weak));
++#endif
++
+ namespace Vulkan {
+ namespace {
+ using boost::container::small_vector;
+@@ -482,11 +494,12 @@
+         }
+     }
+ 
+-    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics] {
++    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
++               on_worker = worker_thread != nullptr] {
+         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
+         Validate();
+         try {
+-            MakePipeline(render_pass);
++            MakePipeline(render_pass, on_worker);
+             if (RunsMeshAsCompute()) {
+                 MakeMeshComputePipelines();
+             }
+@@ -1269,7 +1282,7 @@
+     return true;
+ }
+ 
+-void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
++void GraphicsPipeline::MakePipeline(VkRenderPass render_pass, [[maybe_unused]] bool on_worker) {
+     FixedPipelineState::DynamicState dynamic{};
+     if (!key.state.extended_dynamic_state) {
+         dynamic = key.state.dynamic_state;
+@@ -1714,7 +1727,7 @@
+         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+     }
+ 
+-    pipeline = device.GetLogical().CreateGraphicsPipeline({
++    const VkGraphicsPipelineCreateInfo pipeline_ci{
+         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+         .pNext = nullptr,
+         .flags = flags,
+@@ -1734,7 +1747,46 @@
+         .subpass = 0,
+         .basePipelineHandle = nullptr,
+         .basePipelineIndex = 0,
+-    }, *pipeline_cache);
++    };
++#ifdef PS5_NATIVE
++    static const bool retry_enabled = Common::PeSwitch("EDEN_NX2_GRAPHICS_PIPELINE_OOM_RETRY");
++    if (retry_enabled && on_worker) {
++        try {
++            pipeline = device.GetLogical().CreateGraphicsPipeline(pipeline_ci, *pipeline_cache);
++        } catch (const vk::Exception& exception) {
++            const VkResult result = exception.GetResult();
++            if (result != VK_ERROR_OUT_OF_HOST_MEMORY && result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
++                throw;
++            }
++            // The driver call has unwound. Only on a pipeline worker: the renderer's inline
++            // builds do not wait here. Out of host memory is mostly the shader compiler's own
++            // allocations, which the driver's retry (lead-mesh-22) never sees: ask for the same
++            // memory it would (64 MiB), give the collector a frame, and try once more.
++            const std::uint64_t freed =
++                eden_radv_out_of_memory ? eden_radv_out_of_memory(std::uint64_t{16} << 20) : 0;
++            std::this_thread::sleep_for(std::chrono::milliseconds{16});
++            static std::atomic<u32> logged{};
++            try {
++                pipeline = device.GetLogical().CreateGraphicsPipeline(pipeline_ci, *pipeline_cache);
++            } catch (const vk::Exception&) {
++                if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
++                    LOG_WARNING(Render_Vulkan,
++                                "EDEN_GRAPHICS_PIPELINE_OOM_RETRY still no memory ({} MiB given back)",
++                                freed >> 20);
++                }
++                throw;
++            }
++            if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
++                LOG_INFO(Render_Vulkan,
++                         "EDEN_GRAPHICS_PIPELINE_OOM_RETRY recovered a pipeline ({} MiB given back)",
++                         freed >> 20);
++            }
++        }
++    } else
++#endif
++    {
++        pipeline = device.GetLogical().CreateGraphicsPipeline(pipeline_ci, *pipeline_cache);
++    }
+ 
+     // Log graphics pipeline creation
+     if (GPU::Logging::IsActive()) {
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -268,7 +268,7 @@
+     bool ConfigureDraw(const RescalingPushConstant& rescaling,
+                        const RenderAreaPushConstant& render_are);
+ 
+-    void MakePipeline(VkRenderPass render_pass);
++    void MakePipeline(VkRenderPass render_pass, bool on_worker);
+     void MakeMeshComputePipelines();
+     bool RecordMeshComputePasses(const void* descriptor_data, VkDeviceSize descriptor_buffer_offset,
+                                  u32 descriptor_buffer_chunk, const RescalingPushConstant& rescaling,
