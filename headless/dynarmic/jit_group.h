@@ -21,6 +21,7 @@
 // EdenPrecompile); `precompile_mutex` keeps the members alive while it does.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -144,9 +145,10 @@ public:
         for (const PendingSite& pending : own_sites) {
             if (const auto target = blocks.find(pending.target); target != blocks.end())
                 Link(pending.site, target->second.entrypoint);
-            sites[pending.target].push_back(pending.site);
+            SitesFor(pending.target)[pending.target].push_back(pending.site);
         }
-        if (const auto waiting = sites.find(location); waiting != sites.end())
+        const auto& target_sites = SitesFor(location);
+        if (const auto waiting = target_sites.find(location); waiting != target_sites.end())
             for (const Site& site : waiting->second)
                 Link(site, block.entrypoint);
         return true;
@@ -162,7 +164,8 @@ public:
             if (blocks.erase(location) == 0)
                 continue;
             invalidated.push_back(location.Value());
-            if (const auto waiting = sites.find(location); waiting != sites.end())
+            const auto& target_sites = SitesFor(location);
+            if (const auto waiting = target_sites.find(location); waiting != target_sites.end())
                 for (const Site& site : waiting->second)
                     Link(site, nullptr);
         }
@@ -173,7 +176,8 @@ public:
     void Clear() {
         ++invalidations;
         blocks.clear();
-        sites.clear();
+        for (auto& shard : sites)
+            shard.clear();
         ranges.ClearCache();
     }
 
@@ -199,8 +203,19 @@ public:
     const void* key = nullptr;
 
 private:
+    using SiteMap = ::Common::unordered_map<IR::LocationDescriptor, std::vector<Site>>;
+    static constexpr std::size_t SiteShardCount = 128;
+
+    SiteMap& SitesFor(IR::LocationDescriptor target) {
+        std::size_t hash = 0;
+        ::Common::HashCombine(hash, target.Value());
+        return sites[hash % SiteShardCount];
+    }
+
     ::Common::unordered_map<IR::LocationDescriptor, Block> blocks;
-    ::Common::unordered_map<IR::LocationDescriptor, std::vector<Site>> sites;
+    // Split the flat table so growth replaces one shard rather than allocating a second
+    // copy of the entire table at once. The single table needed 62 MiB to grow in Kakariko.
+    std::array<SiteMap, SiteShardCount> sites;
     BlockRangeInformation<u64> ranges;
 };
 
