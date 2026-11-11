@@ -1,0 +1,214 @@
+Subject: [PATCH] Deleted buffers are destroyed early while many wait (EDEN_NX2_BC_PENDING_MIB)
+
+A deleted buffer keeps its memory for 8 frames (delayed_destruction_ring), and every buffer that
+grows leaves its old copy there. At Ocarina of Time's Castle Town gate GPU-only buffers went from
+219 MiB in 289 buffers to 1464 MiB in 1626 within 2 s while frames took up to 3.3 s, and the pool
+refused the area's images (crash-20261110-190821, base PS5 13.60, graphics census). Whether those
+were buffers waiting in the ring is not known from that run: the census cannot tell them from
+live ones, and the cache's own line stops when frames slow down. This patch measures it and acts.
+With EDEN_NX2_BC_PENDING_MIB=<n>, a draw or dispatch about to make a buffer while n MiB or more
+wait in the ring first waits for the GPU and destroys them (runtime.ReleaseForBuffer, the relief
+0210 gives a refused buffer, before a refusal instead of after). Off unless set.
+EDEN_NX2_BC_PENDING_LOG=1 only logs what waits and what the cache holds (EDEN_BC_PENDING lines,
+one per 64 MiB over the highest so far); the switch logs the same.
+Host test: tools/test-pending-destroy.cpp (frontend repo): the count against the real ring.
+
+---
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 9d25cb2..a7bf65e 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -150,6 +150,65 @@ void BufferCache<P>::CollectRefused() {
+ template <class P>
+ void BufferCache<P>::ReleaseFinished() {
+     delayed_destruction_ring.Clear();
++    pending_destroy.Clear();
++}
++
++// EDEN_NX2_BC_PENDING_MIB=<MiB> (unset or 0: off, as before): a deleted buffer keeps its memory for
++// 8 frames (delayed_destruction_ring), and every buffer that grows leaves its old copy there. At
++// Ocarina of Time's Castle Town gate (crash-20261110-190821, base PS5 13.60) GPU-only buffers went
++// from 219 MiB in 289 buffers to 1464 MiB in 1626 within 2 s while frames took up to 3.3 s, and the
++// pool refused the images of the area. With the switch, a draw or dispatch about to make a buffer
++// while that many MiB wait first waits for the GPU and destroys them (the refused buffer's own
++// relief, runtime.ReleaseForBuffer, before a refusal instead of after one).
++// EDEN_NX2_BC_PENDING_LOG=1 only logs: a line each time what waits, or what the buffers hold,
++// passes its highest so far by 64 MiB. The switch logs the same lines.
++template <class P>
++void BufferCache<P>::ReleasePendingBuffers() {
++    static const u64 limit = [] {
++        const char* const value = std::getenv("EDEN_NX2_BC_PENDING_MIB");
++        const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
++        if (mib != 0) {
++            std::fprintf(stderr, "EDEN_BC_PENDING on: deleted buffers are destroyed early from %llu MiB waiting\n",
++                         static_cast<unsigned long long>(mib));
++        }
++        return mib << 20;
++    }();
++    static const bool log = [] {
++        const char* const value = std::getenv("EDEN_NX2_BC_PENDING_LOG");
++        return limit != 0 || (value != nullptr && value[0] == '1');
++    }();
++    if (!log) {
++        return;
++    }
++    constexpr u64 step = u64{64} << 20;
++    const u64 waiting = pending_destroy.Bytes();
++    if (waiting >= pending_logged_bytes + step || buffer_bytes >= live_logged_bytes + step) {
++        pending_logged_bytes = (std::max)(pending_logged_bytes, waiting);
++        live_logged_bytes = (std::max)(live_logged_bytes, buffer_bytes);
++        std::fprintf(stderr, "EDEN_BC_PENDING frame=%llu waiting=%llu MiB in %llu deleted buffers, the cache holds %llu MiB\n",
++                     static_cast<unsigned long long>(frame_tick),
++                     static_cast<unsigned long long>(waiting >> 20),
++                     static_cast<unsigned long long>(pending_destroy.Buffers()),
++                     static_cast<unsigned long long>(buffer_bytes >> 20));
++    }
++    if (!may_wait_for_memory || !pending_destroy.Over(limit)) {
++        return;
++    }
++    if constexpr (requires { runtime.ReleaseForBuffer(); }) {
++        const u64 buffers = pending_destroy.Buffers();
++        // Ends in ReleaseFinished above, which empties the ring and the count.
++        runtime.ReleaseForBuffer();
++        pending_released_bytes += waiting;
++        // The 1st, 2nd, 4th, 8th ... release in the log.
++        if (const u64 times = ++pending_releases; (times & (times - 1)) == 0) {
++            std::fprintf(stderr, "EDEN_BC_PENDING release %llu at frame %llu: %llu MiB in %llu buffers destroyed after a wait "
++                         "for the GPU (%llu MiB so far), %llu MiB still waiting\n",
++                         static_cast<unsigned long long>(times), static_cast<unsigned long long>(frame_tick),
++                         static_cast<unsigned long long>(waiting >> 20), static_cast<unsigned long long>(buffers),
++                         static_cast<unsigned long long>(pending_released_bytes >> 20),
++                         static_cast<unsigned long long>(pending_destroy.Bytes() >> 20));
++        }
++    }
+ }
+ 
+ template <class P>
+@@ -241,6 +300,7 @@ void BufferCache<P>::TickFrame() {
+     }
+     ++frame_tick;
+     delayed_destruction_ring.Tick();
++    pending_destroy.Tick();
+ 
+     // EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): pages draws wrote get their early
+     // downloads now that the frame's work is recorded (EDEN_UP_L1028_EARLY), and read downloads
+@@ -4095,6 +4155,7 @@ BufferId BufferCache<P>::CreateBuffer(DAddr device_addr, u32 wanted_size,
+     // The synchronized-range tables hold Buffer pointers and ids that this may move or reuse.
+     nx2_synced_ranges.fill({});
+     nx2_synced_vertex_buffers.fill({});
++    ReleasePendingBuffers();
+     DAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
+     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
+     wanted_size = static_cast<u32>(device_addr_end - device_addr);
+@@ -4872,7 +4933,10 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
+ #ifdef YUZU_LEGACY
+     if (!do_not_mark || !immediately_free)
+ #endif
++    {
++        pending_destroy.Push(slot_buffers[buffer_id].SizeBytes());
+         delayed_destruction_ring.Push(std::move(slot_buffers[buffer_id]));
++    }
+ 
+     slot_buffers.erase(buffer_id);
+ 
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 05a0eea..969b7e1 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -40,6 +40,7 @@
+ #include "video_core/buffer_cache/uniform_stream_reuse.h"
+ #include "video_core/buffer_cache/virtual_range_cache.h"
+ #include "video_core/control/channel_state_cache.h"
++#include "video_core/buffer_cache/pending_destroy.h"
+ #include "video_core/delayed_destruction_ring.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/maxwell_3d.h"
+@@ -264,6 +265,8 @@ public:
+     /// GPU.
+     void ReleaseFinished();
+ 
++    void ReleasePendingBuffers();
++
+     /// write_mark_limit: EDEN_UP_FRITCHII_WRITEMARK's mark, spread over the segments in order.
+     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
+                                std::span<const MultiRangeSegment> pool,
+@@ -893,6 +896,12 @@ private:
+     static constexpr size_t TICKS_TO_DESTROY = 8;
+ #endif
+     DelayedDestructionRing<Buffer, TICKS_TO_DESTROY> delayed_destruction_ring;
++    /// What the ring above holds, in bytes (EDEN_NX2_BC_PENDING_MIB, ReleasePendingBuffers).
++    PendingDestroyBytes<TICKS_TO_DESTROY> pending_destroy;
++    u64 pending_logged_bytes = 0; ///< Most that waited, as last logged
++    u64 live_logged_bytes = 0;    ///< Most the buffers held, as last logged
++    u64 pending_releases = 0;
++    u64 pending_released_bytes = 0;
+ 
+     const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams* current_draw_indirect{};
+ 
+diff --git a/src/video_core/buffer_cache/pending_destroy.h b/src/video_core/buffer_cache/pending_destroy.h
+new file mode 100644
+index 0000000..5b3caca
+--- /dev/null
++++ b/src/video_core/buffer_cache/pending_destroy.h
+@@ -0,0 +1,61 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++
++namespace VideoCommon {
++
++/// The bytes of deleted buffers still waiting in a DelayedDestructionRing, kept slot by slot the
++/// way the ring keeps the buffers: Push adds to the current slot, Tick moves on and empties the
++/// slot it lands on, Clear empties all. A deleted buffer keeps its memory for Ticks frames, so
++/// when a frame takes seconds (an area streaming in) everything replaced during it waits here.
++template <std::size_t Ticks>
++class PendingDestroyBytes {
++public:
++    void Push(std::uint64_t bytes) noexcept {
++        bytes_in[index] += bytes;
++        ++buffers_in[index];
++        total_bytes += bytes;
++        ++total_buffers;
++    }
++
++    void Tick() noexcept {
++        index = (index + 1) % Ticks;
++        total_bytes -= bytes_in[index];
++        total_buffers -= buffers_in[index];
++        bytes_in[index] = 0;
++        buffers_in[index] = 0;
++    }
++
++    void Clear() noexcept {
++        bytes_in.fill(0);
++        buffers_in.fill(0);
++        total_bytes = 0;
++        total_buffers = 0;
++    }
++
++    [[nodiscard]] std::uint64_t Bytes() const noexcept {
++        return total_bytes;
++    }
++    [[nodiscard]] std::uint64_t Buffers() const noexcept {
++        return total_buffers;
++    }
++
++    /// Whether what waits has reached `limit` bytes. A limit of 0 is "no limit": never.
++    [[nodiscard]] bool Over(std::uint64_t limit) const noexcept {
++        return limit != 0 && total_bytes >= limit;
++    }
++
++private:
++    std::size_t index = 0;
++    std::array<std::uint64_t, Ticks> bytes_in{};
++    std::array<std::uint64_t, Ticks> buffers_in{};
++    std::uint64_t total_bytes = 0;
++    std::uint64_t total_buffers = 0;
++};
++
++} // namespace VideoCommon
