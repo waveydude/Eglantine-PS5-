@@ -1,0 +1,183 @@
+Subject: [PATCH] Inline Maxwell 3D register state writes
+
+Adapt Lichii 73a1b58e7d7a3b02f116c897a2c8487923256b1a (#1095) to T120.
+Keep its existing command dispatch, query-light exception and profiling.
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -330,16 +330,6 @@
+     return std::min<size_t>(memory_manager.GetMemoryLayoutSize(start_address, byte_size * max_size) / byte_size, lower_cap);
+ }
+ 
+-u32 Maxwell3D::ProcessShadowRam(u32 method, u32 argument) {
+-    // Keep track of the register value in shadow_state when requested.
+-    auto const c = shadow_state.shadow_ram_control;
+-    if (c == Regs::ShadowRamControl::Track || c == Regs::ShadowRamControl::TrackWithFilter)
+-        return shadow_state.reg_array[method] = argument;
+-    else if (c == Regs::ShadowRamControl::Replay)
+-        return shadow_state.reg_array[method];
+-    return argument;
+-}
+-
+ void Maxwell3D::ConsumeSinkImpl(Core::System& system) {
+     const auto control = shadow_state.shadow_ram_control;
+     // Sunk methods are state writes only (not in execution_mask): skip unchanged values, as
+@@ -365,12 +355,11 @@
+     method_sink.clear();
+ }
+ 
+-namespace {
+ /// EDEN_UP_QUERY_LIGHT (nx2_query_light.h): whether writing `argument` to `method` is a report
+ /// that only queues a Z pass count: Release or ReportOnly of ZPassPixelCount64, and not a short
+ /// release, which signals a fence. For such a report QueryCacheBase::CounterReport records the
+ /// end of the host query and queues the value; guest memory gets it on the fencing thread.
+-bool IsQueuedCounterReport(u32 method, u32 argument) {
++bool Maxwell3D::IsQueuedCounterReport(u32 method, u32 argument) {
+     using Semaphore = Maxwell3D::Regs::ReportSemaphore;
+     if (method != MAXWELL3D_REG_INDEX(report_semaphore.query) ||
+         !VideoCommon::QueryLight::Enabled()) {
+@@ -385,6 +374,8 @@
+     return operation == Semaphore::Operation::ReportOnly ||
+            (operation == Semaphore::Operation::Release && report.query.short_query == 0);
+ }
++
++namespace {
+ 
+ /// EDEN_UP_QUERY_LIGHT: whether a macro DMA read's call on the split's back ends fast draw reuse
+ /// only when it flushes. With a query DMA sync or trace mode the call can wait for the host GPU
+@@ -434,22 +425,6 @@
+     }
+ }
+ } // Anonymous namespace
+-
+-void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
+-    // The instances after the first are drawn together once their loop ends, and they must see
+-    // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
+-    // c[0][0x644]) right after the loop, before the macro returns.
+-    if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
+-        draw_manager.DrawDeferred(*this, true);
+-    }
+-    if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
+-        !IsFastDrawParameter(method) && !IsQueuedCounterReport(method, argument)) {
+-        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
+-    }
+-    regs.reg_array[method] = argument;
+-    for (auto const& table : dirty.tables)
+-        dirty.flags[table[method]] = true;
+-}
+ 
+ bool Maxwell3D::IsFastDrawParameter(u32 method) {
+     switch (method) {
+@@ -726,10 +701,7 @@
+     if (short_path && method < MacroRegistersStart && !execution_mask[method] &&
+         !front_macros && !bookkeeping)
+         [[likely]] {
+-        const u32 value = ProcessShadowRam(method, argument);
+-        if (!SkipSameValueWrites() || regs.reg_array[method] != value) {
+-            ProcessDirtyRegisters(method, value);
+-        }
++        WriteStateRegister(method, argument);
+         return;
+     }
+     CallMethod(system, method, argument, true);
+@@ -767,19 +739,16 @@
+         back_control_writes[back_control_count++ % back_control_writes.size()] = {
+             method_argument, static_cast<u32>(shadow_state.shadow_ram_control), is_last_call ? 1U : 0U};
+     }
+-    const u32 argument = ProcessShadowRam(method, method_argument);
+     // A state register written with the value it holds changes nothing: no dirty flags (they
+     // would make the next draw re-check that state), no method processing. Title 1 makes ~6
+     // million 3D register writes a second, ~60% of them same-value, most from macro replays.
+     // Methods with side effects (execution_mask: draws, clears, constant buffer data and
+     // binds, semaphores, ...) always run. EDEN_NX2_SKIP_SAME=0 turns it off.
+     if (!execution_mask[method]) {
+-        // ProcessMethodCall (and the draw manager behind it) acts only on executable methods.
+-        if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
+-            ProcessDirtyRegisters(method, argument);
+-        }
+-        return;
+-    }
++        WriteStateRegister(method, method_argument);
++        return;
++    }
++    const u32 argument = ProcessShadowRam(method, method_argument);
+     ProcessDirtyRegisters(method, argument);
+     ProcessMethodCall(method, argument, method_argument, is_last_call);
+ }
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3309,9 +3309,47 @@
+ 
+     void ProcessMacro(Core::System& system, u32 method, const u32* base_start, u32 amount, bool is_last_call);
+ 
+-    u32 ProcessShadowRam(u32 method, u32 argument);
+-
+-    void ProcessDirtyRegisters(u32 method, u32 argument);
++    static bool IsQueuedCounterReport(u32 method, u32 argument);
++
++    u32 ProcessShadowRam(u32 method, u32 argument) {
++        // Keep track of the register value in shadow_state when requested.
++        auto const c = shadow_state.shadow_ram_control;
++        if (c == Regs::ShadowRamControl::Track || c == Regs::ShadowRamControl::TrackWithFilter)
++            return shadow_state.reg_array[method] = argument;
++        else if (c == Regs::ShadowRamControl::Replay)
++            return shadow_state.reg_array[method];
++        return argument;
++    }
++
++    void ProcessDirtyRegisters(u32 method, u32 argument) {
++        // The instances after the first are drawn together once their loop ends, and they must see
++        // the state they were begun with: NVN's draw macros reset the base instance (and its copy in
++        // c[0][0x644]) right after the loop, before the macro returns.
++        if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) [[unlikely]] {
++            draw_manager.DrawDeferred(*this, true);
++        }
++        if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
++            !IsFastDrawParameter(method) &&
++            (method != MAXWELL3D_REG_INDEX(report_semaphore.query) ||
++             !IsQueuedCounterReport(method, argument))) {
++            VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
++        }
++        regs.reg_array[method] = argument;
++        for (auto const& table : dirty.tables)
++            dirty.flags[table[method]] = true;
++    }
++
++    // Lichii #1095: keep the state-only write in the caller's hot path.
++#if defined(PS5_NATIVE) && defined(__clang__)
++    // Keep the same-value branch local even with the PS5 release compiler's size heuristics.
++    [[clang::always_inline]]
++#endif
++    void WriteStateRegister(u32 method, u32 method_argument) {
++        const u32 argument = ProcessShadowRam(method, method_argument);
++        if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
++            ProcessDirtyRegisters(method, argument);
++        }
++    }
+ 
+ public:
+     /// A register write a macro makes (MacroEngine::Execute): a state register (not in
+@@ -3340,13 +3378,15 @@
+     void CallMacroMethod(Core::System& system, u32 method, std::span<const u32> parameters);
+ 
+     /// Whether state register writes that keep the register's value are dropped (CallMethod).
+-    static bool SkipSameValueWrites() {
+-        static const bool skip = [] {
+-            const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
+-            return value == nullptr || value[0] != '0';
+-        }();
+-        return skip;
++    bool SkipSameValueWrites() const {
++        return skip_same_value_writes;
+     }
++
++    // Engine construction happens after the title's environment has been applied.
++    const bool skip_same_value_writes = [] {
++        const char* value = std::getenv("EDEN_NX2_SKIP_SAME");
++        return value == nullptr || value[0] != '0';
++    }();
+ 
+     /// Handles writes to the macro uploading register.
+     void ProcessMacroUpload(u32 data);

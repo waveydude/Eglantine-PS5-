@@ -1,0 +1,72 @@
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -960,8 +960,11 @@
+ // mark) for 20 s and then 0 MiB four seconds later (crash-20261108-023138). 998 of those images,
+ // 1700 MiB, had been unused for 10 frames or more.
+ // The signal is a burst of new images: at least EDEN_NX2_AREA_EVICT_BURST (100) created within
+-// 30 frames, which only a load does (0 to 12 images per 600 frames in that intro, 1962 in the
+-// 600 frames of the forest load). For the 120 frames after a burst, images unused for <frames>
++// 30 frames. A pause menu can produce this signal too. On PS5, EDEN_NX2_AREA_EVICT_GUARD=1
++// lets bursts of 400 or more images start proactive eviction; smaller bursts require a known
++// largest free block below 512 MiB, and stop evicting if that headroom comes back. A deferred
++// burst can still grow or meet the pressure requirement within the same 30-frame window.
++// For the 120 frames after a qualifying burst, images unused for <frames>
+ // frames are deleted at the end of each frame, up to 64 a frame: only images the cache can
+ // upload again from guest memory (nothing the GPU wrote still to copy back), so this needs no
+ // staging buffer and no GPU wait, and nothing is lost; a CPU-decoded image is decoded again if
+@@ -1035,8 +1038,31 @@
+         area_window_created = 0;
+     }
+     area_window_created += created;
+-    if (area_window_created >= burst) {
+-        if (!window_open()) {
++
++#ifdef PS5_NATIVE
++    static const bool guard = Common::PeSwitch("EDEN_NX2_AREA_EVICT_GUARD") &&
++                              eden_pool_largest_free != nullptr;
++#else
++    constexpr bool guard = false;
++#endif
++    constexpr u64 LargeBurst = 400;
++    const bool needs_pressure = guard && area_window_created < LargeBurst;
++    const bool pressure = [&] {
++#ifdef PS5_NATIVE
++        if (guard && ((needs_pressure && area_window_created >= burst) ||
++                      (area_evict_pressure_only && window_open()))) {
++            const u64 largest_free = eden_pool_largest_free();
++            return largest_free != 0 && largest_free < 512_MiB;
++        }
++#endif
++        return false;
++    }();
++    if (area_window_created >= burst && (!needs_pressure || pressure)) {
++        const bool extending = window_open();
++        if (!extending || !needs_pressure) {
++            area_evict_pressure_only = needs_pressure;
++        }
++        if (!extending) {
+             ++area_bursts;
+             area_evicted_images = area_evicted_bytes = area_dropped_images = 0;
+             std::fprintf(stderr,
+@@ -1066,6 +1092,9 @@
+         }
+         area_window_open = true;
+     } else if (frame_tick >= area_evict_until || frame_tick <= age) {
++        return;
++    }
++    if (area_evict_pressure_only && !pressure) {
+         return;
+     }
+     const std::optional<u64> below =
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -209,6 +209,7 @@
+     std::chrono::steady_clock::time_point area_evict_until_time{};
+     u64 area_evict_min_until{}; ///< ...but not before this frame (very low frame rates)
+     bool area_window_open{};    ///< The window was open last frame (the done line, time mode)
++    bool area_evict_pressure_only{}; ///< A small burst may evict only while the PS5 pool is short
+     size_t area_kept_last{};    ///< GPU-written images kept in the last pass (the done line)
+     /// EDEN_UP_MEM_CENSUS (CensusTick): its own count of AreaEvict's burst, so the census needs no
+     /// EDEN_NX2_AREA_EVICT.

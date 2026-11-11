@@ -1,0 +1,78 @@
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "common/pe_switch.h"
+ #include <algorithm>
++#include <charconv>
+ #include <chrono>
+ #include <condition_variable>
+ #include <map>
+@@ -1954,6 +1955,30 @@
+                                       (canonical_keys ? " canonical1" : ""));
+     std::atomic<size_t> prep_compared{};
+     std::atomic<size_t> prep_differed{};
++    // A route profile can move its worst first-use stalls to boot. Keep the extra work bounded
++    // and use the same on-disk compatibility checks and workers as the usual used-list replay.
++    constexpr size_t MaxPriorityPipelines = 32;
++    std::set<u64> priority_pipelines;
++    if (const char* profile = std::getenv("EDEN_NX2_PIPELINE_BOOT_PRIORITY");
++        profile != nullptr && !PipelineColdBoot() && !PreloadAllPipelines()) {
++        std::string_view hashes{profile};
++        for (size_t slot = 0; slot < MaxPriorityPipelines && !hashes.empty(); ++slot) {
++            const auto separator = hashes.find(',');
++            const auto token = hashes.substr(0, separator);
++            u64 hash{};
++            const auto parsed = std::from_chars(token.data(), token.data() + token.size(), hash, 16);
++            if (token.size() == 16 && parsed.ec == std::errc{} &&
++                parsed.ptr == token.data() + token.size()) {
++                priority_pipelines.insert(hash);
++            }
++            if (separator == std::string_view::npos) {
++                break;
++            }
++            hashes.remove_prefix(separator + 1);
++        }
++    }
++    const size_t priority_requested = priority_pipelines.size();
++    size_t priority_added = 0;
+     size_t skipped_pipelines = 0;
+     size_t queued_graphics = 0;
+     size_t canonical_rekeyed = 0;
+@@ -2088,13 +2113,17 @@
+             !used_pipelines.empty() || (canonical_keys && !legacy_used_pipelines.empty());
+         // EDEN_UP_MESH_CACHE=1: a task/mesh record is built whether or not the used list has it.
+         const bool mesh_always = loading_mesh_file && MeshCacheBoot() && !PipelineColdBoot();
+-        if (!PreloadAllPipelines() && !mesh_always &&
++        const bool normally_skipped =
++            !PreloadAllPipelines() && !mesh_always &&
+             (PipelineColdBoot() ||
+-             (!have_used_list ? queued_graphics >= MaxPipelinesWithoutUsedList
+-                              : !used_pipelines.contains(hash)))) {
++             (!have_used_list ? queued_graphics - priority_added >= MaxPipelinesWithoutUsedList
++                              : !used_pipelines.contains(hash)));
++        const bool priority_match = priority_pipelines.erase(hash) != 0;
++        if (normally_skipped && !priority_match) {
+             ++skipped_pipelines;
+             return;
+         }
++        priority_added += normally_skipped;
+         ++queued_graphics;
+         if (mesh_always) {
+             ++mesh_queued;
+@@ -2170,6 +2199,14 @@
+     }
+ 
+     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
++    if (priority_requested != 0) {
++        LOG_INFO(Render_Vulkan,
++                 "Pipeline boot priority: {} requested, {} extra queued, {} already selected, "
++                 "{} unmatched",
++                 priority_requested, priority_added,
++                 priority_requested - priority_added - priority_pipelines.size(),
++                 priority_pipelines.size());
++    }
+     if (skipped_pipelines != 0) {
+         LOG_INFO(Render_Vulkan,
+                  "{} cached graphics pipelines are built when first needed",

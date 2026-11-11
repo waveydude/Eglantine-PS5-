@@ -1,0 +1,61 @@
+Subject: [PATCH] Defer texture eviction if writeback scratch cannot grow
+
+Crash 20261111-005114 failed a 32 MiB scratch allocation during texture
+writeback. Reserve space for the largest guest mip before writing it.
+On refusal, keep the dirty image and leave normal guest readbacks alone.
+Opt in with EDEN_NX2_DEFER_WRITEBACK_OOM=1.
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -425,6 +425,29 @@
+         gpu_unswizzle_maxsize = 0;
+         swizzle_chunk_size = 0;
+         swizzle_slices_per_batch = 0;
++    }
++}
++
++// Block-linear writeback needs scratch for one guest mip at a time. Reserve it before
++// staging the readback or writing any guest bytes, so a refused allocation keeps the image.
++[[nodiscard]] inline bool ReserveEvictionWritebackScratch(const ImageInfo& info,
++                                                          Common::ScratchBuffer<u8>& scratch) {
++    static const bool enabled = Common::PeSwitch("EDEN_NX2_DEFER_WRITEBACK_OOM");
++    if (!enabled || info.type == ImageType::Linear) {
++        return true;
++    }
++    const auto sizes = CalculateMipLevelSizes(info);
++    const size_t required = *std::ranges::max_element(sizes);
++    if (required <= scratch.capacity()) {
++        return true;
++    }
++    try {
++        scratch.resize_destructive(required);
++        return true;
++    } catch (const std::bad_alloc&) {
++        // Avoid allocating a log message while the pool is exhausted.
++        std::fprintf(stderr, "EDEN_NX2_DEFER_WRITEBACK_OOM scratch_bytes=%zu\n", required);
++        return false;
+     }
+ }
+ 
+@@ -515,6 +538,10 @@
+             (!high_priority_mode && must_download)) {
+             return false;
+         }
++        if (must_download && !ReserveEvictionWritebackScratch(image.info, swizzle_data_buffer)) {
++            ++gc_downloads_deferred;
++            return false;
++        }
+         if (must_download) {
+             // EDEN_UP_GC_ONE_WAIT: this frame's wait is spent; the image stays, nothing is lost.
+             if (WaitHeld()) {
+@@ -1304,6 +1331,9 @@
+     u64 bytes = 0;
+     for (const ImageId image_id : chosen) {
+         Image& image = slot_images[image_id];
++        if (!ReserveEvictionWritebackScratch(image.info, swizzle_data_buffer)) {
++            break;
++        }
+         auto map = TryDownloadStaging(runtime, image.unswizzled_size_bytes, false);
+         if (!map) {
+             break; // The pool has none: the collector copies the rest back when it gets to them.
