@@ -1,0 +1,51 @@
+Subject: [PATCH] Skip memory waits for optional texture writeback scratch
+
+The collector already retains the image when scratch growth is refused.
+Avoid waiting on the graphics thread before taking that existing fallback.
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -26,6 +26,7 @@
+ 
+ #include "common/alignment.h"
+ #include "common/settings.h"
++#include "common/scope_exit.h"
+ #include "common/slot_vector.h"
+ #include "video_core/control/channel_state.h"
+ #include "video_core/dirty_flags.h"
+@@ -48,6 +49,7 @@
+ 
+ #ifdef PS5_NATIVE
+ extern "C" unsigned long long eden_pool_largest_free(void) __attribute__((weak));
++extern "C" void eden_optional_allocation_scope(bool enter) noexcept __attribute__((weak));
+ #endif
+ 
+ namespace VideoCommon {
+@@ -441,7 +443,26 @@
+     if (required <= scratch.capacity()) {
+         return true;
+     }
++#ifdef PS5_NATIVE
++    if (eden_pool_largest_free) {
++        const auto largest = eden_pool_largest_free();
++        if (largest != 0 && largest < required) {
++            // The cache can keep this dirty image and retry on a later frame.
++            return false;
++        }
++    }
++#endif
+     try {
++#ifdef PS5_NATIVE
++        if (eden_optional_allocation_scope) {
++            eden_optional_allocation_scope(true);
++        }
++        SCOPE_EXIT {
++            if (eden_optional_allocation_scope) {
++                eden_optional_allocation_scope(false);
++            }
++        };
++#endif
+         scratch.resize_destructive(required);
+         return true;
+     } catch (const std::bad_alloc&) {

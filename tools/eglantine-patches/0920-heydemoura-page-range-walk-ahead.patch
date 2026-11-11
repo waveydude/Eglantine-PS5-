@@ -1,0 +1,206 @@
+Subject: [PATCH] Reuse GPU page-table walks across nearby buffer bindings
+
+Adapt Heydemoura PR #100 (0076) to T120. Keep the existing locked layout lookup, and only reuse continuous-range walks if the mapping history proves them current. Opt in with EDEN_NX2_PAGE_RANGE_WALK_AHEAD=1.
+
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index f53df68..5b4c771 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -16,6 +16,7 @@
+ #include "common/live_switch.h"
+ #include "common/logging.h"
+ #include "common/pe_switch.h"
++#include "common/scope_exit.h"
+ #include "common/paged_scalar.h"
+ #include "core/core.h"
+ #include "core/hle/kernel/k_page_table.h"
+@@ -139,7 +140,49 @@ inline void MemoryManager::SetBigPageContinuous(size_t big_page_index, bool valu
+         (~(1ULL << sub_index) & continuous_mask) | (value ? 1ULL << sub_index : 0);
+ }
+ 
++static bool RangeWalkAheadEnabled() {
++    static const bool enabled = Common::PeSwitch("EDEN_NX2_PAGE_RANGE_WALK_AHEAD");
++    return enabled;
++}
++
++void MemoryManager::FinishMapChange(GPUVAddr begin, GPUVAddr end) {
++    std::scoped_lock lock{map_log_guard};
++    const u64 next = map_serial.load(std::memory_order_relaxed) + 1;
++    map_log[next % map_log.size()] = {begin, end};
++    map_serial.store(next, std::memory_order_release);
++}
++
++bool MemoryManager::MapChangedSince(u64 since, u64 serial, GPUVAddr begin, GPUVAddr end) const {
++    if (serial - since > map_log.size()) {
++        return true;
++    }
++    std::scoped_lock lock{map_log_guard};
++    if (map_serial.load(std::memory_order_relaxed) != serial) {
++        return true;
++    }
++    for (u64 change = since; change != serial;) {
++        const auto& [changed_begin, changed_end] = map_log[++change % map_log.size()];
++        // A map that starts exactly where the walk stopped can extend the answer.
++        if (changed_begin <= end && changed_end >= begin) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
++    const bool log_ranges = RangeWalkAheadEnabled();
++    if (log_ranges) {
++        map_writers.fetch_add(1, std::memory_order_acq_rel);
++    }
++    SCOPE_EXIT {
++        if (log_ranges) {
++            const auto begin = Common::AlignDown(gpu_addr, page_size);
++            const auto end = begin + Common::AlignUp(size, page_size);
++            FinishMapChange(begin, end);
++            map_writers.fetch_sub(1, std::memory_order_acq_rel);
++        }
++    };
+     [[maybe_unused]] u64 remaining_size{size};
+     if (entry_type == EntryType::Mapped) {
+         page_table.ReserveRange(gpu_addr, size);
+@@ -176,11 +219,25 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
+     }
+     flush_modified();
+     kind_map.Map(gpu_addr, gpu_addr + size, kind);
+-    map_serial.fetch_add(1, std::memory_order_release);
++    if (!log_ranges) {
++        map_serial.fetch_add(1, std::memory_order_release);
++    }
+     return gpu_addr;
+ }
+ 
+ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
++    const bool log_ranges = RangeWalkAheadEnabled();
++    if (log_ranges) {
++        map_writers.fetch_add(1, std::memory_order_acq_rel);
++    }
++    SCOPE_EXIT {
++        if (log_ranges) {
++            const auto begin = Common::AlignDown(gpu_addr, big_page_size);
++            const auto end = begin + Common::AlignUp(size, big_page_size);
++            FinishMapChange(begin, end);
++            map_writers.fetch_sub(1, std::memory_order_acq_rel);
++        }
++    };
+     [[maybe_unused]] u64 remaining_size{size};
+     GPUVAddr modified_start{};
+     u64 modified_size{};
+@@ -232,7 +289,9 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
+         std::unique_lock<std::mutex> lock(guard);
+         kind_map.Map(gpu_addr, gpu_addr + size, kind);
+     }
+-    map_serial.fetch_add(1, std::memory_order_release);
++    if (!log_ranges) {
++        map_serial.fetch_add(1, std::memory_order_release);
++    }
+     return gpu_addr;
+ }
+ 
+@@ -735,6 +794,9 @@ bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
+ }
+ 
+ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
++    if (RangeWalkAheadEnabled()) {
++        return MaxContinuousRangeAhead(gpu_addr, size);
++    }
+     // Native storage buffers ask this for up to 8 MiB on each bind, ~70,000 times a second in
+     // title 1's forest (17% of the GPU thread walking pages): keep answers per thread until the
+     // page table changes. Ocarina of Time asks ~220,000 times a second for more buffers than 64
+@@ -758,6 +820,66 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
+     return result;
+ }
+ 
++size_t MemoryManager::MaxContinuousRangeAhead(GPUVAddr gpu_addr, size_t size) const {
++    if (size == 0 || !IsWithinGPUAddressRange(gpu_addr) ||
++        size > address_space_size - gpu_addr || map_writers.load(std::memory_order_acquire) != 0) {
++        return MaxContinuousRangeUncached(gpu_addr, size);
++    }
++
++    struct Interval {
++        GPUVAddr begin{};
++        GPUVAddr end{};
++        u64 serial{};
++        bool complete{};
++    };
++    struct Cache {
++        size_t owner{};
++        std::array<Interval, 16> intervals{};
++        size_t next{};
++    };
++    thread_local Cache cache{};
++    if (cache.owner != unique_identifier + 1) {
++        cache = {};
++        cache.owner = unique_identifier + 1;
++    }
++    const u64 serial = map_serial.load(std::memory_order_acquire);
++    const auto mapping_is_current = [&] {
++        return map_writers.load(std::memory_order_acquire) == 0 &&
++               map_serial.load(std::memory_order_acquire) == serial;
++    };
++    for (auto& interval : cache.intervals) {
++        if (gpu_addr < interval.begin || gpu_addr >= interval.end) {
++            continue;
++        }
++        const size_t available = interval.end - gpu_addr;
++        if (size > available && !interval.complete) {
++            continue;
++        }
++        if (interval.serial != serial &&
++            MapChangedSince(interval.serial, serial, interval.begin, interval.end)) {
++            interval = {};
++            continue;
++        }
++        if (mapping_is_current()) {
++            interval.serial = serial;
++            return (std::min)(size, available);
++        }
++        return MaxContinuousRangeUncached(gpu_addr, size);
++    }
++
++    constexpr size_t walk_ahead = size_t{256} << 20;
++    const auto walk = (std::min<size_t>)((std::max)(size, walk_ahead), address_space_size - gpu_addr);
++    const size_t found = MaxContinuousRangeUncached(gpu_addr, walk);
++    if (!mapping_is_current()) {
++        return MaxContinuousRangeUncached(gpu_addr, size);
++    }
++    if (found != 0) {
++        cache.intervals[cache.next++ % cache.intervals.size()] =
++            {gpu_addr, gpu_addr + found, serial, found < walk};
++    }
++    return (std::min)(size, found);
++}
++
+ size_t MemoryManager::MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const {
+     std::optional<DAddr> old_page_addr{};
+     size_t range_so_far = 0;
+diff --git a/src/video_core/memory_manager.h b/src/video_core/memory_manager.h
+index 8668252..22fa58f 100644
+--- a/src/video_core/memory_manager.h
++++ b/src/video_core/memory_manager.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <atomic>
+ #include <map>
+ #include <mutex>
+@@ -271,6 +272,12 @@ private:
+     mutable std::mutex guard;
+     /// Bumped after each page table change; MaxContinuousRange answers are kept until then.
+     std::atomic<u64> map_serial{};
++    std::atomic<unsigned> map_writers{};
++    mutable std::mutex map_log_guard;
++    std::array<std::pair<GPUVAddr, GPUVAddr>, 64> map_log{};
++    void FinishMapChange(GPUVAddr begin, GPUVAddr end);
++    bool MapChangedSince(u64 since, u64 serial, GPUVAddr begin, GPUVAddr end) const;
++    size_t MaxContinuousRangeAhead(GPUVAddr gpu_addr, size_t size) const;
+ 
+     static constexpr size_t continuous_bits = 64;
+ 
