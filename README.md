@@ -21,6 +21,14 @@
 
 # English
 
+## Ocarina of Time on base PS5
+
+On a base PS5 running firmware 13.60, the T85-based **Build N** cleared the Castle Town gate at **0.75×** after the Deku Tree and Hyrule Field. Link made it halfway past the fountain before a crash in the RADV shader compiler.
+
+Build N adds `EDEN_NX2_NATIVE_LARGE_DEPTH=1`. The renderer keeps the game's 297 MiB shadow map at native size and avoids the extra 167 MiB copy it used to allocate at 0.75×. The console's graphics memory logs confirmed the copy was absent through the fountain run.
+
+**Build O** adds a RADV fix for the fountain crash path. If the shader compiler cannot allocate its floating-point analysis cache, it uses a conservative result. Forced allocation-failure tests and PS5 package validation passed. The castle route still needs a console run with Build O.
+
 ## What this is
 
 A PS5 homebrew build that stacks three layers, always updated in this order:

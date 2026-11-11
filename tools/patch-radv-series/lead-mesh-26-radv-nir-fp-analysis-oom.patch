@@ -1,0 +1,56 @@
+Subject: [PATCH] RADV: let NIR FP analysis fall back under allocation pressure
+
+Build N entered Castle Town on base PS5 at 0.75x, then crashed near the
+fountain in fp_insert with a 3 MiB largest free block. Handle missing
+FP-class cache storage conservatively instead of writing through it.
+
+---
+diff --git a/src/compiler/nir/nir_range_analysis.c b/src/compiler/nir/nir_range_analysis.c
+--- a/src/compiler/nir/nir_range_analysis.c
++++ b/src/compiler/nir/nir_range_analysis.c
+@@ -1378,6 +1378,9 @@
+ fp_class_mask
+ nir_analyze_fp_class(nir_fp_analysis_state *fp_state, const nir_def *def)
+ {
++   if (!fp_state->bitset || !fp_state->arr)
++      return FP_CLASS_UNKNOWN;
++
+    struct fp_query query_alloc[64];
+    uint32_t result_alloc[64];
+ 
+@@ -1407,12 +1410,22 @@
+    state.max = -1;
+    state.bitset = calloc(BITSET_BYTES(state.size), 1);
+    state.arr = malloc(state.size * sizeof(uint16_t));
++   if (!state.bitset || !state.arr) {
++      free(state.bitset);
++      free(state.arr);
++      state.bitset = NULL;
++      state.arr = NULL;
++   }
+    return state;
+ }
+ 
+ void
+ nir_invalidate_fp_analysis_state(nir_fp_analysis_state *state)
+ {
++   /* This analysis is optional. Keep a failed cache disabled for its lifetime. */
++   if (!state->bitset || !state->arr)
++      return;
++
+    if (state->impl->ssa_alloc > state->size) {
+       state->size = state->impl->ssa_alloc + state->impl->ssa_alloc / 4u;
+ 
+@@ -1420,6 +1433,12 @@
+       free(state->bitset);
+       state->arr = malloc(state->size * sizeof(uint16_t));
+       state->bitset = calloc(BITSET_BYTES(state->size), 1);
++      if (!state->bitset || !state->arr) {
++         free(state->bitset);
++         free(state->arr);
++         state->bitset = NULL;
++         state->arr = NULL;
++      }
+    } else if (state->max >= 0) {
+       memset(state->bitset, 0, BITSET_BYTES(state->max + 1));
+    }
