@@ -23,6 +23,8 @@
 
 ## Ocarina of Time on base PS5
 
+This branch combines Vampinity’s T120 with the Build O fixes and an optional idle-texture sweep under PS5 memory pressure. The sweep looks for reloadable textures unused for at least one second when the largest free block falls below 1 GiB. The [comparison preset](docs/presets/env-t120-build-o-0400486024dec000.txt) enables it and T120’s stale upload skip and shader memory wait. Use the same Town save at 0.75× to compare with Build O. The combined version still needs a console test. The run below used Build O.
+
 On a base PS5 running firmware 13.60, the T85-based **Build N** cleared the Castle Town gate at **0.75×** after the Deku Tree and Hyrule Field. Link made it halfway past the fountain before a crash in the RADV shader compiler.
 
 Build N adds `EDEN_NX2_NATIVE_LARGE_DEPTH=1`. The renderer keeps the game's 297 MiB shadow map at native size and avoids the extra 167 MiB copy it used to allocate at 0.75×. The console's graphics memory logs confirmed the copy was absent through the fountain run.

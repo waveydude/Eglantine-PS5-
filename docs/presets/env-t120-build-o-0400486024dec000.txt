@@ -1,0 +1,53 @@
+# Ocarina of Time (Switch 2), base PS5 13.60. Lines here override env.txt for this game only.
+# Kept from the Town experiments (no harm measured): shader preparation, ASTC layer batches,
+# in-place packing for the compressed swap, collector pacing, packed slots given back.
+EDEN_UP_SHADER_PREP=1
+EDEN_NX2_TRANSCODE_BATCH_LAYERS=1
+EDEN_GUEST_SWAP_PACK_IN_PLACE=1
+EDEN_NX2_CLEAN_BY_TIME=1
+EDEN_NX2_REFUSAL_EVICT=1
+EDEN_CRAM_FREE_RETURN=1
+# Removed (back to env.txt): disk swap (EDEN_GUEST_SWAP=2: 0.2 s writes, reads up to 2.9 s, and it
+# replaced the compressed swap), one shader worker (slower first-time shaders), VMA 8 MiB blocks
+# (untested), texture marks 1536/2048 with budget cap (env.txt's 2048/2816 ran 18 min clean), and
+# two settings that drop GPU-written images without a copy (AREA_EVICT_DIRTY, TC_DOWNLOAD_MAX_MIB).
+
+# test F: memory the emulator and the driver hold for themselves (about 400 MiB in all)
+# JIT lookup tables 16 MiB a core -> 1 MiB
+EDEN_JIT_DISPATCH_BITS=16
+# texture and sampler tables sized by use, not 16 MiB each
+EDEN_NX2_TIGHT_DESCRIPTOR_TABLES=1
+# upload ring 128 -> 64 MiB
+EDEN_STREAM_RING_MIB=64
+# upload scratch kept between frames: at most 16 MiB
+EDEN_TC_SCRATCH_KEEP_MIB=16
+# decompressed game file cache 64 -> 32 MiB
+EDEN_NUP_CACHE_MIB=32
+# driver scratch ring: 4 waves a compute unit (Mesa recommends at most 4; was 32, a 128 MiB ring)
+RADV_PS5_SCRATCH_WAVES_PER_CU=4
+# test G: render targets the GPU never wrote are deleted after 8 idle frames while textures are over budget (PS5_Lichii 0227)
+EDEN_NX2_RT_EVICT_PRESSURE=8
+# a pipeline build refused for memory asks for memory, waits 16 ms and tries once more
+EDEN_NX2_GRAPHICS_PIPELINE_OOM_RETRY=1
+# test I: graphics memory census, a line every 5 s and at each refusal (diagnostics only)
+EDEN_GFX_CENSUS=1
+# test K: while under 1 GiB is free, shader builds take turns (waiting at most 2 s each) instead of all at once
+EDEN_PIPELINE_MEMORY_GATE_MIB=1024
+EDEN_PIPELINE_MEMORY_GATE_MS=2000
+# and at most 2 shader builder threads (was 8), so fewer builds start at once even with memory free
+EDEN_NX2_PIPELINE_WORKERS=2
+# test L: deleted buffers waiting for their 8 frames are destroyed early once 128 MiB of them wait
+# (one wait for the GPU each time); EDEN_BC_PENDING lines say how much waited and what the cache held
+EDEN_NX2_BC_PENDING_MIB=128
+# test M: the same early release also fires when 128 MiB of deleted images wait for the GPU
+EDEN_NX2_TC_PENDING_MIB=128
+
+# Build N: keep oversized D16 targets native at 0.75x.
+EDEN_NX2_NATIVE_LARGE_DEPTH=1
+
+EDEN_GUEST_SWAP_AHEAD_MIB=2048
+EDEN_UP_HEAP_HOLDERS=1
+EDEN_UP_SKIP_STALE_UPLOADS=1
+EDEN_UP_HEAP_WAIT_MS=2000
+EDEN_UP_MEM_CENSUS=1
+EDEN_NX2_IDLE_TEXTURE_PRESSURE=1
