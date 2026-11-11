@@ -1,0 +1,1139 @@
+Subject: [PATCH] T120: integrate Build O and add idle texture pressure cleanup
+
+diff --git a/src/common/slot_vector.h b/src/common/slot_vector.h
+--- a/src/common/slot_vector.h
++++ b/src/common/slot_vector.h
+@@ -138,6 +138,15 @@
+         ResetStorageBit(id.Value());
+     }
+ 
++    /// Whether `id` names a live slot (queues that keep ids across frames check before use).
++    [[nodiscard]] bool contains(SlotId id) const noexcept {
++        if (!id) {
++            return false;
++        }
++        const u32 index = id.Value();
++        return index / 64 < stored_bitset.size() && ((stored_bitset[index / 64] >> (index % 64)) & 1) != 0;
++    }
++
+     [[nodiscard]] Iterator begin() noexcept {
+         const auto it = std::ranges::find_if(stored_bitset, [](u64 value) { return value != 0; });
+         if (it == stored_bitset.end()) {
+diff --git a/src/shader_recompiler/object_pool.h b/src/shader_recompiler/object_pool.h
+--- a/src/shader_recompiler/object_pool.h
++++ b/src/shader_recompiler/object_pool.h
+@@ -91,6 +91,7 @@
+     }
+ 
+ private:
++
+     struct NonTrivialDummy {
+         NonTrivialDummy() noexcept {}
+     };
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -155,6 +155,100 @@
+ template <class P>
+ void BufferCache<P>::ReleaseFinished() {
+     delayed_destruction_ring.Clear();
++    pending_destroy.Clear();
++}
++
++// EDEN_NX2_BC_PENDING_MIB=<MiB> (unset or 0: off, as before): a deleted buffer keeps its memory for
++// 8 frames (delayed_destruction_ring), and every buffer that grows leaves its old copy there. At
++// Ocarina of Time's Castle Town gate (crash-20261110-190821, base PS5 13.60) GPU-only buffers went
++// from 219 MiB in 289 buffers to 1464 MiB in 1626 within 2 s while frames took up to 3.3 s, and the
++// pool refused the images of the area. With the switch, a draw or dispatch about to make a buffer
++// while that many MiB wait first waits for the GPU and destroys them (the refused buffer's own
++// relief, runtime.ReleaseForBuffer, before a refusal instead of after one).
++// EDEN_NX2_BC_PENDING_LOG=1 only logs: a line each time what waits, or what the buffers hold,
++// passes its highest so far by 64 MiB. The switch logs the same lines.
++// EDEN_NX2_TC_PENDING_MIB=<MiB> (unset or 0: off) does the same for deleted images: they wait for
++// the GPU to pass them, but that is only looked at once a frame. With EDEN_NX2_BC_PENDING_MIB=128
++// alone (crash-20261110-192152) about 1000 images, 486 MiB, were destroyed in one go a second
++// after the first refusal at the gate. The wait and the destruction are the same call, so either
++// limit being reached releases both.
++template <class P>
++void BufferCache<P>::ReleasePendingBuffers() {
++    static const u64 limit = [] {
++        const char* const value = std::getenv("EDEN_NX2_BC_PENDING_MIB");
++        const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
++        if (mib != 0) {
++            std::fprintf(stderr, "EDEN_BC_PENDING on: deleted buffers are destroyed early from %llu MiB waiting\n",
++                         static_cast<unsigned long long>(mib));
++        }
++        return mib << 20;
++    }();
++    static const u64 image_limit = [] {
++        const char* const value = std::getenv("EDEN_NX2_TC_PENDING_MIB");
++        const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
++        if (mib != 0) {
++            std::fprintf(stderr, "EDEN_TC_PENDING on: deleted images are destroyed early from %llu MiB waiting\n",
++                         static_cast<unsigned long long>(mib));
++        }
++        return mib << 20;
++    }();
++    static const bool log = [] {
++        const char* const value = std::getenv("EDEN_NX2_BC_PENDING_LOG");
++        return limit != 0 || image_limit != 0 || (value != nullptr && value[0] == '1');
++    }();
++    if (!log) {
++        return;
++    }
++    constexpr u64 step = u64{64} << 20;
++    const u64 waiting = pending_destroy.Bytes();
++    // The texture cache's figure is only read where the release below may run: both caches are
++    // locked there (PrepareDraw, DispatchCompute). Elsewhere it counts as nothing.
++    u64 images = 0;
++    if constexpr (requires { runtime.PendingImageBytes(); }) {
++        if (may_wait_for_memory) {
++            images = runtime.PendingImageBytes();
++        }
++    }
++    if (waiting >= pending_logged_bytes + step || buffer_bytes >= live_logged_bytes + step ||
++        images >= images_logged_bytes + step) {
++        pending_logged_bytes = (std::max)(pending_logged_bytes, waiting);
++        live_logged_bytes = (std::max)(live_logged_bytes, buffer_bytes);
++        images_logged_bytes = (std::max)(images_logged_bytes, images);
++        std::fprintf(stderr, "EDEN_BC_PENDING frame=%llu waiting=%llu MiB in %llu deleted buffers, the cache holds %llu MiB, "
++                     "deleted images waiting %llu MiB\n",
++                     static_cast<unsigned long long>(frame_tick),
++                     static_cast<unsigned long long>(waiting >> 20),
++                     static_cast<unsigned long long>(pending_destroy.Buffers()),
++                     static_cast<unsigned long long>(buffer_bytes >> 20),
++                     static_cast<unsigned long long>(images >> 20));
++    }
++    if (!may_wait_for_memory ||
++        !VideoCommon::PendingReleaseDue(waiting, limit, images, image_limit)) {
++        return;
++    }
++    if constexpr (requires { runtime.ReleaseForBuffer(); }) {
++        const u64 buffers = pending_destroy.Buffers();
++        // Ends in ReleaseFinished above, which empties the ring and the count, and in the texture
++        // cache's, which destroys the images the GPU is past: after the wait, all of them.
++        runtime.ReleaseForBuffer();
++        u64 images_left = 0;
++        if constexpr (requires { runtime.PendingImageBytes(); }) {
++            images_left = runtime.PendingImageBytes();
++        }
++        pending_released_bytes += waiting + (images - (std::min)(images, images_left));
++        // The 1st, 2nd, 4th, 8th ... release in the log.
++        if (const u64 times = ++pending_releases; (times & (times - 1)) == 0) {
++            std::fprintf(stderr, "EDEN_BC_PENDING release %llu at frame %llu: %llu MiB in %llu buffers and %llu MiB of images "
++                         "destroyed after a wait for the GPU (%llu MiB so far), still waiting: %llu MiB of buffers, "
++                         "%llu MiB of images\n",
++                         static_cast<unsigned long long>(times), static_cast<unsigned long long>(frame_tick),
++                         static_cast<unsigned long long>(waiting >> 20), static_cast<unsigned long long>(buffers),
++                         static_cast<unsigned long long>((images - (std::min)(images, images_left)) >> 20),
++                         static_cast<unsigned long long>(pending_released_bytes >> 20),
++                         static_cast<unsigned long long>(pending_destroy.Bytes() >> 20),
++                         static_cast<unsigned long long>(images_left >> 20));
++        }
++    }
+ }
+ 
+ template <class P>
+@@ -265,6 +359,7 @@
+     }
+     ++frame_tick;
+     delayed_destruction_ring.Tick();
++    pending_destroy.Tick();
+ 
+     // EDEN_UP_L1028_ASYNC_READBACK (zortos293/Lichii #1028): pages draws wrote get their early
+     // downloads now that the frame's work is recorded (EDEN_UP_L1028_EARLY), and read downloads
+@@ -4722,6 +4817,7 @@
+     // The synchronized-range tables hold Buffer pointers and ids that this may move or reuse.
+     nx2_synced_ranges.fill({});
+     nx2_synced_vertex_buffers.fill({});
++    ReleasePendingBuffers();
+     DAddr device_addr_end = Common::AlignUp(device_addr + wanted_size, CACHING_PAGESIZE);
+     device_addr = Common::AlignDown(device_addr, CACHING_PAGESIZE);
+     wanted_size = static_cast<u32>(device_addr_end - device_addr);
+@@ -5526,7 +5622,10 @@
+ #ifdef YUZU_LEGACY
+     if (!do_not_mark || !immediately_free)
+ #endif
++    {
++        pending_destroy.Push(slot_buffers[buffer_id].SizeBytes());
+         delayed_destruction_ring.Push(std::move(slot_buffers[buffer_id]));
++    }
+ 
+     slot_buffers.erase(buffer_id);
+ 
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -44,6 +44,7 @@
+ #include "video_core/ubo_ahead.h"
+ #include "video_core/buffer_cache/virtual_range_cache.h"
+ #include "video_core/control/channel_state_cache.h"
++#include "video_core/buffer_cache/pending_destroy.h"
+ #include "video_core/delayed_destruction_ring.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/maxwell_3d.h"
+@@ -269,6 +270,8 @@
+     /// Destroys the buffers waiting for their frames. The caller holds mutex and has waited for the
+     /// GPU.
+     void ReleaseFinished();
++
++    void ReleasePendingBuffers();
+ 
+     /// write_mark_limit: EDEN_UP_FRITCHII_WRITEMARK's mark, spread over the segments in order.
+     bool BindMultiRangeStorage(const Binding& binding, bool is_written,
+@@ -978,6 +981,13 @@
+     static constexpr size_t TICKS_TO_DESTROY = 8;
+ #endif
+     DelayedDestructionRing<Buffer, TICKS_TO_DESTROY> delayed_destruction_ring;
++    /// What the ring above holds, in bytes (EDEN_NX2_BC_PENDING_MIB, ReleasePendingBuffers).
++    PendingDestroyBytes<TICKS_TO_DESTROY> pending_destroy;
++    u64 pending_logged_bytes = 0; ///< Most that waited, as last logged
++    u64 live_logged_bytes = 0;    ///< Most the buffers held, as last logged
++    u64 images_logged_bytes = 0;  ///< Most deleted images waited, as last logged
++    u64 pending_releases = 0;
++    u64 pending_released_bytes = 0;
+ 
+     const Tegra::Engines::Maxwell3D::DrawManager::IndirectParams* current_draw_indirect{};
+ 
+diff --git a/src/video_core/buffer_cache/pending_destroy.h b/src/video_core/buffer_cache/pending_destroy.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/buffer_cache/pending_destroy.h
+@@ -0,0 +1,70 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++
++namespace VideoCommon {
++
++/// The bytes of deleted buffers still waiting in a DelayedDestructionRing, kept slot by slot the
++/// way the ring keeps the buffers: Push adds to the current slot, Tick moves on and empties the
++/// slot it lands on, Clear empties all. A deleted buffer keeps its memory for Ticks frames, so
++/// when a frame takes seconds (an area streaming in) everything replaced during it waits here.
++template <std::size_t Ticks>
++class PendingDestroyBytes {
++public:
++    void Push(std::uint64_t bytes) noexcept {
++        bytes_in[index] += bytes;
++        ++buffers_in[index];
++        total_bytes += bytes;
++        ++total_buffers;
++    }
++
++    void Tick() noexcept {
++        index = (index + 1) % Ticks;
++        total_bytes -= bytes_in[index];
++        total_buffers -= buffers_in[index];
++        bytes_in[index] = 0;
++        buffers_in[index] = 0;
++    }
++
++    void Clear() noexcept {
++        bytes_in.fill(0);
++        buffers_in.fill(0);
++        total_bytes = 0;
++        total_buffers = 0;
++    }
++
++    [[nodiscard]] std::uint64_t Bytes() const noexcept {
++        return total_bytes;
++    }
++    [[nodiscard]] std::uint64_t Buffers() const noexcept {
++        return total_buffers;
++    }
++
++    /// Whether what waits has reached `limit` bytes. A limit of 0 is "no limit": never.
++    [[nodiscard]] bool Over(std::uint64_t limit) const noexcept {
++        return limit != 0 && total_bytes >= limit;
++    }
++
++private:
++    std::size_t index = 0;
++    std::array<std::uint64_t, Ticks> bytes_in{};
++    std::array<std::uint64_t, Ticks> buffers_in{};
++    std::uint64_t total_bytes = 0;
++    std::uint64_t total_buffers = 0;
++};
++
++/// Whether to wait for the GPU and destroy what waits: deleted buffers have reached their limit, or
++/// deleted images theirs. A limit of 0 is "no limit" for that kind; both 0 is never.
++[[nodiscard]] constexpr bool PendingReleaseDue(std::uint64_t buffer_bytes, std::uint64_t buffer_limit,
++                                               std::uint64_t image_bytes,
++                                               std::uint64_t image_limit) noexcept {
++    return (buffer_limit != 0 && buffer_bytes >= buffer_limit) ||
++           (image_limit != 0 && image_bytes >= image_limit);
++}
++
++} // namespace VideoCommon
+diff --git a/src/video_core/renderer_vulkan/pipeline_memory_gate.h b/src/video_core/renderer_vulkan/pipeline_memory_gate.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/pipeline_memory_gate.h
+@@ -0,0 +1,83 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// EglantinePS5: pipeline builds take turns while memory is short (EDEN_PIPELINE_MEMORY_GATE_MIB).
++//
++// Building a pipeline translates its shaders and runs the driver's compiler, and both take their
++// working memory from the pool the CPU and the GPU share. On the way to Ocarina of Time's Castle
++// Town eight builder threads and the GPU thread built at once, the heap's blocks of their own went
++// from 351 to 1168 MiB in seconds, and the GPU thread's next allocation failed with the pool empty
++// (crash-20261110-185626). With the gate, a build that starts while the largest free block of the
++// pool is under the mark waits until no other build is running, or the pool is over the mark
++// again, or its wait reaches the limit (then it goes ahead: a build is never refused here). Over
++// the mark nothing changes. Every build leaves the gate when it ends, by any path.
++//
++// Header only and free of Vulkan, so tools/test-pipeline-memory-gate.cpp tests it on any host.
++#pragma once
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <thread>
++
++namespace Vulkan::PipelineMemoryGate {
++
++struct Counters {
++    std::atomic<std::uint64_t> builds{0};   // builds that passed the gate
++    std::atomic<std::uint64_t> waited{0};   // of them, builds that had to wait
++    std::atomic<std::uint64_t> wait_us{0};  // total time they waited
++    std::atomic<std::uint64_t> timeouts{0}; // waits that reached the limit
++    std::atomic<std::uint32_t> running{0};  // builds inside the gate now
++};
++
++// free_bytes(): the pool's largest free block in bytes, 0 when unknown (the gate then never waits).
++// mark: under this, builds take turns. limit: the longest a build waits. poll: between looks.
++template <typename FreeBytes>
++class Gate {
++public:
++    Gate(Counters& counters, FreeBytes free_bytes, std::uint64_t mark, std::chrono::microseconds limit,
++         std::chrono::microseconds poll = std::chrono::microseconds{2000})
++        : counters_{counters} {
++        if (mark == 0) {
++            entered_ = false;
++            return;
++        }
++        const auto start = std::chrono::steady_clock::now();
++        bool waited = false;
++        for (;;) {
++            std::uint32_t running = counters_.running.load(std::memory_order_acquire);
++            const std::uint64_t free = free_bytes();
++            if (free == 0 || free >= mark || running == 0) {
++                if (counters_.running.compare_exchange_weak(running, running + 1, std::memory_order_acq_rel)) {
++                    break;
++                }
++                continue;
++            }
++            waited = true;
++            if (std::chrono::steady_clock::now() - start >= limit) {
++                counters_.running.fetch_add(1, std::memory_order_acq_rel);
++                counters_.timeouts.fetch_add(1, std::memory_order_relaxed);
++                break;
++            }
++            std::this_thread::sleep_for(poll);
++        }
++        counters_.builds.fetch_add(1, std::memory_order_relaxed);
++        if (waited) {
++            counters_.waited.fetch_add(1, std::memory_order_relaxed);
++            counters_.wait_us.fetch_add(static_cast<std::uint64_t>(
++                                            std::chrono::duration_cast<std::chrono::microseconds>(
++                                                std::chrono::steady_clock::now() - start)
++                                                .count()),
++                                        std::memory_order_relaxed);
++        }
++    }
++    ~Gate() {
++        if (entered_) counters_.running.fetch_sub(1, std::memory_order_acq_rel);
++    }
++    Gate(const Gate&) = delete;
++    Gate& operator=(const Gate&) = delete;
++
++private:
++    Counters& counters_;
++    bool entered_ = true;
++};
++
++} // namespace Vulkan::PipelineMemoryGate
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -135,6 +135,16 @@
+     void SetReleaseHook(void (*hook)(void* context), void* context) noexcept {
+         release_hook = hook;
+         release_context = context;
++    }
++
++    /// Device memory of deleted images that ReleaseForBuffer would give back (the texture cache's,
++    /// through the rasterizer). Only read where ReleaseForBuffer may be called.
++    [[nodiscard]] u64 PendingImageBytes() const {
++        return pending_images_hook ? pending_images_hook(release_context) : 0;
++    }
++
++    void SetPendingImagesHook(u64 (*hook)(void* context)) noexcept {
++        pending_images_hook = hook;
+     }
+ 
+     /// Returns the mask of bindings whose repacked state changed.
+@@ -358,6 +368,7 @@
+     vk::Buffer null_buffer;
+ 
+     void (*release_hook)(void* context) = nullptr;
++    u64 (*pending_images_hook)(void* context) = nullptr;
+     void* release_context = nullptr;
+ 
+     std::unique_ptr<Uint8Pass> uint8_pass;
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -12,6 +12,12 @@
+ #include <iostream>
+ #include <optional>
+ #include <span>
++#ifdef PS5_NATIVE
++#include <chrono>
++#include <cstdint>
++#include <thread>
++#include "common/pe_switch.h"
++#endif
+ 
+ #include <boost/container/small_vector.hpp>
+ #include <boost/container/static_vector.hpp>
+@@ -48,6 +54,12 @@
+ #define LAMBDA_FORCEINLINE [[msvc::forceinline]]
+ #else
+ #define LAMBDA_FORCEINLINE
++#endif
++
++#ifdef PS5_NATIVE
++// headless/performance.cpp: what the driver calls when its own memory runs out (the heap's empty
++// pages, cold guest memory). Weak: a build without the PS5 front end retries without it.
++extern "C" std::uint64_t eden_radv_out_of_memory(std::uint64_t bytes) __attribute__((weak));
+ #endif
+ 
+ namespace Vulkan {
+@@ -485,11 +497,12 @@
+         }
+     }
+ 
+-    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics] {
++    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
++               on_worker = worker_thread != nullptr] {
+         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
+         Validate();
+         try {
+-            MakePipeline(render_pass);
++            MakePipeline(render_pass, on_worker);
+             if (RunsMeshAsCompute()) {
+                 MakeMeshComputePipelines();
+             }
+@@ -1331,7 +1344,7 @@
+     return true;
+ }
+ 
+-void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
++void GraphicsPipeline::MakePipeline(VkRenderPass render_pass, [[maybe_unused]] bool on_worker) {
+     FixedPipelineState::DynamicState dynamic{};
+     if (!key.state.extended_dynamic_state) {
+         dynamic = key.state.dynamic_state;
+@@ -1776,8 +1789,7 @@
+         flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+     }
+ 
+-    pipeline = DriverBuildReport::Build(DriverBuildReport::Kind::Graphics, [&] {
+-        return device.GetLogical().CreateGraphicsPipeline({
++    const VkGraphicsPipelineCreateInfo pipeline_ci{
+         .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+         .pNext = nullptr,
+         .flags = flags,
+@@ -1797,8 +1809,51 @@
+         .subpass = 0,
+         .basePipelineHandle = nullptr,
+         .basePipelineIndex = 0,
+-    }, *pipeline_cache);
+-    });
++    };
++    const auto create_pipeline = [&] {
++        return DriverBuildReport::Build(DriverBuildReport::Kind::Graphics, [&] {
++            return device.GetLogical().CreateGraphicsPipeline(pipeline_ci, *pipeline_cache);
++        });
++    };
++#ifdef PS5_NATIVE
++    static const bool retry_enabled = Common::PeSwitch("EDEN_NX2_GRAPHICS_PIPELINE_OOM_RETRY");
++    if (retry_enabled && on_worker) {
++        try {
++            pipeline = create_pipeline();
++        } catch (const vk::Exception& exception) {
++            const VkResult result = exception.GetResult();
++            if (result != VK_ERROR_OUT_OF_HOST_MEMORY && result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
++                throw;
++            }
++            // The driver call has unwound. Only on a pipeline worker: the renderer's inline
++            // builds do not wait here. Out of host memory is mostly the shader compiler's own
++            // allocations, which the driver's retry (lead-mesh-22) never sees: ask for the same
++            // memory it would (64 MiB), give the collector a frame, and try once more.
++            const std::uint64_t freed =
++                eden_radv_out_of_memory ? eden_radv_out_of_memory(std::uint64_t{16} << 20) : 0;
++            std::this_thread::sleep_for(std::chrono::milliseconds{16});
++            static std::atomic<u32> logged{};
++            try {
++                pipeline = create_pipeline();
++            } catch (const vk::Exception&) {
++                if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
++                    LOG_WARNING(Render_Vulkan,
++                                "EDEN_GRAPHICS_PIPELINE_OOM_RETRY still no memory ({} MiB given back)",
++                                freed >> 20);
++                }
++                throw;
++            }
++            if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
++                LOG_INFO(Render_Vulkan,
++                         "EDEN_GRAPHICS_PIPELINE_OOM_RETRY recovered a pipeline ({} MiB given back)",
++                         freed >> 20);
++            }
++        }
++    } else
++#endif
++    {
++        pipeline = create_pipeline();
++    }
+ 
+     // Log graphics pipeline creation
+     if (GPU::Logging::IsActive()) {
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -282,7 +282,7 @@
+     bool ConfigureDraw(const RescalingPushConstant& rescaling,
+                        const RenderAreaPushConstant& render_are);
+ 
+-    void MakePipeline(VkRenderPass render_pass);
++    void MakePipeline(VkRenderPass render_pass, bool on_worker);
+     void MakeMeshComputePipelines();
+     bool RecordMeshComputePasses(const void* descriptor_data, VkDeviceSize descriptor_buffer_offset,
+                                  u32 descriptor_buffer_chunk, const RescalingPushConstant& rescaling,
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -46,6 +46,7 @@
+ #include "shader_recompiler/ir_opt/compose_guard.h"
+ #include "shader_recompiler/ir_opt/oot_visual_workaround.h"
+ #include "shader_recompiler/program_header.h"
++#include "video_core/renderer_vulkan/pipeline_memory_gate.h"
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include <unordered_set>
+@@ -412,6 +413,54 @@
+ // VK_ERROR_OUT_OF_HOST_MEMORY, Ocarina on 13.60 with the shared pool empty, crash-20261109-121818).
+ // Like a std::bad_alloc here: this pipeline fails, its draws are dropped, and the session goes on.
+ // Any other Vulkan error still ends the session.
++// headless/performance.cpp: the largest free block of the pool the CPU shares with the GPU, in
++// bytes, 0 when unknown. Weak: without it the gate below never waits.
++extern "C" unsigned long long eden_pool_largest_free(void) __attribute__((weak));
++
++// EDEN_PIPELINE_MEMORY_GATE_MIB=<n> (off unless set): while the pool's largest free block is under
++// n MiB, pipeline builds take turns (pipeline_memory_gate.h). EDEN_PIPELINE_MEMORY_GATE_MS=<ms>
++// (default 2000): the longest one waits before it goes ahead anyway.
++PipelineMemoryGate::Counters pipeline_gate_counters;
++std::uint64_t PipelineGateFree() {
++    return eden_pool_largest_free ? eden_pool_largest_free() : 0;
++}
++struct PipelineGateSettings {
++    std::uint64_t mark{};
++    std::chrono::microseconds limit{};
++};
++const PipelineGateSettings& PipelineGate() {
++    static const PipelineGateSettings settings = [] {
++        PipelineGateSettings result{};
++        if (const char* const mib = std::getenv("EDEN_PIPELINE_MEMORY_GATE_MIB")) {
++            result.mark = std::strtoull(mib, nullptr, 10) << 20;
++        }
++        const char* const ms = std::getenv("EDEN_PIPELINE_MEMORY_GATE_MS");
++        result.limit = std::chrono::milliseconds{ms != nullptr ? std::strtoull(ms, nullptr, 10) : 2000ULL};
++        if (result.mark != 0) {
++            LOG_INFO(Render_Vulkan, "EDEN_PIPELINE_MEMORY_GATE: builds take turns under {} MiB free, "
++                                    "waiting at most {} ms",
++                     result.mark >> 20, result.limit.count() / 1000);
++        }
++        return result;
++    }();
++    return settings;
++}
++// A line when the waits grew by 32 since the last one (and at the first): how many builds waited,
++// for how long in all, and how many went ahead at the limit.
++void ReportPipelineGate() {
++    static std::atomic<std::uint64_t> reported{0};
++    const std::uint64_t waited = pipeline_gate_counters.waited.load(std::memory_order_relaxed);
++    std::uint64_t last = reported.load(std::memory_order_relaxed);
++    if (waited == 0 || (last != 0 && waited < last + 32) ||
++        !reported.compare_exchange_strong(last, waited, std::memory_order_relaxed)) {
++        return;
++    }
++    LOG_INFO(Render_Vulkan, "EDEN_PIPELINE_MEMORY_GATE: {} of {} builds waited, {} ms in all, {} at the limit",
++             waited, pipeline_gate_counters.builds.load(std::memory_order_relaxed),
++             pipeline_gate_counters.wait_us.load(std::memory_order_relaxed) / 1000,
++             pipeline_gate_counters.timeouts.load(std::memory_order_relaxed));
++}
++
+ bool SurviveDriverOutOfMemory(const vk::Exception& exception, const char* where) {
+     const VkResult result = exception.GetResult();
+     if (result != VK_ERROR_OUT_OF_HOST_MEMORY && result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+@@ -2428,6 +2477,9 @@
+     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
+     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
+     bool build_in_parallel, ShaderPrep::Stages* kept_out) try {
++    const PipelineMemoryGate::Gate memory_gate{pipeline_gate_counters, &PipelineGateFree, PipelineGate().mark,
++                                               PipelineGate().limit};
++    ReportPipelineGate();
+     auto hash = key.Hash();
+     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
+     size_t env_index{0};
+@@ -3596,6 +3648,9 @@
+ std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
+     ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
+     PipelineStatistics* statistics, bool build_in_parallel) try {
++    const PipelineMemoryGate::Gate memory_gate{pipeline_gate_counters, &PipelineGateFree, PipelineGate().mark,
++                                               PipelineGate().limit};
++    ReportPipelineGate();
+     auto hash = key.Hash();
+     if (device.HasBrokenCompute()) {
+         LOG_ERROR(Render_Vulkan, "Skipping {:#016x}", hash);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -272,6 +272,9 @@
+     buffer_cache_runtime.SetReleaseHook(
+         [](void* context) { static_cast<RasterizerVulkan*>(context)->ReleaseFinishedMemory(); },
+         this);
++    buffer_cache_runtime.SetPendingImagesHook([](void* context) -> u64 {
++        return static_cast<RasterizerVulkan*>(context)->texture_cache.SentencedBytes();
++    });
+     buffer_cache.SetPendingCpuWrites(
+         [this](const std::function<void(DAddr, size_t)>& callback) {
+             gpu.ForEachPendingCpuWrite(callback);
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -5411,10 +5411,25 @@
+         upload_refused = true;
+         return;
+     }
++    // A single scratch image and BC buffer are reused for the layer batches.
++    static const bool batch_layers = Common::PeSwitch("EDEN_NX2_TRANSCODE_BATCH_LAYERS");
++    u64 layer_decode_bytes = 0;
++    for (u32 level = 0; level < levels; ++level) {
++        layer_decode_bytes += u64{(std::max)(width >> level, 1U)} *
++                              (std::max)(height >> level, 1U) * 4;
++    }
++    const bool aligned_layers = info.layer_stride % device.GetStorageBufferAlignment() == 0;
++    const u32 batch = batch_layers && layers > 1 && info.layer_stride != 0 && aligned_layers &&
++                              info.num_samples == 1 && layer_decode_bytes != 0 &&
++                              False(image.flags & ImageFlagBits::Rescaled)
++                          ? static_cast<u32>(std::clamp<u64>((u64{64} << 20) / layer_decode_bytes,
++                                                            1, layers))
++                          : layers;
++    const bool split = batch < layers;
+     // EDEN_UP_ASTC_BATCH_MIB: a texture whose decode image and output pass the budget goes through
+     // TranscodeAstcBatched below. Off: nothing is planned.
+     std::optional<AstcBatchPlan> batch_plan;
+-    if (VideoCommon::AstcBatchBudgetBytes() != 0) {
++    if (!split && VideoCommon::AstcBatchBudgetBytes() != 0) {
+         batch_plan = PlanAstcBatches(
+             info, swizzles,
+             !IsOpaqueBc1Astc(device, info) &&
+@@ -5430,11 +5445,7 @@
+             }
+             return result;
+         };
+-        u64 incoming{};
+-        for (u32 level = 0; level < levels; ++level) {
+-            incoming += u64{(std::max)(width >> level, 1U)} *
+-                        (std::max)(height >> level, 1U) * 4 * layers;
+-        }
++        u64 incoming = layer_decode_bytes * batch;
+         if (batch_plan) {
+             incoming = batch_plan->scratch_bytes; // only the batches' decode image is new
+         }
+@@ -5475,7 +5486,7 @@
+     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
+     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
+     const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
+-        return t.width == width && t.height == height && t.levels == levels && t.layers == layers;
++        return t.width == width && t.height == height && t.levels == levels && t.layers == batch;
+     });
+     PendingTranscode pending;
+     if (reusable != free_transcodes.end()) {
+@@ -5494,7 +5505,7 @@
+                 .format = DecodeFormat,
+                 .extent = {width, height, 1},
+                 .mipLevels = levels,
+-                .arrayLayers = layers,
++                .arrayLayers = batch,
+                 .samples = VK_SAMPLE_COUNT_1_BIT,
+                 .tiling = VK_IMAGE_TILING_OPTIMAL,
+                 .usage = VK_IMAGE_USAGE_STORAGE_BIT,
+@@ -5519,7 +5530,7 @@
+             .width = width,
+             .height = height,
+             .levels = levels,
+-            .layers = layers,
++            .layers = batch,
+             .unused_frames = 0,
+         };
+         for (u32 level = 0; level < levels; ++level) {
+@@ -5527,70 +5538,118 @@
+                 MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
+         }
+     }
+-    astc_decoder_pass->AssembleInto(
+-        info, 0, image.guest_size_bytes,
+-        ASTCDecoderPass::Target{
+-            .image = *pending.image,
+-            .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+-            .initialized = false,
+-            .level_view = [&pending](s32 level) { return *pending.views[level]; },
+-            .wait = true,
+-        },
+-        map, swizzles);
+-
+-    // Encode every level into one buffer, then copy it into the image.
+     const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
+                      Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
+     const u64 block_bytes = bc3 ? 16 : 8;
+-    boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
+-    u64 total = 0;
+-    for (u32 level = 0; level < levels; ++level) {
+-        const u32 level_width = (std::max)(width >> level, 1U);
+-        const u32 level_height = (std::max)(height >> level, 1U);
+-        const u32 blocks_x = Common::DivCeil(level_width, 4U);
+-        const u32 blocks_y = Common::DivCeil(level_height, 4U);
+-        const u64 size = u64{blocks_x} * blocks_y * layers * block_bytes;
+-        copies.push_back({
+-            .buffer_offset = total,
+-            .buffer_size = size,
+-            .buffer_row_length = blocks_x * 4,
+-            .buffer_image_height = blocks_y * 4,
+-            .image_subresource{
+-                .base_level = static_cast<s32>(level),
+-                .base_layer = 0,
+-                .num_layers = static_cast<s32>(layers),
++    std::optional<StagingBufferRef> output;
++    VideoCommon::ImageInfo batch_info = info;
++    for (u32 first = 0; first < layers; first += batch) {
++        const u32 count = (std::min)(batch, layers - first);
++        boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
++        u64 total = 0;
++        for (u32 level = 0; level < levels; ++level) {
++            const u32 level_width = (std::max)(width >> level, 1U);
++            const u32 level_height = (std::max)(height >> level, 1U);
++            const u32 blocks_x = Common::DivCeil(level_width, 4U);
++            const u32 blocks_y = Common::DivCeil(level_height, 4U);
++            const u64 size = u64{blocks_x} * blocks_y * count * block_bytes;
++            copies.push_back({
++                .buffer_offset = total,
++                .buffer_size = size,
++                .buffer_row_length = blocks_x * 4,
++                .buffer_image_height = blocks_y * 4,
++                .image_subresource{
++                    .base_level = static_cast<s32>(level),
++                    .base_layer = static_cast<s32>(first),
++                    .num_layers = static_cast<s32>(count),
++                },
++                .image_offset{0, 0, 0},
++                .image_extent{level_width, level_height, 1},
++            });
++            total += size;
++        }
++        if (split && first == 0) {
++            // Acquire the one output buffer before recording a partial upload.
++            output = staging_buffer_pool.TryRequest(total, MemoryUsage::DeviceLocal);
++            if (!output) {
++                upload_refused = true;
++                return;
++            }
++            // UploadMemory transitions only its copy range. Initialize all layers before any
++            // partial copy so subsequent batches start from GENERAL as UploadMemory expects.
++            TransitionImageLayout(image);
++            LOG_INFO(Render_Vulkan,
++                     "ASTC transcode split {}x{}x{} ({} mips) into {} layers per batch, "
++                     "decode scratch {} -> {} MiB, BC staging {} MiB per batch",
++                     width, height, layers, levels, batch, (layer_decode_bytes * layers) >> 20,
++                     (layer_decode_bytes * batch) >> 20, total >> 20);
++        } else if (first != 0) {
++            // The previous batch encoded from the image and copied from the BC buffer.
++            // Order both reads before the next batch overwrites that scratch.
++            scheduler.Record([](vk::CommandBuffer cmdbuf) {
++                const VkMemoryBarrier barrier{
++                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                    .pNext = nullptr,
++                    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
++                    .dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++                };
++                cmdbuf.PipelineBarrier(
++                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
++                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, barrier);
++            });
++        }
++
++        batch_info.resources.layers = static_cast<s32>(count);
++        StagingBufferRef input = map;
++        const size_t layer_offset = size_t{first} * info.layer_stride;
++        input.offset += layer_offset;
++        const size_t input_size = split
++                                      ? (std::min)(size_t{count} * info.layer_stride,
++                                                   size_t{image.guest_size_bytes} - layer_offset)
++                                      : image.guest_size_bytes;
++        const u64 decode_tick = scheduler.CurrentTick();
++        astc_decoder_pass->AssembleInto(
++            batch_info, 0, input_size,
++            ASTCDecoderPass::Target{
++                .image = *pending.image,
++                .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
++                .initialized = first != 0,
++                .level_view = [&pending](s32 level) { return *pending.views[level]; },
++                .wait = true,
+             },
+-            .image_offset{0, 0, 0},
+-            .image_extent{level_width, level_height, 1},
++            input, swizzles);
++        if (split) {
++            // AssembleInto may submit. Keep both staging buffers busy until the last batch.
++            staging_buffer_pool.CarryTick(decode_tick, scheduler.CurrentTick());
++        }
++
++        if (!output) {
++            output = staging_buffer_pool.TryRequest(total, MemoryUsage::DeviceLocal);
++            if (!output) {
++                // The single-batch decode was recorded. Keep it alive and retry the upload later.
++                pending.tick = scheduler.CurrentTick();
++                pending_transcodes.emplace_back(std::move(pending));
++                upload_refused = true;
++                return;
++            }
++        }
++        for (u32 level = 0; level < levels; ++level) {
++            bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
++                                    copies[level].image_extent.height, count, bc3, output->buffer,
++                                    output->offset, total, copies[level].buffer_offset);
++        }
++        scheduler.Record([](vk::CommandBuffer cmdbuf) {
++            const VkMemoryBarrier barrier{
++                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++            };
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
+         });
+-        total += size;
+-    }
+-    // Zelda ended here on 2026-11-06: Request throws when refused, a buffer only the GPU uses has
+-    // no smaller size to try, and nothing on the GPU thread catches it. Now the upload is done at the
+-    // image's next use instead. The decode is recorded: its image stays until the GPU is past it.
+-    const auto output = staging_buffer_pool.TryRequest(total, MemoryUsage::DeviceLocal);
+-    if (!output) {
+-        pending.tick = scheduler.CurrentTick();
+-        pending_transcodes.emplace_back(std::move(pending));
+-        upload_refused = true;
+-        return;
+-    }
+-    for (u32 level = 0; level < levels; ++level) {
+-        bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
+-                                copies[level].image_extent.height, layers, bc3, output->buffer,
+-                                output->offset, total, copies[level].buffer_offset);
+-    }
+-    scheduler.Record([](vk::CommandBuffer cmdbuf) {
+-        const VkMemoryBarrier barrier{
+-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+-            .pNext = nullptr,
+-            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+-        };
+-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+-                               0, barrier);
+-    });
+-    image.UploadMemory(output->buffer, output->offset, copies);
++        image.UploadMemory(output->buffer, output->offset, copies);
++    }
+     pending.tick = scheduler.CurrentTick();
+     pending_transcodes.push_back(std::move(pending));
+ }
+diff --git a/src/video_core/texture_cache/image_base.h b/src/video_core/texture_cache/image_base.h
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -68,6 +68,8 @@
+     /// then not the newest, so MarkStale leaves these pages alone. A new image joined from
+     /// others takes it from them (JoinImages). Never cleared; only set with the switch on.
+     GuestBytes = 1 << 24,
++    /// A render target the GPU had never written when it was bound.
++    TransientTarget = 1 << 25,
+ };
+ DECLARE_ENUM_FLAG_OPERATORS(ImageFlagBits)
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -45,6 +45,10 @@
+ #include "video_core/hitch_trace.h"
+ #include "video_core/churn_counters.h"
+ #include "video_core/textures/decoders.h"
++
++#ifdef PS5_NATIVE
++extern "C" unsigned long long eden_pool_largest_free(void) __attribute__((weak));
++#endif
+ 
+ namespace VideoCommon {
+ 
+@@ -1145,7 +1149,7 @@
+ // images already go again when one was deleted (has_deleted_images), as for JoinImages' own deletes.
+ // Lines in stderr: EDEN_REFUSAL_EVICT, the first 16 and then every 64th.
+ template <class P>
+-u64 TextureCache<P>::RefusalEvict(u64 wanted, bool in_join) {
++u64 TextureCache<P>::RefusalEvict(u64 wanted, bool in_join, bool idle_pressure) {
+     constexpr u64 MinFrames = 10;
+     constexpr auto MinAge = std::chrono::milliseconds(300);
+     constexpr size_t MaxImages = 128;
+@@ -1153,7 +1157,8 @@
+     if (frame_tick <= MinFrames) {
+         return 0;
+     }
+-    const auto ended = frame_clock.LastEndedBy(std::chrono::steady_clock::now() - MinAge);
++    const auto ended = frame_clock.LastEndedBy(std::chrono::steady_clock::now() -
++        (idle_pressure ? std::chrono::milliseconds(1000) : MinAge));
+     if (!ended) {
+         return 0;
+     }
+@@ -1181,7 +1186,8 @@
+         if (True(image.flags & ImageFlagBits::IsDecoding) ||
+             (KeepAsyncDecodedFrames() != 0 &&
+              True(image.flags & ImageFlagBits::AsynchronousDecode)) ||
+-            KeptRemade(image) || joining(image_id)) {
++            KeptRemade(image) || joining(image_id) ||
++            (idle_pressure && True(image.flags & ImageFlagBits::GpuModified))) {
+             return false;
+         }
+         if (IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap)) {
+@@ -1349,8 +1355,21 @@
+     if (pe_busy) Eden::AstcPolicy::Frame();
+     // EDEN_UP_HITCH_TRACE: the frame that just ended, when it was long.
+     HitchTrace::EndFrame(frame_tick);
+-    if (CleanByTime() || RefusalEvictEnabled()) {
+-        frame_clock.EndFrame(frame_tick, std::chrono::steady_clock::now());
++    bool idle_pressure = false;
++    const auto now = std::chrono::steady_clock::now();
++#ifdef PS5_NATIVE
++    static const bool idle_pressure_enabled = Common::PeSwitch("EDEN_NX2_IDLE_TEXTURE_PRESSURE");
++    if (idle_pressure_enabled && eden_pool_largest_free && now >= idle_pressure_next) {
++        idle_pressure_next = now + std::chrono::milliseconds(250);
++        idle_pressure = eden_pool_largest_free() < 1024_MiB;
++    }
++#endif
++    if (CleanByTime() || RefusalEvictEnabled()
++#ifdef PS5_NATIVE
++        || idle_pressure_enabled
++#endif
++    ) {
++        frame_clock.EndFrame(frame_tick, now);
+     }
+     // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
+     // rather than kept for the rest of the session.
+@@ -1568,6 +1587,66 @@
+         gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
+         images_created = images_deleted = 0;
+     }
++    if (const u64 rt_evict = RtEvictPressureFrames();
++        rt_evict != 0 && total_used_memory > expected_memory) {
++        const auto queued = [](ImageId image_id, const auto& downloads) {
++            return std::ranges::any_of(downloads, [image_id](const auto& download) {
++                return download.is_swizzle && download.object_id == image_id;
++            });
++        };
++        for (size_t budget = transient_targets.size(); budget != 0 && !transient_targets.empty();
++             --budget) {
++            TransientTarget entry = transient_targets.front();
++            if (frame_tick - entry.check_tick < rt_evict) {
++                break;
++            }
++            transient_targets.pop_front();
++            if (!slot_images.contains(entry.id)) {
++                continue;
++            }
++            Image& image = slot_images[entry.id];
++            if (image.allocation_tick != entry.allocation_tick ||
++                False(image.flags & ImageFlagBits::TransientTarget) ||
++                False(image.flags & ImageFlagBits::Registered)) {
++                continue;
++            }
++            const bool bound = std::ranges::any_of(image.image_view_ids, [this](ImageViewId view) {
++                return render_targets.depth_buffer_id == view ||
++                       std::ranges::find(render_targets.color_buffer_ids, view) !=
++                           render_targets.color_buffer_ids.end();
++            });
++            const u64 last_use = image.lru_index != SIZE_MAX ? lru_cache.Tick(image.lru_index) : frame_tick;
++            if (frame_tick - last_use < rt_evict || bound ||
++                True(image.flags & ImageFlagBits::IsDecoding) ||
++                queued(entry.id, uncommitted_downloads) ||
++                std::ranges::any_of(committed_downloads,
++                                    [&](const auto& downloads) { return queued(entry.id, downloads); })) {
++                if (++entry.survived < 4) {
++                    entry.check_tick = frame_tick;
++                    transient_targets.push_back(entry);
++                } else {
++                    image.flags &= ~ImageFlagBits::TransientTarget;
++                }
++                continue;
++            }
++            transient_evicted_bytes += image.unswizzled_size_bytes;
++            MarkStale(image);
++            if (True(image.flags & ImageFlagBits::Tracked)) {
++                UntrackImage(image, entry.id);
++            }
++            UnregisterImage(entry.id);
++            DeleteImage(entry.id, false);
++            ++transient_evictions;
++        }
++    } else if (transient_targets.size() > 8192) {
++        transient_targets.erase(transient_targets.begin(),
++                                transient_targets.begin() + (transient_targets.size() - 8192));
++    }
++    if (frame_tick % 600 == 0 && transient_evictions != logged_transient_evictions) {
++        LOG_INFO(HW_GPU, "RT evict: {} unused fresh render targets deleted early so far ({} MiB), {} waiting",
++                 transient_evictions, transient_evicted_bytes >> 20, transient_targets.size());
++        logged_transient_evictions = transient_evictions;
++    }
+     // EDEN_UP_FRITCHII_CHURN=1 (Fritchii dcbd696438): what the caches made and destroyed.
+     if (Churn::Enabled() && frame_tick % 600 == 0) {
+         const auto churn = Churn::Take();
+@@ -1615,6 +1694,12 @@
+             RefusalDownloadEvict();
+         }
+         refusal_evicts_this_frame = 0;
++    }
++    if (idle_pressure) {
++        const u64 bytes = RefusalEvict(64_MiB, false, true);
++        if (bytes != 0) {
++            LOG_INFO(HW_GPU, "EDEN_NX2_IDLE_TEXTURE_PRESSURE retired {} MiB", bytes >> 20);
++        }
+     }
+     if (MemoryCensus::Enabled()) {
+         CensusTick();
+@@ -4364,9 +4449,18 @@
+     return found(*std::ranges::max_element(image_ids, image_ids_compare));
+ }
+ 
++// The original allocation stays live when a target is scaled. At 0.75x, Town's
++// 12288x12288 D16 shadow map gets a second 9216x9216 allocation.
++[[nodiscard]] inline bool KeepLargeDepthNative(const ImageInfo& info) {
++    static const bool enabled = Common::PeSwitch("EDEN_NX2_NATIVE_LARGE_DEPTH");
++    return enabled && Settings::values.resolution_info.downscale &&
++           info.format == VideoCore::Surface::PixelFormat::D16_UNORM &&
++           info.size.width >= 8192 && info.size.height >= 8192;
++}
++
+ template <class P>
+ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
+-    if (!image.info.rescaleable) {
++    if (!image.info.rescaleable || KeepLargeDepthNative(image.info)) {
+         return false;
+     }
+     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
+@@ -5225,7 +5319,7 @@
+     ForEachSparseImageInRegion(channel_state->gpu_memory.GetID(), gpu_addr, size_bytes,
+                                region_check_gpu);
+ 
+-    bool can_rescale = info.rescaleable;
++    bool can_rescale = info.rescaleable && !KeepLargeDepthNative(new_info);
+     bool any_rescaled = false;
+     for (const auto& copy : join_copies_to_do) {
+         if (!can_rescale) {
+@@ -6076,6 +6170,21 @@
+         return ImageViewId{};
+     }
+     Image& image = slot_images[image_id];
++    if (RtEvictPressureFrames() != 0 && Tegra::g_nx2_ampere.load(std::memory_order_relaxed) &&
++        image.modification_tick == 0 && True(image.flags & ImageFlagBits::CpuModified) &&
++        False(image.flags & ImageFlagBits::GpuModified) &&
++        False(image.flags & (ImageFlagBits::SparseLayers | ImageFlagBits::SparseTiles |
++                             ImageFlagBits::Unbacked)) &&
++        image.dirty_layers.empty()) {
++        image.flags &= ~ImageFlagBits::CpuModified;
++        if (False(image.flags & ImageFlagBits::Tracked)) {
++            TrackImage(image, image_id);
++        }
++        if (False(image.flags & ImageFlagBits::TransientTarget)) {
++            image.flags |= ImageFlagBits::TransientTarget;
++            transient_targets.push_back({image_id, image.allocation_tick, frame_tick, 0});
++        }
++    }
+     const ImageViewType view_type = RenderTargetImageViewType(info);
+     SubresourceBase base;
+     if (image.info.type == ImageType::Linear) {
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -290,6 +290,9 @@
+ 
+     static constexpr u32 LayerUploadMinSize = 64U << 20;
+     static constexpr size_t LargeScratchCapacity = 64U << 20;
++    /// What an upload scratch buffer may keep between the checks made every 256 frames, and
++    /// what the ASTC scan buffer may keep after a scan (PS5_Lichii 0230).
++    static constexpr size_t KeptScratchCapacity = 8U << 20;
+ 
+     /// Splits large 2D image uploads into smaller chunks, avoiding multi-hundred MiB staging buffers.
+     bool UploadInChunks(Image& image, u64 min_size = u64{64} << 20);
+@@ -385,6 +388,11 @@
+     /// Destroys the deleted images the GPU is done with, as TickFrame does. Mutex held.
+     void ReleaseFinished();
+ 
++    /// Device memory of deleted images still waiting for the GPU (EDEN_NX2_TC_PENDING_MIB).
++    [[nodiscard]] u64 SentencedBytes() const noexcept {
++        return gpu_sentenced_bytes;
++    }
++
+     /// EDEN_NX2_CLEAN_BY_TIME: the LRU tick at or below which an image counts as unused for
+     /// `frames` frames: with the switch, also for that many frames' time at 60 fps when that is at
+     /// least max(floor, 3, frames / 8) frames. Empty when nothing can be that old yet.
+@@ -399,7 +407,8 @@
+     /// images wait for TickFrame) is back for the retry. "Need no copy back" = !IsDownloadable,
+     /// as in AreaEvict and the collector, so GPU-written images that cannot be copied back (MSAA
+     /// without CanDownloadMsaa, TrimmedLevels, unbacked) go without a copy. Returns bytes deleted.
+-    u64 RefusalEvict(u64 wanted, bool in_join);
++    u64 RefusalEvict(u64 wanted, bool in_join, bool idle_pressure = false);
++    std::chrono::steady_clock::time_point idle_pressure_next{};
+ 
+     /// EDEN_NX2_REFUSAL_EVICT=1, at the end of a frame after RefusalEvict passed GPU-written
+     /// images over: copies back and deletes up to 8 of them, each up to 32 MiB and 64 MiB in all,
+@@ -1040,6 +1049,29 @@
+ 
+     std::vector<PendingDownload> uncommitted_downloads;
+     std::deque<std::vector<PendingDownload>> committed_downloads;
++
++    /// EDEN_NX2_RT_EVICT_PRESSURE=<frames> (off unless set; PS5_Lichii 0227, Fritchii#34,
++    /// Lichii#1023): a render target the GPU never wrote starts undefined instead of loading the
++    /// guest memory under it, and is queued. While the cache is over its expected size, a queued
++    /// target unused for that many frames is deleted without a download; one still in use is
++    /// checked again, up to 4 times, then counts as lasting.
++    struct TransientTarget {
++        ImageId id;
++        u64 allocation_tick;
++        u64 check_tick;
++        u32 survived;
++    };
++    std::deque<TransientTarget> transient_targets;
++    u64 transient_evictions{};
++    u64 transient_evicted_bytes{};
++    u64 logged_transient_evictions{};
++    [[nodiscard]] static u64 RtEvictPressureFrames() {
++        static const u64 frames = [] {
++            const char* value = std::getenv("EDEN_NX2_RT_EVICT_PRESSURE");
++            return value != nullptr ? std::strtoull(value, nullptr, 10) : u64{0};
++        }();
++        return frames;
++    }
+     std::vector<AsyncBuffer> uncommitted_async_buffers;
+     std::deque<std::vector<AsyncBuffer>> async_buffers;
+     std::deque<AsyncBuffer> async_buffers_death_ring;
