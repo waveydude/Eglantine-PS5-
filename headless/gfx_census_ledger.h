@@ -7,8 +7,10 @@
 // Flag values are Vulkan's and VMA's own (checked against the headers there with static_asserts).
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <cstddef>
 #include <cstdint>
 
@@ -67,16 +69,90 @@ inline constexpr std::uint32_t BufferSamplerDescriptor = 0x200000, BufferResourc
     return Owner::BufStream;
 }
 
-// The tag an allocation carries in its VMA user data: owner + 1, so null means untagged.
-[[nodiscard]] inline void* TagOf(Owner owner) noexcept {
-    return reinterpret_cast<void*>(static_cast<std::uintptr_t>(owner) + 1);
+// The tag an allocation carries in its VMA user data: owner + 1 in the low byte, so null means
+// untagged, and for an image its shape's id (ShapeTable, 0: none) in the 16 bits above.
+[[nodiscard]] inline void* TagOf(Owner owner, std::uint32_t shape = 0) noexcept {
+    return reinterpret_cast<void*>((static_cast<std::uintptr_t>(owner) + 1) |
+                                   (static_cast<std::uintptr_t>(shape & 0xffff) << 8));
 }
 [[nodiscard]] inline bool OwnerOfTag(const void* tag, Owner* owner) noexcept {
     const auto value = reinterpret_cast<std::uintptr_t>(tag);
-    if (value == 0 || value > OwnerCount) return false;
-    *owner = static_cast<Owner>(value - 1);
+    const auto low = value & 0xff;
+    if ((value >> 24) != 0 || low == 0 || low > OwnerCount) return false; // not a tag: a pointer, or null
+    *owner = static_cast<Owner>(low - 1);
     return true;
 }
+[[nodiscard]] inline std::uint32_t ShapeOfTag(const void* tag) noexcept {
+    const auto value = reinterpret_cast<std::uintptr_t>(tag);
+    return (value >> 24) != 0 ? 0 : static_cast<std::uint32_t>((value >> 8) & 0xffff);
+}
+
+// What an image is, for the census's "which images hold an owner's memory" lines.
+struct Shape {
+    std::uint32_t width, height, layers, levels, format, samples;
+    Owner owner;
+    [[nodiscard]] constexpr bool operator==(const Shape&) const noexcept = default;
+};
+
+// Live images by shape. Images are made and destroyed a few thousand times a session, so one
+// mutex and a linear search of at most Capacity shapes are enough. An id is the shape's index + 1
+// and is never reused; with the table full a new shape gets id 0 and is not counted here (the
+// ledger still counts its bytes under its owner).
+class ShapeTable {
+public:
+    static constexpr std::size_t Capacity = 1024;
+    struct Row {
+        Shape shape;
+        std::uint64_t count, bytes;
+    };
+
+    /// Counts one more image of this shape and returns its id (0: table full, not counted).
+    [[nodiscard]] std::uint32_t Add(const Shape& shape, std::uint64_t bytes) noexcept {
+        std::scoped_lock lock{mutex};
+        std::size_t index = 0;
+        while (index < used && !(rows[index].shape == shape)) ++index;
+        if (index == used) {
+            if (used == Capacity) return 0;
+            rows[used++] = Row{shape, 0, 0};
+        }
+        ++rows[index].count;
+        rows[index].bytes += bytes;
+        return static_cast<std::uint32_t>(index + 1);
+    }
+
+    /// One image of the shape with this id is gone. Never below zero; id 0 or unknown: nothing.
+    void Free(std::uint32_t id, std::uint64_t bytes) noexcept {
+        std::scoped_lock lock{mutex};
+        if (id == 0 || id > used) return;
+        Row& row = rows[id - 1];
+        if (row.count != 0) --row.count;
+        row.bytes -= (std::min)(row.bytes, bytes);
+    }
+
+    /// The owner's live shapes holding the most bytes, largest first. Returns how many were written.
+    [[nodiscard]] std::size_t Top(Owner owner, Row* out, std::size_t max) const noexcept {
+        std::scoped_lock lock{mutex};
+        std::size_t written = 0;
+        for (std::size_t index = 0; index < used; ++index) {
+            const Row& row = rows[index];
+            if (row.shape.owner != owner || row.count == 0) continue;
+            // Insertion into the sorted prefix; the smallest falls off the end when full.
+            std::size_t at = written;
+            while (at > 0 && out[at - 1].bytes < row.bytes) --at;
+            if (at >= max) continue;
+            const std::size_t last = written < max ? written : max - 1;
+            for (std::size_t move = last; move > at; --move) out[move] = out[move - 1];
+            out[at] = row;
+            if (written < max) ++written;
+        }
+        return written;
+    }
+
+private:
+    mutable std::mutex mutex;
+    std::array<Row, Capacity> rows{};
+    std::size_t used = 0;
+};
 
 struct OwnerSnapshot {
     std::uint64_t live_bytes, live_count, peak_bytes, made, freed, failures;

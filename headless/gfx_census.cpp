@@ -39,6 +39,7 @@ static_assert(VK_FORMAT_BC1_RGB_UNORM_BLOCK == 131 && VK_FORMAT_ASTC_12x12_SRGB_
 
 namespace {
 Ledger ledger;
+ShapeTable shapes;
 std::mutex allocator_mutex; // guards `allocator` against vmaDestroyAllocator
 VmaAllocator allocator{};
 std::atomic<std::uint64_t> fails_logged{0};
@@ -147,17 +148,44 @@ void WriteLine(bool on_refusal) {
         line[length++] = '\n';
         std::fwrite(line, 1, static_cast<std::size_t>(length), stderr);
     }
+    // Which images hold the render targets' and textures' memory: the six shapes with the most
+    // bytes per owner, as width x height x layers, mip levels, VkFormat, samples, count and MiB.
+    // With every 5 s line, and with refusal lines at most once a second.
+    static long long shapes_at = -1;
+    if (on_refusal && seconds == shapes_at) return;
+    shapes_at = seconds;
+    for (const Owner owner : {Owner::RtDepth, Owner::RtColor, Owner::TexBlock}) {
+        ShapeTable::Row rows[6];
+        const std::size_t count = shapes.Top(owner, rows, 6);
+        if (count == 0) continue;
+        length = std::snprintf(line, sizeof(line), "EDEN_GFX_CENSUS_SHAPES t=%lld %s:", static_cast<long long>(seconds),
+                               OwnerNames[static_cast<std::size_t>(owner)]);
+        for (std::size_t i = 0; i < count && length > 0 && length < static_cast<int>(sizeof(line)); ++i) {
+            const Shape& s = rows[i].shape;
+            length += std::snprintf(line + length, sizeof(line) - static_cast<std::size_t>(length),
+                                    " %ux%ux%u/L%u/f%u/s%u n=%llu %lluMiB;", s.width, s.height, s.layers, s.levels,
+                                    s.format, s.samples, static_cast<unsigned long long>(rows[i].count),
+                                    static_cast<unsigned long long>(rows[i].bytes >> 20));
+        }
+        if (length <= 0) continue;
+        if (length >= static_cast<int>(sizeof(line))) length = sizeof(line) - 2;
+        line[length++] = '\n';
+        std::fwrite(line, 1, static_cast<std::size_t>(length), stderr);
+    }
 }
 
-void Charged(VmaAllocator vma, VmaAllocation allocation, Owner owner) {
-    if (allocation == nullptr) return;
+// Returns the tag the allocation now carries (null: left uncounted). `shape` is for images.
+void* Charged(VmaAllocator vma, VmaAllocation allocation, Owner owner, const Shape* shape = nullptr) {
+    if (allocation == nullptr) return nullptr;
     VmaAllocationInfo info{};
     vmaGetAllocationInfo(vma, allocation, &info);
-    if (info.pUserData != nullptr) return; // someone else's data: leave it, and the allocation uncounted
-    vmaSetAllocationUserData(vma, allocation, TagOf(owner));
+    if (info.pUserData != nullptr) return nullptr; // someone else's data: leave it, and the allocation uncounted
+    void* const tag = TagOf(owner, shape != nullptr ? shapes.Add(*shape, info.size) : 0);
+    vmaSetAllocationUserData(vma, allocation, tag);
     ledger.Add(owner, info.size);
     Start();
     StartThread();
+    return tag;
 }
 
 void Released(VmaAllocator vma, VmaAllocation allocation) {
@@ -165,7 +193,10 @@ void Released(VmaAllocator vma, VmaAllocation allocation) {
     VmaAllocationInfo info{};
     vmaGetAllocationInfo(vma, allocation, &info);
     Owner owner;
-    if (OwnerOfTag(info.pUserData, &owner)) ledger.Free(owner, info.size);
+    if (OwnerOfTag(info.pUserData, &owner)) {
+        ledger.Free(owner, info.size);
+        shapes.Free(ShapeOfTag(info.pUserData), info.size);
+    }
 }
 
 void Refused(Owner owner, VkResult result, const char* what, unsigned long long a, unsigned long long b,
@@ -223,8 +254,10 @@ VkResult __wrap_vmaCreateImage(VmaAllocator vma, const VkImageCreateInfo* ci, co
     if (!Enabled() || ci == nullptr) return result;
     const Owner owner = ClassifyImage(ci->usage, static_cast<std::uint32_t>(ci->format));
     if (result == VK_SUCCESS) {
-        Charged(vma, *allocation, owner);
-        if (info != nullptr) info->pUserData = TagOf(owner);
+        const Shape shape{ci->extent.width, ci->extent.height, ci->arrayLayers * ci->extent.depth, ci->mipLevels,
+                          static_cast<std::uint32_t>(ci->format), static_cast<std::uint32_t>(ci->samples), owner};
+        void* const tag = Charged(vma, *allocation, owner, &shape);
+        if (info != nullptr && tag != nullptr) info->pUserData = tag;
     } else {
         Refused(owner, result, "image", ci->extent.width, ci->extent.height, ci->arrayLayers,
                 static_cast<unsigned>(ci->format));

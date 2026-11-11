@@ -137,13 +137,15 @@ def load(paths):
 
 def steady_and_peak(samples):
     """The sample just before the pool first ran short (free under 256 MiB after the first minute
-    with a game loaded), and the sample with the least free memory after it."""
+    with a game loaded), and the sample with the least free memory after it.
+    If the logs end before recording a shortage, compare the first minimum with its predecessor."""
     loaded = [s for s in samples if s.driver > 0]
     if not loaded:
         return None, None
     short = next((i for i, s in enumerate(loaded) if s.free < 256 and s.t >= loaded[0].t + 60), None)
     if short is None:
-        return loaded[-1], min(loaded, key=lambda s: s.free)
+        low = min(range(len(loaded)), key=lambda i: loaded[i].free)
+        return loaded[max(low - 1, 0)], loaded[low]
     steady = loaded[max(short - 1, 0)]
     peak = min(loaded[short:], key=lambda s: (s.free, -s.driver))
     return steady, peak
@@ -177,7 +179,8 @@ def report(session):
     least = min(samples, key=lambda s: s.free)
     w('## What happened\n')
     w(f'- {len(samples)} memory samples over {samples[-1].t - samples[0].t} s; pool {samples[0].pool} MiB.')
-    w(f'- Least free: **{least.free} MiB** at t={least.t} s, driver then {least.driver} MiB.')
+    w(f'- Least free in periodic driver samples: **{least.free} MiB** at t={least.t} s, '
+      f'driver then {least.driver} MiB.')
     w(f'- Most driver memory: {max(s.driver for s in samples)} MiB.')
     if session.crash:
         w(f"- Crash: {session.crash.get('what', '?')} on {session.crash.get('thread', '?')}, "
@@ -196,7 +199,7 @@ def report(session):
 
     steady, peak = steady_and_peak(samples)
     if steady and peak and steady is not peak:
-        w(f'## What grew (t={steady.t} s, last sample before the pool ran short, to t={peak.t} s, least free after)\n')
+        w(f'## What grew between driver samples (t={steady.t} s to t={peak.t} s)\n')
         before, after = components(steady), components(peak)
         w('| Component | Before MiB | After MiB | Change |')
         w('|---|---:|---:|---:|')
@@ -251,7 +254,7 @@ def report(session):
         before, after = components(steady), components(peak)
         growth = sorted(((after.get(n, 0) - before.get(n, 0), n) for n in after
                          if not n.startswith('driver (RADV')), reverse=True)[:3]
-        w('Largest growth into the shortage: ' + ', '.join(f'{n} {d:+d} MiB' for d, n in growth if d > 0) + '.')
+        w('Largest growth in that interval: ' + ', '.join(f'{n} {d:+d} MiB' for d, n in growth if d > 0) + '.')
         if not has_census:
             w('The driver line is not split by owner here; a run with EDEN_GFX_CENSUS=1 names the Vulkan owners.')
     return '\n'.join(out)

@@ -114,6 +114,20 @@ int main() {
             }
         }
     }
+    // 0917: either kind reaching its own limit releases both; a limit of 0 switches that kind off.
+    {
+        using VideoCommon::PendingReleaseDue;
+        constexpr std::uint64_t M = std::uint64_t{1} << 20;
+        CHECK(!PendingReleaseDue(0, 0, 0, 0));
+        CHECK(!PendingReleaseDue(900 * M, 0, 900 * M, 0));     // both off: never
+        CHECK(!PendingReleaseDue(127 * M, 128 * M, 255 * M, 256 * M));
+        CHECK(PendingReleaseDue(128 * M, 128 * M, 0, 256 * M)); // buffers exactly at their limit
+        CHECK(PendingReleaseDue(0, 128 * M, 256 * M, 256 * M)); // images exactly at theirs
+        CHECK(!PendingReleaseDue(0, 128 * M, 900 * M, 0));      // images off: only buffers count
+        CHECK(!PendingReleaseDue(900 * M, 0, 255 * M, 256 * M)); // buffers off: only images count
+        CHECK(PendingReleaseDue(900 * M, 0, 256 * M, 256 * M));
+        CHECK(!PendingReleaseDue(100 * M, 128 * M, 100 * M, 256 * M)); // the two are not added up
+    }
     CHECK(live_bytes == 0 && live_count == 0);
     std::printf(failures == 0 ? "pending-destroy: all checks passed\n" : "pending-destroy: %d FAILED\n", failures);
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
