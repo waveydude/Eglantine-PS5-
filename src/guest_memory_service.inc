@@ -1368,12 +1368,26 @@ std::atomic<std::uint64_t> memory_waits_won{0}, memory_waits_lost{0};
 // game's own memory comes first: a large open-world game wrote 1.8 GB of new memory within 10 s
 // after 23 minutes of play, faster than the caches free at the end of each frame, and the write
 // that found no block ended the session. So the writer waits here, in its fault handler, and tries
-// again every 20 ms for up to 2 s while the caches give memory back. Only then is it refused.
+// again every 20 ms while the caches give memory back: for up to EDEN_GUEST_WRITE_WAIT_MS, 2 s unset
+// (headless/memory_wait.h: PS5_Hookshot's game pages gave up at 3 s and survived at 10 s leaving
+// Castle Town). Only then is it refused. The limit is read at the first wait, which is long after
+// the game's env file is in, and kept.
+unsigned GuestWriteWaitMs() noexcept {
+    static std::atomic<unsigned> kept{0};
+    unsigned ms = kept.load(std::memory_order_relaxed);
+    if (ms == 0) {
+        ms = ::Eden::MemoryWait::ReadMs("EDEN_GUEST_WRITE_WAIT_MS", 2000, 20, 60000);
+        kept.store(ms, std::memory_order_relaxed);
+    }
+    return ms;
+}
+
 template <typename Promote>
 bool WaitForBlock(Promote&& promote) noexcept {
     memory_waiters.fetch_add(1, std::memory_order_acq_rel);
     bool ok = false;
-    for (unsigned tries = 0; tries < 100 && !ok; ++tries) {
+    const unsigned limit = ::Eden::MemoryWait::Steps(GuestWriteWaitMs());
+    for (unsigned tries = 0; tries < limit && !ok; ++tries) {
         const timespec pause{0, 20'000'000};
         nanosleep(&pause, nullptr);
         ok = promote();
@@ -1381,7 +1395,7 @@ bool WaitForBlock(Promote&& promote) noexcept {
     memory_waiters.fetch_sub(1, std::memory_order_acq_rel);
     (ok ? memory_waits_won : memory_waits_lost).fetch_add(1, std::memory_order_relaxed);
     Note(ok ? "EDEN_CRAM a written slot waited for the graphics caches to give memory back, and got a block\n"
-            : "EDEN_CRAM a written slot waited 2 s for memory and found no block\n");
+            : "EDEN_CRAM a written slot waited its whole limit (EDEN_GUEST_WRITE_WAIT_MS, 2 s unset) for memory and found no block\n");
     return ok;
 }
 } // namespace
