@@ -13,6 +13,12 @@
 //
 // Cost when off: one load of a static bool per VMA call. When on: a few atomics per allocation and
 // free, one vmaGetAllocationInfo per free, and vmaCalculateStatistics every 5 s on its own thread.
+//
+// The allocator is created VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED: VMA takes no lock of its
+// own and its callers keep to one thread at a time. The census thread is not one of them, so with
+// the census on every wrapped call (all of VMA's allocations and frees) and the thread's
+// vmaCalculateStatistics hold `vma_mutex`: the walk over VMA's blocks never meets one being
+// changed (Vampinity's review of 0912, issue 21). Off, the mutex is never touched.
 // Not counted: allocations made before the census saw its first one (none: it starts with the
 // first allocation), and memory the driver takes for itself (RADV_PS5_MEMORY shows that).
 #ifdef PS5_NATIVE
@@ -42,6 +48,9 @@ Ledger ledger;
 ShapeTable shapes;
 std::mutex allocator_mutex; // guards `allocator` against vmaDestroyAllocator
 VmaAllocator allocator{};
+std::mutex vma_mutex;       // census on: one of {a wrapped VMA call, the census thread's statistics} at a time.
+                            // Taken after allocator_mutex where both are held, never before it.
+
 std::atomic<std::uint64_t> fails_logged{0};
 std::mutex wake_mutex;
 std::condition_variable wake;
@@ -53,6 +62,17 @@ bool Enabled() noexcept {
     }();
     return enabled;
 }
+
+// Holds vma_mutex for a wrapped call, with the census on only.
+class VmaCall {
+public:
+    VmaCall() {
+        if (Enabled()) lock = std::unique_lock{vma_mutex};
+    }
+
+private:
+    std::unique_lock<std::mutex> lock;
+};
 
 bool HostAccess(const VmaAllocationCreateInfo* aci) noexcept {
     if (aci == nullptr) return false;
@@ -131,7 +151,10 @@ void WriteLine(bool on_refusal) {
         std::scoped_lock lock{allocator_mutex};
         if (allocator != nullptr && length > 0 && length < static_cast<int>(sizeof(line))) {
             VmaTotalStatistics stats{};
-            vmaCalculateStatistics(allocator, &stats);
+            {
+                std::scoped_lock vma_lock{vma_mutex};
+                vmaCalculateStatistics(allocator, &stats);
+            }
             const VmaDetailedStatistics& total = stats.total;
             const VkDeviceSize blocks = total.statistics.blockBytes, used = total.statistics.allocationBytes;
             length += std::snprintf(line + length, sizeof(line) - static_cast<std::size_t>(length),
@@ -250,6 +273,7 @@ void __wrap_vmaDestroyAllocator(VmaAllocator vma) {
 
 VkResult __wrap_vmaCreateImage(VmaAllocator vma, const VkImageCreateInfo* ci, const VmaAllocationCreateInfo* aci,
                                VkImage* image, VmaAllocation* allocation, VmaAllocationInfo* info) {
+    const VmaCall vma_call;
     const VkResult result = __real_vmaCreateImage(vma, ci, aci, image, allocation, info);
     if (!Enabled() || ci == nullptr) return result;
     const Owner owner = ClassifyImage(ci->usage, static_cast<std::uint32_t>(ci->format));
@@ -279,6 +303,7 @@ static void BufferResult(VmaAllocator vma, const VkBufferCreateInfo* ci, const V
 
 VkResult __wrap_vmaCreateBuffer(VmaAllocator vma, const VkBufferCreateInfo* ci, const VmaAllocationCreateInfo* aci,
                                 VkBuffer* buffer, VmaAllocation* allocation, VmaAllocationInfo* info) {
+    const VmaCall vma_call;
     const VkResult result = __real_vmaCreateBuffer(vma, ci, aci, buffer, allocation, info);
     BufferResult(vma, ci, aci, result, allocation, info);
     return result;
@@ -287,6 +312,7 @@ VkResult __wrap_vmaCreateBuffer(VmaAllocator vma, const VkBufferCreateInfo* ci, 
 VkResult __wrap_vmaCreateBufferWithAlignment(VmaAllocator vma, const VkBufferCreateInfo* ci,
                                              const VmaAllocationCreateInfo* aci, VkDeviceSize alignment,
                                              VkBuffer* buffer, VmaAllocation* allocation, VmaAllocationInfo* info) {
+    const VmaCall vma_call;
     const VkResult result = __real_vmaCreateBufferWithAlignment(vma, ci, aci, alignment, buffer, allocation, info);
     BufferResult(vma, ci, aci, result, allocation, info);
     return result;
@@ -305,6 +331,7 @@ static void MemoryResult(VmaAllocator vma, Owner owner, VkResult result, VkDevic
 
 VkResult __wrap_vmaAllocateMemory(VmaAllocator vma, const VkMemoryRequirements* reqs, const VmaAllocationCreateInfo* aci,
                                   VmaAllocation* allocation, VmaAllocationInfo* info) {
+    const VmaCall vma_call;
     const VkResult result = __real_vmaAllocateMemory(vma, reqs, aci, allocation, info);
     MemoryResult(vma, Owner::MemRaw, result, reqs != nullptr ? reqs->size : 0, allocation, info);
     return result;
@@ -312,6 +339,7 @@ VkResult __wrap_vmaAllocateMemory(VmaAllocator vma, const VkMemoryRequirements* 
 
 VkResult __wrap_vmaAllocateMemoryForBuffer(VmaAllocator vma, VkBuffer buffer, const VmaAllocationCreateInfo* aci,
                                            VmaAllocation* allocation, VmaAllocationInfo* info) {
+    const VmaCall vma_call;
     const VkResult result = __real_vmaAllocateMemoryForBuffer(vma, buffer, aci, allocation, info);
     MemoryResult(vma, Owner::MemBuffer, result, 0, allocation, info);
     return result;
@@ -319,22 +347,26 @@ VkResult __wrap_vmaAllocateMemoryForBuffer(VmaAllocator vma, VkBuffer buffer, co
 
 VkResult __wrap_vmaAllocateMemoryForImage(VmaAllocator vma, VkImage image, const VmaAllocationCreateInfo* aci,
                                           VmaAllocation* allocation, VmaAllocationInfo* info) {
+    const VmaCall vma_call;
     const VkResult result = __real_vmaAllocateMemoryForImage(vma, image, aci, allocation, info);
     MemoryResult(vma, Owner::MemImage, result, 0, allocation, info);
     return result;
 }
 
 void __wrap_vmaDestroyImage(VmaAllocator vma, VkImage image, VmaAllocation allocation) {
+    const VmaCall vma_call;
     if (Enabled()) Released(vma, allocation);
     __real_vmaDestroyImage(vma, image, allocation);
 }
 
 void __wrap_vmaDestroyBuffer(VmaAllocator vma, VkBuffer buffer, VmaAllocation allocation) {
+    const VmaCall vma_call;
     if (Enabled()) Released(vma, allocation);
     __real_vmaDestroyBuffer(vma, buffer, allocation);
 }
 
 void __wrap_vmaFreeMemory(VmaAllocator vma, VmaAllocation allocation) {
+    const VmaCall vma_call;
     if (Enabled()) Released(vma, allocation);
     __real_vmaFreeMemory(vma, allocation);
 }

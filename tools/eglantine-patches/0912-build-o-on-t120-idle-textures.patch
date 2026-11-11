@@ -33,13 +33,13 @@ diff --git a/src/shader_recompiler/object_pool.h b/src/shader_recompiler/object_
 diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
 --- a/src/video_core/buffer_cache/buffer_cache.h
 +++ b/src/video_core/buffer_cache/buffer_cache.h
-@@ -155,6 +155,100 @@
+@@ -155,9 +155,103 @@
  template <class P>
  void BufferCache<P>::ReleaseFinished() {
      delayed_destruction_ring.Clear();
 +    pending_destroy.Clear();
-+}
-+
+ }
+ 
 +// EDEN_NX2_BC_PENDING_MIB=<MiB> (unset or 0: off, as before): a deleted buffer keeps its memory for
 +// 8 frames (delayed_destruction_ring), and every buffer that grows leaves its old copy there. At
 +// Ocarina of Time's Castle Town gate (crash-20261110-190821, base PS5 13.60) GPU-only buffers went
@@ -54,7 +54,7 @@ diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_
 +// alone (crash-20261110-192152) about 1000 images, 486 MiB, were destroyed in one go a second
 +// after the first refusal at the gate. The wait and the destruction are the same call, so either
 +// limit being reached releases both.
-+template <class P>
+ template <class P>
 +void BufferCache<P>::ReleasePendingBuffers() {
 +    static const u64 limit = [] {
 +        const char* const value = std::getenv("EDEN_NX2_BC_PENDING_MIB");
@@ -131,9 +131,12 @@ diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_
 +                         static_cast<unsigned long long>(images_left >> 20));
 +        }
 +    }
- }
- 
- template <class P>
++}
++
++template <class P>
+ void BufferCache<P>::TickFrame() {
+     // Homebrew console apps don't create or bind any channels, so this will be nullptr.
+     if (!channel_state) {
 @@ -265,6 +359,7 @@
      }
      ++frame_tick;
@@ -172,15 +175,15 @@ diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/bu
  #include "video_core/delayed_destruction_ring.h"
  #include "video_core/dirty_flags.h"
  #include "video_core/engines/maxwell_3d.h"
-@@ -269,6 +270,8 @@
-     /// Destroys the buffers waiting for their frames. The caller holds mutex and has waited for the
+@@ -270,6 +271,8 @@
      /// GPU.
      void ReleaseFinished();
-+
-+    void ReleasePendingBuffers();
  
++    void ReleasePendingBuffers();
++
      /// write_mark_limit: EDEN_UP_FRITCHII_WRITEMARK's mark, spread over the segments in order.
      bool BindMultiRangeStorage(const Binding& binding, bool is_written,
+                                std::span<const MultiRangeSegment> pool,
 @@ -978,6 +981,13 @@
      static constexpr size_t TICKS_TO_DESTROY = 8;
  #endif
@@ -274,7 +277,7 @@ diff --git a/src/video_core/renderer_vulkan/pipeline_memory_gate.h b/src/video_c
 new file mode 100644
 --- /dev/null
 +++ b/src/video_core/renderer_vulkan/pipeline_memory_gate.h
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,98 @@
 +// SPDX-License-Identifier: GPL-3.0-or-later
 +// EglantinePS5: pipeline builds take turns while memory is short (EDEN_PIPELINE_MEMORY_GATE_MIB).
 +//
@@ -287,6 +290,12 @@ new file mode 100644
 +// again, or its wait reaches the limit (then it goes ahead: a build is never refused here). Over
 +// the mark nothing changes. Every build leaves the gate when it ends, by any path.
 +//
++// A build has two parts that may run on different threads: the shader translation, in
++// PipelineCache::Create*Pipeline, and the driver's compile, in the work the pipeline's constructor
++// queues to a builder thread (or runs itself when there is none). Each part takes the gate where
++// it runs. A thread that is already inside does not take it again (the compile run inline under
++// the translation's gate), so a build never waits for itself.
++//
 +// Header only and free of Vulkan, so tools/test-pipeline-memory-gate.cpp tests it on any host.
 +#pragma once
 +
@@ -297,15 +306,20 @@ new file mode 100644
 +
 +namespace Vulkan::PipelineMemoryGate {
 +
++// Whether this thread is inside a gate now.
++inline thread_local bool inside_this_thread = false;
++
 +struct Counters {
-+    std::atomic<std::uint64_t> builds{0};   // builds that passed the gate
-+    std::atomic<std::uint64_t> waited{0};   // of them, builds that had to wait
++    std::atomic<std::uint64_t> builds{0};   // passes through the gate (a build's translation and
++                                            // its compile on another thread are one pass each)
++    std::atomic<std::uint64_t> waited{0};   // of them, passes that had to wait
 +    std::atomic<std::uint64_t> wait_us{0};  // total time they waited
 +    std::atomic<std::uint64_t> timeouts{0}; // waits that reached the limit
 +    std::atomic<std::uint32_t> running{0};  // builds inside the gate now
 +};
 +
-+// free_bytes(): the pool's largest free block in bytes, 0 when unknown (the gate then never waits).
++// free_bytes(): the pool's largest free block in bytes, 0 when unknown (the gate then never waits;
++// an empty pool is not unknown and must read as a small number, see headless/pool_free_value.h).
 +// mark: under this, builds take turns. limit: the longest a build waits. poll: between looks.
 +template <typename FreeBytes>
 +class Gate {
@@ -313,10 +327,11 @@ new file mode 100644
 +    Gate(Counters& counters, FreeBytes free_bytes, std::uint64_t mark, std::chrono::microseconds limit,
 +         std::chrono::microseconds poll = std::chrono::microseconds{2000})
 +        : counters_{counters} {
-+        if (mark == 0) {
++        if (mark == 0 || inside_this_thread) {
 +            entered_ = false;
 +            return;
 +        }
++        inside_this_thread = true;
 +        const auto start = std::chrono::steady_clock::now();
 +        bool waited = false;
 +        for (;;) {
@@ -347,7 +362,10 @@ new file mode 100644
 +        }
 +    }
 +    ~Gate() {
-+        if (entered_) counters_.running.fetch_sub(1, std::memory_order_acq_rel);
++        if (entered_) {
++            counters_.running.fetch_sub(1, std::memory_order_acq_rel);
++            inside_this_thread = false;
++        }
 +    }
 +    Gate(const Gate&) = delete;
 +    Gate& operator=(const Gate&) = delete;
@@ -358,15 +376,75 @@ new file mode 100644
 +};
 +
 +} // namespace Vulkan::PipelineMemoryGate
+diff --git a/src/video_core/renderer_vulkan/pipeline_memory_gate_live.h b/src/video_core/renderer_vulkan/pipeline_memory_gate_live.h
+new file mode 100644
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/pipeline_memory_gate_live.h
+@@ -0,0 +1,57 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// EglantinePS5: the one pipeline memory gate of the process (pipeline_memory_gate.h), with its
++// settings and counters, for every place a pipeline build runs: the shader translation in
++// vk_pipeline_cache.cpp and the driver compiles queued by vk_graphics_pipeline.cpp and
++// vk_compute_pipeline.cpp.
++//
++// EDEN_PIPELINE_MEMORY_GATE_MIB=<n> (off unless set): while the pool's largest free block is under
++// n MiB, pipeline builds take turns. EDEN_PIPELINE_MEMORY_GATE_MS=<ms> (default 2000): the longest
++// one waits before it goes ahead anyway.
++#pragma once
++
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++
++#include "video_core/renderer_vulkan/pipeline_memory_gate.h"
++
++// headless/performance.cpp: the largest free block of the pool the CPU shares with the GPU, in
++// bytes; 0 when unknown, 1 when the pool has nothing free. Weak: without it the gate never waits.
++extern "C" unsigned long long eden_pool_largest_free(void) __attribute__((weak));
++
++namespace Vulkan::PipelineMemoryGate {
++
++struct Settings {
++    std::uint64_t mark{};
++    std::chrono::microseconds limit{};
++};
++
++inline Counters& LiveCounters() {
++    static Counters counters;
++    return counters;
++}
++
++inline std::uint64_t LiveFree() {
++    return eden_pool_largest_free ? eden_pool_largest_free() : 0;
++}
++
++inline const Settings& LiveSettings() {
++    static const Settings settings = [] {
++        Settings result{};
++        if (const char* const mib = std::getenv("EDEN_PIPELINE_MEMORY_GATE_MIB")) {
++            result.mark = std::strtoull(mib, nullptr, 10) << 20;
++        }
++        const char* const ms = std::getenv("EDEN_PIPELINE_MEMORY_GATE_MS");
++        result.limit = std::chrono::milliseconds{ms != nullptr ? std::strtoull(ms, nullptr, 10) : 2000ULL};
++        return result;
++    }();
++    return settings;
++}
++
++// Held for as long as it lives. Off (no mark set) it does nothing.
++class LiveGate : public Gate<std::uint64_t (*)()> {
++public:
++    LiveGate() : Gate{LiveCounters(), &LiveFree, LiveSettings().mark, LiveSettings().limit} {}
++};
++
++} // namespace Vulkan::PipelineMemoryGate
 diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
 --- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
 +++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
-@@ -135,6 +135,16 @@
-     void SetReleaseHook(void (*hook)(void* context), void* context) noexcept {
-         release_hook = hook;
+@@ -137,6 +137,16 @@
          release_context = context;
-+    }
-+
+     }
+ 
 +    /// Device memory of deleted images that ReleaseForBuffer would give back (the texture cache's,
 +    /// through the rasterizer). Only read where ReleaseForBuffer may be called.
 +    [[nodiscard]] u64 PendingImageBytes() const {
@@ -375,9 +453,11 @@ diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/r
 +
 +    void SetPendingImagesHook(u64 (*hook)(void* context)) noexcept {
 +        pending_images_hook = hook;
-     }
- 
++    }
++
      /// Returns the mask of bindings whose repacked state changed.
+     u32 SetVertexRepackLayout(const Tegra::Engines::Maxwell3D::Regs& regs, bool dynamic_input);
+ 
 @@ -358,6 +368,7 @@
      vk::Buffer null_buffer;
  
@@ -386,10 +466,30 @@ diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/r
      void* release_context = nullptr;
  
      std::unique_ptr<Uint8Pass> uint8_pass;
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -11,6 +11,7 @@
+ #include <fmt/format.h>
+ 
+ #include "video_core/renderer_vulkan/pipeline_helper.h"
++#include "video_core/renderer_vulkan/pipeline_memory_gate_live.h"
+ #include "video_core/renderer_vulkan/pipeline_statistics.h"
+ #include "video_core/renderer_vulkan/vk_buffer_cache.h"
+ #include "video_core/renderer_vulkan/vk_driver_build_report.h"
+@@ -83,6 +84,8 @@
+     }
+ 
+     auto func{[this, shader_notify, pipeline_statistics] {
++        // The driver's compile, on whichever thread runs this work (pipeline_memory_gate.h).
++        const PipelineMemoryGate::LiveGate memory_gate;
+         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+             .pNext = nullptr,
 diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 --- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
 +++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
-@@ -12,6 +12,12 @@
+@@ -12,6 +12,13 @@
  #include <iostream>
  #include <optional>
  #include <span>
@@ -399,10 +499,11 @@ diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video
 +#include <thread>
 +#include "common/pe_switch.h"
 +#endif
++#include "video_core/renderer_vulkan/pipeline_memory_gate_live.h"
  
  #include <boost/container/small_vector.hpp>
  #include <boost/container/static_vector.hpp>
-@@ -48,6 +54,12 @@
+@@ -48,6 +55,12 @@
  #define LAMBDA_FORCEINLINE [[msvc::forceinline]]
  #else
  #define LAMBDA_FORCEINLINE
@@ -415,13 +516,16 @@ diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video
  #endif
  
  namespace Vulkan {
-@@ -485,11 +497,12 @@
+@@ -485,11 +498,15 @@
          }
      }
  
 -    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics] {
 +    auto func{[this, shader_notify, &render_pass_cache, pipeline_statistics,
 +               on_worker = worker_thread != nullptr] {
++        // The driver's compile, on whichever thread runs this work: a builder thread long after
++        // CreateGraphicsPipeline left its own gate, or that same thread, still inside it.
++        const PipelineMemoryGate::LiveGate memory_gate;
          const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state, device))};
          Validate();
          try {
@@ -430,7 +534,7 @@ diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video
              if (RunsMeshAsCompute()) {
                  MakeMeshComputePipelines();
              }
-@@ -1331,7 +1344,7 @@
+@@ -1331,7 +1348,7 @@
      return true;
  }
  
@@ -439,7 +543,7 @@ diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video
      FixedPipelineState::DynamicState dynamic{};
      if (!key.state.extended_dynamic_state) {
          dynamic = key.state.dynamic_state;
-@@ -1776,8 +1789,7 @@
+@@ -1776,8 +1793,7 @@
          flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
      }
  
@@ -449,7 +553,7 @@ diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video
          .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
          .pNext = nullptr,
          .flags = flags,
-@@ -1797,8 +1809,51 @@
+@@ -1797,8 +1813,51 @@
          .subpass = 0,
          .basePipelineHandle = nullptr,
          .basePipelineIndex = 0,
@@ -522,45 +626,30 @@ diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_co
  #include "shader_recompiler/ir_opt/compose_guard.h"
  #include "shader_recompiler/ir_opt/oot_visual_workaround.h"
  #include "shader_recompiler/program_header.h"
-+#include "video_core/renderer_vulkan/pipeline_memory_gate.h"
++#include "video_core/renderer_vulkan/pipeline_memory_gate_live.h"
  #include "video_core/engines/kepler_compute.h"
  #include "video_core/engines/maxwell_3d.h"
  #include <unordered_set>
-@@ -412,6 +413,54 @@
+@@ -412,6 +413,39 @@
  // VK_ERROR_OUT_OF_HOST_MEMORY, Ocarina on 13.60 with the shared pool empty, crash-20261109-121818).
  // Like a std::bad_alloc here: this pipeline fails, its draws are dropped, and the session goes on.
  // Any other Vulkan error still ends the session.
-+// headless/performance.cpp: the largest free block of the pool the CPU shares with the GPU, in
-+// bytes, 0 when unknown. Weak: without it the gate below never waits.
-+extern "C" unsigned long long eden_pool_largest_free(void) __attribute__((weak));
-+
-+// EDEN_PIPELINE_MEMORY_GATE_MIB=<n> (off unless set): while the pool's largest free block is under
-+// n MiB, pipeline builds take turns (pipeline_memory_gate.h). EDEN_PIPELINE_MEMORY_GATE_MS=<ms>
-+// (default 2000): the longest one waits before it goes ahead anyway.
-+PipelineMemoryGate::Counters pipeline_gate_counters;
-+std::uint64_t PipelineGateFree() {
-+    return eden_pool_largest_free ? eden_pool_largest_free() : 0;
-+}
-+struct PipelineGateSettings {
-+    std::uint64_t mark{};
-+    std::chrono::microseconds limit{};
-+};
-+const PipelineGateSettings& PipelineGate() {
-+    static const PipelineGateSettings settings = [] {
-+        PipelineGateSettings result{};
-+        if (const char* const mib = std::getenv("EDEN_PIPELINE_MEMORY_GATE_MIB")) {
-+            result.mark = std::strtoull(mib, nullptr, 10) << 20;
-+        }
-+        const char* const ms = std::getenv("EDEN_PIPELINE_MEMORY_GATE_MS");
-+        result.limit = std::chrono::milliseconds{ms != nullptr ? std::strtoull(ms, nullptr, 10) : 2000ULL};
-+        if (result.mark != 0) {
++// The pipeline memory gate (pipeline_memory_gate_live.h): its counters, and one line at the first
++// build that says it is on. The translation takes the gate in Create*Pipeline below; the driver
++// compile takes it in the work the pipeline queues (vk_graphics_pipeline.cpp,
++// vk_compute_pipeline.cpp), which runs on a builder thread after Create*Pipeline has returned.
++PipelineMemoryGate::Counters& pipeline_gate_counters = PipelineMemoryGate::LiveCounters();
++void AnnouncePipelineGate() {
++    static const bool announced = [] {
++        const PipelineMemoryGate::Settings& settings = PipelineMemoryGate::LiveSettings();
++        if (settings.mark != 0) {
 +            LOG_INFO(Render_Vulkan, "EDEN_PIPELINE_MEMORY_GATE: builds take turns under {} MiB free, "
 +                                    "waiting at most {} ms",
-+                     result.mark >> 20, result.limit.count() / 1000);
++                     settings.mark >> 20, settings.limit.count() / 1000);
 +        }
-+        return result;
++        return true;
 +    }();
-+    return settings;
++    static_cast<void>(announced);
 +}
 +// A line when the waits grew by 32 since the last one (and at the first): how many builds waited,
 +// for how long in all, and how many went ahead at the limit.
@@ -581,22 +670,22 @@ diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_co
  bool SurviveDriverOutOfMemory(const vk::Exception& exception, const char* where) {
      const VkResult result = exception.GetResult();
      if (result != VK_ERROR_OUT_OF_HOST_MEMORY && result != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
-@@ -2428,6 +2477,9 @@
+@@ -2428,6 +2462,9 @@
      ShaderPools& pools, const GraphicsPipelineCacheKey& key,
      std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
      bool build_in_parallel, ShaderPrep::Stages* kept_out) try {
-+    const PipelineMemoryGate::Gate memory_gate{pipeline_gate_counters, &PipelineGateFree, PipelineGate().mark,
-+                                               PipelineGate().limit};
++    AnnouncePipelineGate();
++    const PipelineMemoryGate::LiveGate memory_gate;
 +    ReportPipelineGate();
      auto hash = key.Hash();
      LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
      size_t env_index{0};
-@@ -3596,6 +3648,9 @@
+@@ -3596,6 +3633,9 @@
  std::unique_ptr<ComputePipeline> PipelineCache::CreateComputePipeline(
      ShaderPools& pools, const ComputePipelineCacheKey& key, Shader::Environment& env,
      PipelineStatistics* statistics, bool build_in_parallel) try {
-+    const PipelineMemoryGate::Gate memory_gate{pipeline_gate_counters, &PipelineGateFree, PipelineGate().mark,
-+                                               PipelineGate().limit};
++    AnnouncePipelineGate();
++    const PipelineMemoryGate::LiveGate memory_gate;
 +    ReportPipelineGate();
      auto hash = key.Hash();
      if (device.HasBrokenCompute()) {
@@ -617,17 +706,18 @@ diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/r
 diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
 --- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
 +++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
-@@ -5411,10 +5411,25 @@
+@@ -5410,11 +5410,26 @@
+     if (wait_for_memory && staging_buffer_pool.RefusedJustNow()) {
          upload_refused = true;
          return;
-     }
++    }
 +    // A single scratch image and BC buffer are reused for the layer batches.
 +    static const bool batch_layers = Common::PeSwitch("EDEN_NX2_TRANSCODE_BATCH_LAYERS");
 +    u64 layer_decode_bytes = 0;
 +    for (u32 level = 0; level < levels; ++level) {
 +        layer_decode_bytes += u64{(std::max)(width >> level, 1U)} *
 +                              (std::max)(height >> level, 1U) * 4;
-+    }
+     }
 +    const bool aligned_layers = info.layer_stride % device.GetStorageBufferAlignment() == 0;
 +    const u32 batch = batch_layers && layers > 1 && info.layer_stride != 0 && aligned_layers &&
 +                              info.num_samples == 1 && layer_decode_bytes != 0 &&
@@ -720,6 +810,9 @@ diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_cor
 -                .base_level = static_cast<s32>(level),
 -                .base_layer = 0,
 -                .num_layers = static_cast<s32>(layers),
+-            },
+-            .image_offset{0, 0, 0},
+-            .image_extent{level_width, level_height, 1},
 +    std::optional<StagingBufferRef> output;
 +    VideoCommon::ImageInfo batch_info = info;
 +    for (u32 first = 0; first < layers; first += batch) {
@@ -795,9 +888,7 @@ diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_cor
 +                .initialized = first != 0,
 +                .level_view = [&pending](s32 level) { return *pending.views[level]; },
 +                .wait = true,
-             },
--            .image_offset{0, 0, 0},
--            .image_extent{level_width, level_height, 1},
++            },
 +            input, swizzles);
 +        if (split) {
 +            // AssembleInto may submit. Keep both staging buffers busy until the last batch.
@@ -840,7 +931,8 @@ diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_cor
 -        pending_transcodes.emplace_back(std::move(pending));
 -        upload_refused = true;
 -        return;
--    }
++        image.UploadMemory(output->buffer, output->offset, copies);
+     }
 -    for (u32 level = 0; level < levels; ++level) {
 -        bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
 -                                copies[level].image_extent.height, layers, bc3, output->buffer,
@@ -857,8 +949,6 @@ diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_cor
 -                               0, barrier);
 -    });
 -    image.UploadMemory(output->buffer, output->offset, copies);
-+        image.UploadMemory(output->buffer, output->offset, copies);
-+    }
      pending.tick = scheduler.CurrentTick();
      pending_transcodes.push_back(std::move(pending));
  }
@@ -917,7 +1007,7 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
              return false;
          }
          if (IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap)) {
-@@ -1349,8 +1355,21 @@
+@@ -1349,9 +1355,24 @@
      if (pe_busy) Eden::AstcPolicy::Frame();
      // EDEN_UP_HITCH_TRACE: the frame that just ended, when it was long.
      HitchTrace::EndFrame(frame_tick);
@@ -929,8 +1019,10 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
 +    static const bool idle_pressure_enabled = Common::PeSwitch("EDEN_NX2_IDLE_TEXTURE_PRESSURE");
 +    if (idle_pressure_enabled && eden_pool_largest_free && now >= idle_pressure_next) {
 +        idle_pressure_next = now + std::chrono::milliseconds(250);
-+        idle_pressure = eden_pool_largest_free() < 1024_MiB;
-+    }
++        // 0 is "unknown" (the query failed), not "empty": no pressure sweep on a guess.
++        const u64 pool_free = eden_pool_largest_free();
++        idle_pressure = pool_free != 0 && pool_free < 1024_MiB;
+     }
 +#endif
 +    if (CleanByTime() || RefusalEvictEnabled()
 +#ifdef PS5_NATIVE
@@ -938,10 +1030,11 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
 +#endif
 +    ) {
 +        frame_clock.EndFrame(frame_tick, now);
-     }
++    }
      // Upload buffers grown for one huge image (title 1's 341 MiB terrain layer pools) are freed
      // rather than kept for the rest of the session.
-@@ -1568,6 +1587,66 @@
+     // EDEN_TC_SCRATCH_KEEP_MIB=<0..64>: keep less of each between frames. A frame that needs more
+@@ -1568,6 +1589,78 @@
          gc_deletes = gc_costly_deletes = gc_download_deletes = async_decodes_queued = 0;
          images_created = images_deleted = 0;
      }
@@ -973,6 +1066,16 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
 +                       std::ranges::find(render_targets.color_buffer_ids, view) !=
 +                           render_targets.color_buffer_ids.end();
 +            });
++            // What the guest reads back is never deleted without a download, however unused it
++            // looks here: the same three signs the cold collector keeps GPU-written images by
++            // (a relocation guard noted, downloaded at fences, downloaded once already). Such a
++            // target leaves the queue for good (Vampinity's review of 0912, issue 21).
++            if (image.relocation_guard_noted != 0 || image.info.forced_flushed ||
++                image.info.dma_downloaded) {
++                image.flags &= ~ImageFlagBits::TransientTarget;
++                ++transient_kept_read;
++                continue;
++            }
 +            const u64 last_use = image.lru_index != SIZE_MAX ? lru_cache.Tick(image.lru_index) : frame_tick;
 +            if (frame_tick - last_use < rt_evict || bound ||
 +                True(image.flags & ImageFlagBits::IsDecoding) ||
@@ -1001,14 +1104,16 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
 +                                transient_targets.begin() + (transient_targets.size() - 8192));
 +    }
 +    if (frame_tick % 600 == 0 && transient_evictions != logged_transient_evictions) {
-+        LOG_INFO(HW_GPU, "RT evict: {} unused fresh render targets deleted early so far ({} MiB), {} waiting",
-+                 transient_evictions, transient_evicted_bytes >> 20, transient_targets.size());
++        LOG_INFO(HW_GPU, "RT evict: {} unused fresh render targets deleted early so far ({} MiB), {} waiting, "
++                         "{} kept because the guest reads them back",
++                 transient_evictions, transient_evicted_bytes >> 20, transient_targets.size(),
++                 transient_kept_read);
 +        logged_transient_evictions = transient_evictions;
 +    }
      // EDEN_UP_FRITCHII_CHURN=1 (Fritchii dcbd696438): what the caches made and destroyed.
      if (Churn::Enabled() && frame_tick % 600 == 0) {
          const auto churn = Churn::Take();
-@@ -1615,6 +1694,12 @@
+@@ -1615,6 +1708,12 @@
              RefusalDownloadEvict();
          }
          refusal_evicts_this_frame = 0;
@@ -1021,7 +1126,7 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
      }
      if (MemoryCensus::Enabled()) {
          CensusTick();
-@@ -4364,9 +4449,18 @@
+@@ -4364,9 +4463,18 @@
      return found(*std::ranges::max_element(image_ids, image_ids_compare));
  }
  
@@ -1041,7 +1146,7 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
          return false;
      }
      if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
-@@ -5225,7 +5319,7 @@
+@@ -5225,7 +5333,7 @@
      ForEachSparseImageInRegion(channel_state->gpu_memory.GetID(), gpu_addr, size_bytes,
                                 region_check_gpu);
  
@@ -1050,7 +1155,7 @@ diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/textu
      bool any_rescaled = false;
      for (const auto& copy : join_copies_to_do) {
          if (!can_rescale) {
-@@ -6076,6 +6170,21 @@
+@@ -6076,6 +6184,21 @@
          return ImageViewId{};
      }
      Image& image = slot_images[image_id];
@@ -1107,7 +1212,7 @@ diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/
  
      /// EDEN_NX2_REFUSAL_EVICT=1, at the end of a frame after RefusalEvict passed GPU-written
      /// images over: copies back and deletes up to 8 of them, each up to 32 MiB and 64 MiB in all,
-@@ -1040,6 +1049,29 @@
+@@ -1040,6 +1049,31 @@
  
      std::vector<PendingDownload> uncommitted_downloads;
      std::deque<std::vector<PendingDownload>> committed_downloads;
@@ -1116,7 +1221,8 @@ diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/
 +    /// Lichii#1023): a render target the GPU never wrote starts undefined instead of loading the
 +    /// guest memory under it, and is queued. While the cache is over its expected size, a queued
 +    /// target unused for that many frames is deleted without a download; one still in use is
-+    /// checked again, up to 4 times, then counts as lasting.
++    /// checked again, up to 4 times, then counts as lasting. A target the guest reads back
++    /// (relocation guard noted, forced_flushed, dma_downloaded) is never deleted this way.
 +    struct TransientTarget {
 +        ImageId id;
 +        u64 allocation_tick;
@@ -1126,6 +1232,7 @@ diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/
 +    std::deque<TransientTarget> transient_targets;
 +    u64 transient_evictions{};
 +    u64 transient_evicted_bytes{};
++    u64 transient_kept_read{};
 +    u64 logged_transient_evictions{};
 +    [[nodiscard]] static u64 RtEvictPressureFrames() {
 +        static const u64 frames = [] {
