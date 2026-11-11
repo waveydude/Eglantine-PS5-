@@ -1,0 +1,46 @@
+Subject: [PATCH] Scan ASTC opacity with fixed-size scratch
+
+The Kokiri return crash 20261111-095523 hit operator new while JoinImages
+grew its full-texture opacity scratch to 32,435,200 bytes. ASTC opacity
+is decided independently per 16-byte block. Reuse 16 KiB and stop at
+the first block that requires alpha.
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -5424,12 +5424,17 @@
+         if (IsPixelFormatASTC(new_info.format) && runtime.UseOpaqueAstcFormat()) {
+             const size_t scan_bytes = CalculateGuestSizeInBytes(new_info);
+             if (scan_bytes <= MaxScanBytes) {
+-                astc_scan_buffer.resize(scan_bytes);
+-                gpu_memory->ReadBlockUnsafe(gpu_addr, astc_scan_buffer.data(), scan_bytes);
+-                new_info.astc_opaque = AstcDataLooksOpaque(astc_scan_buffer);
+-                static const bool trim = Common::PeSwitch("EDEN_UP_HEAP_HOLDERS");
+-                if (trim && astc_scan_buffer.capacity() > (size_t{8} << 20)) {
+-                    std::vector<u8>{}.swap(astc_scan_buffer);
++                // ASTC blocks are 16 bytes and their opacity is independent. Scan whole blocks
++                // in bounded chunks so a large image cannot exhaust host heap scratch.
++                new_info.astc_opaque = true;
++                for (size_t offset = 0; offset < scan_bytes; offset += astc_scan_buffer.size()) {
++                    const size_t bytes = (std::min)(scan_bytes - offset, astc_scan_buffer.size());
++                    const auto chunk = std::span{astc_scan_buffer}.first(bytes);
++                    gpu_memory->ReadBlockUnsafe(gpu_addr + offset, chunk.data(), chunk.size());
++                    if (!AstcDataLooksOpaque(chunk)) {
++                        new_info.astc_opaque = false;
++                        break;
++                    }
+                 }
+                 ++(new_info.astc_opaque ? astc_opaque_images : astc_alpha_images);
+             }
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -250,7 +250,7 @@
+     u64 slack_margin{};           ///< Extra room for allocator block space the driver counts as used
+     u64 astc_opaque_images{};
+     u64 astc_alpha_images{};
+-    std::vector<u8> astc_scan_buffer;
++    std::array<u8, 16 * 1024> astc_scan_buffer;
+     u64 images_deleted{};
+     /// EDEN_UP_TC_TRACE (Lichii #1130): why the next DeleteImage happens, set by its caller;
+     /// DeleteImage reads it and puts back "other". Reasons that start with "gc" are collectors'.
