@@ -1853,4 +1853,28 @@ extern "C" std::uint64_t eden_radv_out_of_memory(std::uint64_t bytes) {
 }
 #endif
 
+#ifdef PS5_NATIVE
+extern "C" std::int64_t sceKernelGetDirectMemorySize();
+extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*,
+                                                           std::size_t*);
+// The largest free block of the pool in bytes, 0 when unknown, looked at again every 20 ms at most:
+// pipeline builds ask it before they start (core patch 0915, EDEN_PIPELINE_MEMORY_GATE_MIB), from
+// any builder thread. Only the kernel query and two atomics: no lock, no allocation, no log.
+extern "C" unsigned long long eden_pool_largest_free(void) {
+    static std::atomic<long long> checked_ns{0};
+    static std::atomic<unsigned long long> largest_seen{0};
+    const long long now = ::Eden::Performance::NowNs();
+    const long long last = checked_ns.load(std::memory_order_relaxed);
+    if (last != 0 && now - last < 20'000'000) return largest_seen.load(std::memory_order_relaxed);
+    checked_ns.store(now, std::memory_order_relaxed);
+    std::int64_t start = 0;
+    std::size_t largest = 0;
+    const std::int64_t total = sceKernelGetDirectMemorySize();
+    const unsigned long long value =
+        total > 0 && sceKernelAvailableDirectMemorySize(0, total, 0x4000, &start, &largest) == 0 ? largest : 0;
+    largest_seen.store(value, std::memory_order_relaxed);
+    return value;
+}
+#endif
+
 #include "ordered_read_trace.inc"
