@@ -29,6 +29,18 @@ extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 extern "C" size_t eden_heap_trim(void) __attribute__((weak));
 // headless/heap_pages.cpp (the native build only): the pool switches, read once env.txt is in.
 extern "C" void eden_heap_pool_init(void) __attribute__((weak));
+
+namespace {
+thread_local unsigned optional_allocation_depth{};
+}
+
+extern "C" void eden_optional_allocation_scope(bool enter) noexcept {
+    if (enter) {
+        ++optional_allocation_depth;
+    } else {
+        --optional_allocation_depth;
+    }
+}
 #endif
 #ifdef EDEN_DEV_VULKAN
 #include "sdk_audit.h"
@@ -338,6 +350,9 @@ int main(int argc, char** argv) {
                                   Eden::FileExists(std::string{folder} + "/ui/fonts/montserrat-medium.pefont") ? "yes" : "no");
         Eden::BootTrace::Line("app folder: %s", Eden::AppDir().c_str());
         std::set_new_handler([] {
+            if (optional_allocation_depth != 0) {
+                throw std::bad_alloc{};
+            }
             unsigned reason = 0;
             size_t count = 0;
             const size_t bytes = eden_heap_last_failure(&reason, &count);
