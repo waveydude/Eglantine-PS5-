@@ -1,0 +1,40 @@
+Subject: [PATCH] Keep large D16 targets native in reduced-resolution mode
+
+Build M's Town crash census recorded a 297 MiB native shadow map and a
+167 MiB target matching its 0.75x dimensions. Reject scaling through the
+normal render-target and alias checks for very large D16 images only.
+Off unless EDEN_NX2_NATIVE_LARGE_DEPTH is enabled.
+
+---
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -4045,9 +4045,18 @@
+     return found(*std::ranges::max_element(image_ids, image_ids_compare));
+ }
+ 
++// The original allocation stays live when a target is scaled. At 0.75x, Town's
++// 12288x12288 D16 shadow map gets a second 9216x9216 allocation.
++[[nodiscard]] inline bool KeepLargeDepthNative(const ImageInfo& info) {
++    static const bool enabled = Common::PeSwitch("EDEN_NX2_NATIVE_LARGE_DEPTH");
++    return enabled && Settings::values.resolution_info.downscale &&
++           info.format == VideoCore::Surface::PixelFormat::D16_UNORM &&
++           info.size.width >= 8192 && info.size.height >= 8192;
++}
++
+ template <class P>
+ bool TextureCache<P>::ImageCanRescale(ImageBase& image) {
+-    if (!image.info.rescaleable) {
++    if (!image.info.rescaleable || KeepLargeDepthNative(image.info)) {
+         return false;
+     }
+     if (Settings::values.resolution_info.downscale && !image.info.downscaleable) {
+@@ -4828,7 +4837,7 @@
+     ForEachSparseImageInRegion(channel_state->gpu_memory.GetID(), gpu_addr, size_bytes,
+                                region_check_gpu);
+ 
+-    bool can_rescale = info.rescaleable;
++    bool can_rescale = info.rescaleable && !KeepLargeDepthNative(new_info);
+     bool any_rescaled = false;
+     for (const auto& copy : join_copies_to_do) {
+         if (!can_rescale) {

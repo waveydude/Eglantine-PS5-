@@ -59,6 +59,11 @@ class Report(unittest.TestCase):
         # 120 s still had 400 MiB free; the pool first fell under 256 MiB at 150 s.
         self.assertEqual((steady.t, peak.t), (120, 150))
 
+    def test_logs_without_a_shortage_sample_keep_comparison_in_time_order(self):
+        self.session.samples[3].free = 500
+        steady, peak = memreport.steady_and_peak(self.session.samples)
+        self.assertEqual((steady.t, peak.t), (60, 120))
+
     def test_report_names_the_growth_and_the_gap(self):
         text = memreport.report(self.session)
         self.assertIn('| vulkan: rt_color | 300 | 1100 | +800 |', text)

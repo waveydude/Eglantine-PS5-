@@ -101,7 +101,74 @@ static void Threads() {
     CHECK(live == count * 4096);
 }
 
+static void Shapes() {
+    // Tags: the owner survives with a shape packed above it; pointers and null are not tags.
+    for (std::size_t i = 0; i < OwnerCount; ++i) {
+        for (const std::uint32_t shape : {0u, 1u, 255u, 256u, 1024u, 0xffffu}) {
+            Owner owner{};
+            void* const tag = TagOf(static_cast<Owner>(i), shape);
+            CHECK(OwnerOfTag(tag, &owner) && owner == static_cast<Owner>(i));
+            CHECK(ShapeOfTag(tag) == shape);
+        }
+    }
+    Owner owner{};
+    CHECK(!OwnerOfTag(nullptr, &owner));
+    CHECK(!OwnerOfTag(reinterpret_cast<void*>(std::uintptr_t{0x7f12345678}), &owner)); // a real pointer
+    CHECK(ShapeOfTag(reinterpret_cast<void*>(std::uintptr_t{0x7f12345678})) == 0);
+    CHECK(!OwnerOfTag(reinterpret_cast<void*>(std::uintptr_t{OwnerCount + 1}), &owner)); // past the last owner
+    CHECK(!OwnerOfTag(reinterpret_cast<void*>(std::uintptr_t{0x100}), &owner));        // a shape, no owner
+
+    ShapeTable table;
+    const Shape shadow{12288, 12288, 1, 1, 126, 1, Owner::RtDepth};
+    const Shape depth{1920, 1080, 1, 1, 130, 1, Owner::RtDepth};
+    const Shape colour{1920, 1080, 1, 1, 37, 1, Owner::RtColor};
+    const std::uint32_t shadow_id = table.Add(shadow, 288u << 20);
+    CHECK(shadow_id == 1 && table.Add(shadow, 288u << 20) == shadow_id); // same shape, same id
+    const std::uint32_t depth_id = table.Add(depth, 8u << 20);
+    const std::uint32_t colour_id = table.Add(colour, 8u << 20);
+    CHECK(depth_id == 2 && colour_id == 3); // same size and extent, another owner: its own row
+    for (int i = 0; i < 99; ++i) CHECK(table.Add(depth, 8u << 20) == depth_id);
+
+    ShapeTable::Row rows[6];
+    CHECK(table.Top(Owner::RtDepth, rows, 6) == 2);
+    CHECK(rows[0].shape == depth && rows[0].count == 100 && rows[0].bytes == (std::uint64_t{800} << 20));
+    CHECK(rows[1].shape == shadow && rows[1].count == 2 && rows[1].bytes == (std::uint64_t{576} << 20));
+    CHECK(table.Top(Owner::RtDepth, rows, 1) == 1 && rows[0].shape == depth); // only the largest fits
+    CHECK(table.Top(Owner::RtColor, rows, 6) == 1 && rows[0].shape == colour);
+    CHECK(table.Top(Owner::TexBlock, rows, 6) == 0);
+    CHECK(table.Top(Owner::RtDepth, rows, 0) == 0);
+
+    // Frees: counted down, never below zero, id 0 and unknown ids ignored, emptied rows not listed.
+    table.Free(shadow_id, 288u << 20);
+    table.Free(0, 1u << 30);
+    table.Free(999, 1u << 30);
+    CHECK(table.Top(Owner::RtDepth, rows, 6) == 2 && rows[1].count == 1 && rows[1].bytes == (std::uint64_t{288} << 20));
+    table.Free(shadow_id, 288u << 20);
+    table.Free(shadow_id, 288u << 20); // one free too many
+    CHECK(table.Top(Owner::RtDepth, rows, 6) == 1 && rows[0].shape == depth);
+    CHECK(table.Add(shadow, 288u << 20) == shadow_id); // an emptied shape keeps its id
+
+    // More than six: the six largest, in order, whatever order they came in.
+    ShapeTable many;
+    for (std::uint32_t i = 1; i <= 20; ++i) {
+        const std::uint32_t size = (i * 7) % 20 + 1; // a permutation of 1..20
+        CHECK(many.Add(Shape{size, size, 1, 1, 37, 1, Owner::RtColor}, std::uint64_t{size} << 20) == i);
+    }
+    CHECK(many.Top(Owner::RtColor, rows, 6) == 6);
+    for (std::uint32_t i = 0; i < 6; ++i) CHECK(rows[i].shape.width == 20 - i);
+
+    // Full: the 1025th shape is not counted and gets id 0; known shapes still count.
+    ShapeTable full;
+    for (std::uint32_t i = 0; i < ShapeTable::Capacity; ++i) {
+        CHECK(full.Add(Shape{i + 1, 1, 1, 1, 37, 1, Owner::RtColor}, 4096) == i + 1);
+    }
+    CHECK(full.Add(Shape{5000, 1, 1, 1, 37, 1, Owner::RtColor}, 4096) == 0);
+    CHECK(full.Add(Shape{7, 1, 1, 1, 37, 1, Owner::RtColor}, 4096) == 7);
+    CHECK(ShapeOfTag(TagOf(Owner::RtColor, ShapeTable::Capacity)) == ShapeTable::Capacity);
+}
+
 int main() {
+    Shapes();
     Classification();
     Tags();
     Accounting();
