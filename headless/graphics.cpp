@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstring>
 #include <time.h>
+#include "build_label.h"
 #include "hud.h"
 #include "network/network.h"
 #include "loading_scene_glsl.h"
@@ -664,7 +665,7 @@ void GraphicsWindow::OnFrameDisplayed() {
         vulkan_hud =
             MakeHudSnapshot(vulkan_hud_clock, vulkan_hud_output_clock, vulkan_hud_speed,
                             Eden::Display::output_millihertz.load(std::memory_order_relaxed) / 1000.0,
-                            RoomPingMilliseconds());
+                            RoomPingMilliseconds(), Eden::kBuildLabel);
 #endif
         ++frame_total;
         Eden::OrderedReadTrace::Frame(frame_total,

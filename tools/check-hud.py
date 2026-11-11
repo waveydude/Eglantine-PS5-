@@ -73,6 +73,24 @@ int main() {
     guest.worst_ms = 17;
     assert(std::string_view(Eden::FormatHudText(guest, shown, 100, "VLK", 59.94).data()) == "VLK F60 S100 W17");
     assert(Eden::MakeHudSnapshot(guest, shown, 100, 119.88).glyphs == Eden::HudText("VLK N60 F120 S100 W17"));
+    // The build label goes after the numbers, whole or not at all, and VLK stays where it is.
+    assert(Eden::MakeHudSnapshot(guest, shown, 100, 119.88, -1, "W-02").glyphs ==
+           Eden::HudText("VLK N60 F120 S100 W17 W-02"));
+    assert(Eden::MakeHudSnapshot(guest, shown, 100, 119.88, -1, "").glyphs ==
+           Eden::HudText("VLK N60 F120 S100 W17"));
+    {
+        std::array<char, 29> line{};
+        std::snprintf(line.data(), line.size(), "%s", "VLK N60 F120 S100 W17");  // 21 glyphs
+        Eden::AppendHudLabel(line, "W-0200");                                   // 21 + 1 + 6 = 28: fits
+        assert(std::string_view(line.data()) == "VLK N60 F120 S100 W17 W-0200");
+        std::snprintf(line.data(), line.size(), "%s", "VLK N60 F120 S100 W17");
+        Eden::AppendHudLabel(line, "W-02000");                                  // 29: left out whole
+        assert(std::string_view(line.data()) == "VLK N60 F120 S100 W17");
+        std::snprintf(line.data(), line.size(), "%s", "VLK N30 F60 S100 W33 P9999"); // with a room ping
+        Eden::AppendHudLabel(line, "W-02");                                     // 26 + 5 = 31: left out
+        assert(std::string_view(line.data()) == "VLK N30 F60 S100 W33 P9999");
+    }
+    for (const char c : std::string_view("W-02")) assert(Eden::HudGlyph(c) != 0);
     clock.fps = -1;
     assert(Eden::MakeHudSnapshot(clock, 0).glyphs == Eden::HudText("VLK F-- S-- W--"));
     clock.fps = 1000000;

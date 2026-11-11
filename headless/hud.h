@@ -201,9 +201,22 @@ inline std::array<char, 29> FormatHudText(const HudClock& clock, const HudClock&
     }
     return text;
 }
+// Adds " <label>" to the end of a HUD line when the whole label fits in the 28 glyphs the overlay
+// can draw; a label that does not fit is left out whole, so a cut label is never mistaken for
+// another build's.
+inline void AppendHudLabel(std::array<char, 29>& text, std::string_view label) {
+    const size_t length = std::string_view{text.data()}.size();
+    if (label.empty() || length + 1 + label.size() > text.size() - 1)
+        return;
+    text[length] = ' ';
+    label.copy(text.data() + length + 1, label.size());
+    text[length + 1 + label.size()] = '\0';
+}
 inline HudSnapshot MakeHudSnapshot(const HudClock& clock, const HudClock& output, double speed,
-                                   double refresh = 0, int ping_ms = -1) {
-    const auto text = FormatHudText(clock, output, speed, "VLK", refresh, ping_ms);
+                                   double refresh = 0, int ping_ms = -1,
+                                   std::string_view label = {}) {
+    auto text = FormatHudText(clock, output, speed, "VLK", refresh, ping_ms);
+    AppendHudLabel(text, label);
     const std::string_view value{text.data()};
     return {HudText(value), static_cast<uint32_t>(value.size() * 16 + 24)};
 }

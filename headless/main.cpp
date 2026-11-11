@@ -81,6 +81,7 @@ extern "C" void eden_optional_allocation_scope(bool enter) noexcept {
 #include "cache_budget.h"
 #include "performance.h"
 #include "memory_wait.h"
+#include "build_label.h"
 #include "crash_site.h"
 #include "core/memory.h"
 #include "video_core/dma_pusher.h"
@@ -282,6 +283,8 @@ int main(int argc, char** argv) {
         std::setvbuf(report, nullptr, _IONBF, 0);
 #ifdef PS5_NATIVE
         Eden::BootTrace::Begin(Eden::kAppVersion, __DATE__ " " __TIME__);
+        Eden::BootTrace::Line("build label %s", Eden::kBuildLabel);
+        std::printf("EDEN_BUILD_LABEL %s (%s)\n", Eden::kBuildLabel, __DATE__ " " __TIME__);
         // The PS5 keyboard's module, for a game's text entry: asked for before anything else
         // changes what the app may load (system_keyboard.h).
         Eden::BootTrace::Line("PS5 keyboard module: %#x", static_cast<unsigned>(Eden::PrepareSystemKeyboard()));
