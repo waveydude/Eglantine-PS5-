@@ -3,7 +3,7 @@
 #pragma once
 
 #ifndef EDEN_BUILD_LABEL
-#define EDEN_BUILD_LABEL "W-02"
+#define EDEN_BUILD_LABEL "W-03"
 #endif
 
 namespace Eden {

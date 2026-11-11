@@ -1,0 +1,120 @@
+Subject: [PATCH] Back off repeated texture upload refusals
+
+--- a/src/video_core/texture_cache/image_base.h
++++ b/src/video_core/texture_cache/image_base.h
+@@ -147,6 +147,8 @@
+     /// (raised when an alias's tick is set or an alias is added): SynchronizeAliases has nothing
+     /// to do while it is not newer. Never read with the switch off.
+     u64 newest_alias_tick = 0;
++    u64 upload_retry_frame = 0;
++    u32 upload_fail_count = 0;
+     size_t lru_index = SIZE_MAX;
+ 
+     /// EDEN_UP_FRITCHII_RELOCATE / _COLD (Fritchii c98e63520a): the frame the GPU last wrote the
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -306,6 +306,10 @@
+     /// the guest writes it again, and the session goes on. EDEN_NX2_BAD_ALLOC_ENDS=1 rethrows.
+     void KeepContentsAfterBadAlloc(Image& image);
+ 
++    /// Repeated upload failures exceeded max_retries: keeps existing contents until the CPU
++    /// modifies the image again, without throwing or rethrowing.
++    void KeepContentsFallback(Image& image);
++
+     /// UploadLayers found no staging buffer for all of `layers`: half as many at a time.
+     void UploadLayersInParts(Image& image, std::span<const u32> layers);
+ 
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2935,6 +2935,8 @@
+             MarkLayersWritten(image, cpu_addr, size);
+             return;
+         }
++        image.upload_fail_count = 0;
++        image.upload_retry_frame = 0;
+         if (True(image.flags & ImageFlagBits::CpuModified)) {
+             return;
+         }
+@@ -3089,6 +3091,8 @@
+         Image& image = slot_images[id];
+         if (False(image.flags & ImageFlagBits::CpuModified)) {
+             image.flags |= ImageFlagBits::CpuModified;
++            image.upload_fail_count = 0;
++            image.upload_retry_frame = 0;
+             if (True(image.flags & ImageFlagBits::Tracked)) {
+                 UntrackImage(image, id);
+             }
+@@ -3813,6 +3817,9 @@
+         // Only upload modified images
+         return;
+     }
++    if (image.upload_retry_frame > frame_tick) {
++        return;
++    }
+     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
+     HitchTrace::Op upload_trace{HitchTrace::Kind::ImageUpload, image.guest_size_bytes,
+                                 HitchTraceDesc(image.info, image.gpu_addr)};
+@@ -3925,6 +3932,7 @@
+     ++images_uploaded;
+     uploaded_bytes += image.guest_size_bytes;
+     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
++    image.upload_retry_frame = 0;
+     try {
+         if (!UploadInChunks(image)) {
+             if (auto staging = UploadStagingNow(runtime, MapSizeBytes(image))) {
+@@ -3936,11 +3944,17 @@
+                 if (refused) {
+                     UploadLater(image);
+                 } else {
++                    image.upload_fail_count = 0;
++                    image.upload_retry_frame = 0;
+                     runtime.InsertUploadMemoryBarrier();
+                 }
+             } else if (!UploadInChunks(image, 0)) {
+                 UploadLater(image);
+-            }
++            } else if (image.upload_retry_frame == 0) {
++                image.upload_fail_count = 0;
++            }
++        } else if (image.upload_retry_frame == 0) {
++            image.upload_fail_count = 0;
+         }
+     } catch (const std::bad_alloc&) {
+         // No memory for one image's unswizzle or conversion scratch (tens of MiB in one piece, on
+@@ -3985,6 +3999,26 @@
+                             "its upload waits for its next use",
+                     image.gpu_addr, MapSizeBytes(image), times);
+     }
++    ++image.upload_fail_count;
++    static const u32 max_retries = [] {
++        const char* const env = std::getenv("EDEN_NX2_UPLOAD_MAX_RETRIES");
++        return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 8U;
++    }();
++    if (image.upload_fail_count >= max_retries) {
++        if (const char* value = std::getenv("EDEN_NX2_BAD_ALLOC_ENDS"); value && value[0] == '1') {
++            throw std::bad_alloc{};
++        }
++        LOG_ERROR(HW_GPU, "Repeated upload failures for image at {:#x}: keeping existing contents",
++                  image.gpu_addr);
++        image.flags &= ~ImageFlagBits::CpuModified;
++        runtime.TransitionImageLayout(image);
++        VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Invalidation);
++        image.upload_fail_count = 0;
++        image.upload_retry_frame = 0;
++        return;
++    }
++    const u64 backoff_frames = std::min<u64>(u64{1} << std::min<u32>(image.upload_fail_count + 2, 7), 128);
++    image.upload_retry_frame = frame_tick + backoff_frames;
+     image.flags |= ImageFlagBits::CpuModified;
+     runtime.TransitionImageLayout(image);
+     // EDEN_UP_FAST_DRAW: the next draw that samples it uploads it, as without fast draws.
+@@ -4027,8 +4061,7 @@
+                 chunk_size /= 2;
+                 continue;
+             }
+-            UploadLater(image);
+-            break;
++            return false;
+         }
+         // UploadMemory marks the image initialized at its first call, and each call's barrier
+         // covers its chunk: later chunks would claim GENERAL on levels still UNDEFINED.

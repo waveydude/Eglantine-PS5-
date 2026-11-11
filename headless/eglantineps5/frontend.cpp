@@ -230,8 +230,6 @@ std::string RunApp(const std::string& launch_error, bool first_start, Eden::Mult
 
         const bool input_ready = radio_input_init();
         if (!input_ready) Eden::Report("menu failure", "The controller could not be opened");
-        // Once per launch: is a newer release listed? The launcher shows the answer when it comes.
-        Eden::UpdateNotice::Start();
         pe::ui::Launcher launcher(services, textures, fonts, first_start);
         int menu_volume = launcher.menu_volume();
         mixer->set_bus_gain(pe::audio::Bus::ui, MenuGain(menu_volume));

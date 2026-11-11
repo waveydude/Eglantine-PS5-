@@ -1,0 +1,45 @@
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -689,7 +689,7 @@
+           // On by default for Ocarina of Time; EDEN_NX2_OOT_VISUAL_WORKAROUND=0 turns it off.
+           return value == nullptr || std::string_view{value} != "0";
+       }()},
+-      workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetBootPipelineWorkers(),
++      workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
+               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
+       serialization_thread(1, "VkPipelineSerialization", {},
+                            Common::ThreadPlacement::Background) {
+@@ -1897,14 +1897,5 @@
+ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                                       const VideoCore::DiskResourceLoadCallback& callback) {
+-    SCOPE_EXIT {
+-        const size_t configured_workers =
+-            device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers();
+-        if (workers.WorkerCount() != configured_workers) {
+-            LOG_INFO(Render_Vulkan, "Shader cache ready: dropping pipeline builders from {} to {}",
+-                     workers.WorkerCount(), configured_workers);
+-            workers.SetWorkerCount(configured_workers);
+-        }
+-    };
+     visual_workaround_title = title_id;
+     if (title_id == 0) {
+         return;
+@@ -1994,6 +1994,18 @@
+     if (device.IsKhrPipelineExecutablePropertiesEnabled()) {
+         state.statistics = std::make_unique<PipelineStatistics>(device);
+     }
++    const size_t runtime_workers = workers.WorkerCount();
++    if (!stop_loading.stop_requested() && !device.HasBrokenParallelShaderCompiling()) {
++        workers.SetWorkerCount(GetBootPipelineWorkers());
++    }
++    SCOPE_EXIT {
++        if (workers.WorkerCount() != runtime_workers) {
++            LOG_INFO(Render_Vulkan, "Shader cache done: restoring {} pipeline builders",
++                     runtime_workers);
++            workers.SetWorkerCount(runtime_workers);
++        }
++    };
++
+     const auto load_compute{[&](std::ifstream& file, FileEnvironment env) {
+         ComputePipelineCacheKey key;
+         file.read(reinterpret_cast<char*>(&key), sizeof(key));

@@ -1,0 +1,283 @@
+Subject: [PATCH] Use more pipeline builders during boot and drop to configured count
+
+Shader cache compilation takes 158s out of 205s boot time when limited to 2
+builder threads. Spawn up to 8 builders during boot (LoadDiskResources), and
+drop back to configured EDEN_NX2_PIPELINE_WORKERS once disk resources are
+loaded before gameplay begins. SCOPE_EXIT ensures the pool always drops back
+even on early return or cache setup failure.
+
+--- a/src/common/thread_worker.h
++++ b/src/common/thread_worker.h
+@@ -6,16 +6,18 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <condition_variable>
++#include <deque>
+ #include <functional>
+ #include <mutex>
++#include <queue>
+ #include <string>
+ #include <thread>
+ #include <type_traits>
++#include <utility>
+ #include <vector>
+-#include <queue>
+-#include <deque>
+ 
+ #include "common/polyfill_thread.h"
+ #include "common/thread.h"
+@@ -40,62 +42,11 @@
+ public:
+     explicit StatefulThreadWorker(size_t num_workers, std::string name, StateMaker func = {},
+                                   ThreadPlacement placement = ThreadPlacement::Default)
+-        : workers_queued{num_workers}, thread_name{std::move(name)} {
+-        const auto lambda = [this, func, placement](std::stop_token stop_token) {
+-            Common::SetCurrentThreadName(thread_name.c_str());
+-            if (placement != ThreadPlacement::Default) {
+-                Common::SetCurrentThreadPriority(ThreadPriority::Low);
+-            }
+-            switch (placement) {
+-            case ThreadPlacement::Efficiency:
+-                Common::SetCurrentThreadToEfficiencyCores();
+-                break;
+-            case ThreadPlacement::Background:
+-                Common::SetCurrentThreadToBackgroundWork();
+-                break;
+-            default:
+-                Common::SetCurrentThreadToAllCores();
+-                break;
+-            }
+-            {
+-                [[maybe_unused]] std::conditional_t<with_state, StateType, int> state{func()};
+-                while (!stop_token.stop_requested()) {
+-                    Task task;
+-                    {
+-                        std::unique_lock lock{queue_mutex};
+-                        if (requests.empty()) {
+-                            wait_condition.notify_all();
+-                        }
+-                        condition.wait(lock, stop_token,
+-                                       [this] { return !requests.empty(); });
+-                        if (stop_token.stop_requested()) {
+-                            break;
+-                        }
+-                        task = std::move(requests.front());
+-                        requests.pop_front();
+-                        if (front_queued > 0) {
+-                            --front_queued; // it was a QueueWorkFront entry
+-                        }
+-                    }
+-                    if constexpr (with_state) {
+-                        task(&state);
+-                    } else {
+-                        task();
+-                    }
+-                    // Draining an executed task includes releasing its captured resources.
+-                    task = {};
+-                    ++work_done;
+-                }
+-            }
+-            {
+-                std::scoped_lock lock{queue_mutex};
+-                ++workers_stopped;
+-            }
+-            wait_condition.notify_all();
+-        };
++        : workers_queued{num_workers}, thread_name{std::move(name)},
++          state_maker{std::move(func)}, thread_placement{placement} {
+         threads.reserve(num_workers);
+         for (size_t i = 0; i < num_workers; ++i) {
+-            threads.emplace_back(lambda);
++            threads.emplace_back(MakeWorkerLambda());
+         }
+     }
+ 
+@@ -137,8 +88,49 @@
+         return scheduled > done ? scheduled - done : 0;
+     }
+ 
++    [[nodiscard]] size_t WorkerCount() const noexcept {
++        std::scoped_lock lock{queue_mutex};
++        return threads.size();
++    }
++
++    void SetWorkerCount(size_t target_count) {
++        target_count = (std::max)(size_t{1}, target_count);
++        std::vector<std::jthread> retiring_threads;
++        {
++            std::scoped_lock lock{queue_mutex};
++            if (target_count == threads.size()) {
++                return;
++            }
++            if (target_count > threads.size()) {
++                const size_t additional = target_count - threads.size();
++                workers_queued += additional;
++                threads.reserve(target_count);
++                for (size_t i = 0; i < additional; ++i) {
++                    threads.emplace_back(MakeWorkerLambda());
++                }
++                return;
++            }
++            const size_t to_remove = threads.size() - target_count;
++            retiring_threads.reserve(to_remove);
++            for (size_t i = 0; i < to_remove; ++i) {
++                retiring_threads.push_back(std::move(threads.back()));
++                threads.pop_back();
++            }
++        }
++        for (auto& thread : retiring_threads) {
++            thread.request_stop();
++        }
++        condition.notify_all();
++        for (auto& thread : retiring_threads) {
++            if (thread.joinable()) {
++                thread.join();
++            }
++        }
++    }
++
+     void WaitForRequests(std::stop_token stop_token = {}) {
+         std::stop_callback callback(stop_token, [this] {
++            std::scoped_lock lock{queue_mutex};
+             for (auto& thread : threads) {
+                 thread.request_stop();
+             }
+@@ -150,11 +142,66 @@
+     }
+ 
+ private:
++    auto MakeWorkerLambda() {
++        return [this](std::stop_token stop_token) {
++            Common::SetCurrentThreadName(thread_name.c_str());
++            if (thread_placement != ThreadPlacement::Default) {
++                Common::SetCurrentThreadPriority(ThreadPriority::Low);
++            }
++            switch (thread_placement) {
++            case ThreadPlacement::Efficiency:
++                Common::SetCurrentThreadToEfficiencyCores();
++                break;
++            case ThreadPlacement::Background:
++                Common::SetCurrentThreadToBackgroundWork();
++                break;
++            default:
++                Common::SetCurrentThreadToAllCores();
++                break;
++            }
++            {
++                [[maybe_unused]] std::conditional_t<with_state, StateType, int> state{state_maker()};
++                while (!stop_token.stop_requested()) {
++                    Task task;
++                    {
++                        std::unique_lock lock{queue_mutex};
++                        if (requests.empty()) {
++                            wait_condition.notify_all();
++                        }
++                        condition.wait(lock, stop_token,
++                                       [this] { return !requests.empty(); });
++                        if (stop_token.stop_requested()) {
++                            break;
++                        }
++                        task = std::move(requests.front());
++                        requests.pop_front();
++                        if (front_queued > 0) {
++                            --front_queued; // it was a QueueWorkFront entry
++                        }
++                    }
++                    if constexpr (with_state) {
++                        task(&state);
++                    } else {
++                        task();
++                    }
++                    // Draining an executed task includes releasing its captured resources.
++                    task = {};
++                    ++work_done;
++                }
++            }
++            {
++                std::scoped_lock lock{queue_mutex};
++                ++workers_stopped;
++            }
++            wait_condition.notify_all();
++        };
++    }
++
+     std::deque<Task> requests;
+     /// How many QueueWorkFront entries lead requests, in arrival order. Guarded by queue_mutex;
+     /// stays 0 unless QueueWorkFront is used (EDEN_UP_FAST_CFG).
+     size_t front_queued{};
+-    std::mutex queue_mutex;
++    mutable std::mutex queue_mutex;
+     std::condition_variable_any condition;
+     std::condition_variable wait_condition;
+     std::atomic<size_t> work_scheduled{};
+@@ -162,6 +209,8 @@
+     std::atomic<size_t> workers_stopped{};
+     std::atomic<size_t> workers_queued{};
+     std::string thread_name;
++    StateMaker state_maker{};
++    ThreadPlacement thread_placement{ThreadPlacement::Default};
+     std::vector<std::jthread> threads;
+ };
+ 
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -494,6 +494,23 @@
+ #endif
+ }
+ 
++size_t GetBootPipelineWorkers() {
++    const size_t max_core_threads =
++        std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
++    size_t boot_builders = std::min<size_t>(8ULL, max_core_threads);
++    if (const char* const value = std::getenv("EDEN_NX2_BOOT_PIPELINE_WORKERS"); value != nullptr) {
++        const size_t asked = static_cast<size_t>(std::strtoul(value, nullptr, 10));
++        if (asked != 0) {
++            boot_builders = std::min(asked, max_core_threads);
++        }
++    }
++    const size_t runtime_builders = GetTotalPipelineWorkers();
++    const size_t effective_boot = std::max(boot_builders, runtime_builders);
++    LOG_INFO(Render_Vulkan, "Boot pipeline builders: {} (configured runtime: {})",
++             effective_boot, runtime_builders);
++    return effective_boot;
++}
++
+ // EDEN_UP_IR_FREE=1 (exact "1", Lichii #878): a build whose driver compile runs on the calling
+ // thread frees its translated IR before that compile instead of when the build returns. Those
+ // are a builder's jobs with their own pools: here only at boot (LoadDiskResources' disk cache,
+@@ -672,7 +689,7 @@
+           // On by default for Ocarina of Time; EDEN_NX2_OOT_VISUAL_WORKAROUND=0 turns it off.
+           return value == nullptr || std::string_view{value} != "0";
+       }()},
+-      workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
++      workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetBootPipelineWorkers(),
+               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
+       serialization_thread(1, "VkPipelineSerialization", {},
+                            Common::ThreadPlacement::Background) {
+@@ -1880,5 +1897,14 @@
+ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
+                                       const VideoCore::DiskResourceLoadCallback& callback) {
++    SCOPE_EXIT {
++        const size_t configured_workers =
++            device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers();
++        if (workers.WorkerCount() != configured_workers) {
++            LOG_INFO(Render_Vulkan, "Shader cache ready: dropping pipeline builders from {} to {}",
++                     workers.WorkerCount(), configured_workers);
++            workers.SetWorkerCount(configured_workers);
++        }
++    };
+     visual_workaround_title = title_id;
+     if (title_id == 0) {
+         return;
+@@ -3984,7 +4010,7 @@
+     // Beside this stamp's store, and removed with it: another build starts without strikes.
+     const auto journal_filename = prep_store.Sidecar(".inflight");
+     const auto strikes_filename = prep_store.Sidecar(".strikes");
+-    const size_t worker_count = GetTotalPipelineWorkers();
++    const size_t worker_count = workers.WorkerCount();
+     const size_t max_in_flight = std::max<size_t>(worker_count * 2, 8);
+ 
+     // A pipeline whose build took the app down twice is left to the draw that needs it. The

@@ -1,0 +1,20 @@
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -1449,8 +1449,15 @@
+         const u32* const recorded_first = FindAnswer(values, first);
+         const u32* const recorded_second = FindAnswer(values, second);
+         if (recorded_first == nullptr || recorded_second == nullptr) {
+-            // The translation did not read this descriptor's handle: nothing to hold it to.
+-            return fail("texture handle");
++            // Any recorded word remains subject to the normal constant comparison below.
++            static const bool skip_unread = [] {
++                const char* value = std::getenv("EDEN_NX2_PREP_SKIP_UNREAD_HANDLES");
++                return value && std::string_view{value} == "1";
++            }();
++            if (!skip_unread) {
++                return fail("texture handle");
++            }
++            continue;
+         }
+         handle_words.push_back(first);
+         handle_words.push_back(second);

@@ -102,6 +102,7 @@ void StartThread() {
         std::thread([] {
             using namespace std::chrono_literals;
             auto last = std::chrono::steady_clock::now();
+            auto last_refusal = std::chrono::steady_clock::time_point{};
             std::uint64_t seen_failures = 0;
             for (;;) {
                 {
@@ -111,9 +112,13 @@ void StartThread() {
                 const std::uint64_t failures = ledger.TotalFailures();
                 const auto now = std::chrono::steady_clock::now();
                 const bool refused = failures != seen_failures;
-                if (refused || now - last >= 5s) {
-                    WriteLine(refused);
+                const bool refusal_due = refused && (now - last_refusal >= 1s);
+                if (refusal_due || now - last >= 5s) {
+                    WriteLine(refusal_due);
                     last = now;
+                    if (refusal_due) {
+                        last_refusal = now;
+                    }
                     seen_failures = failures;
                 }
             }
