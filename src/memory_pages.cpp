@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "fastmem.h"
+#include "../headless/memory_wait.h" // WaitForBlock's limit (EDEN_GUEST_WRITE_WAIT_MS)
 
 // EDEN_UP_* switches (guest_memory_service.inc). The host checks compile this file without the
 // core's include path (tools/check-jit-allocator.py): there, the same rule written out.

@@ -26,6 +26,7 @@
 #include <cstring>
 #include <sys/stat.h>
 extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
+extern "C" size_t eden_heap_trim(void) __attribute__((weak));
 // headless/heap_pages.cpp (the native build only): the pool switches, read once env.txt is in.
 extern "C" void eden_heap_pool_init(void) __attribute__((weak));
 #endif
@@ -67,6 +68,7 @@ extern "C" void eden_heap_pool_init(void) __attribute__((weak));
 #include "extracted_game.h"
 #include "cache_budget.h"
 #include "performance.h"
+#include "memory_wait.h"
 #include "crash_site.h"
 #include "core/memory.h"
 #include "video_core/dma_pusher.h"
@@ -339,6 +341,39 @@ int main(int argc, char** argv) {
             unsigned reason = 0;
             size_t count = 0;
             const size_t bytes = eden_heap_last_failure(&reason, &count);
+            // EDEN_UP_NEW_WAIT_MS=<ms> (memory_wait.h; unset or 0: no wait, as before). operator new
+            // calls this after each refusal and tries again when it returns, so returning after a
+            // 20 ms sleep is the wait: other threads free memory meanwhile (an area's pages and
+            // textures go as the next one's arrive). The heap's empty spaces go back at the start
+            // and every 500 ms. One EDEN_NEW_WAIT line when a wait starts; a wait that is served
+            // prints nothing more, one that runs out prints the failure below and throws, and the
+            // thread's failures of the next 30 s throw at once (memory_wait.h: CooldownMs).
+            {
+                namespace MemoryWait = Eden::MemoryWait;
+                thread_local MemoryWait::Episode episode;
+                const unsigned limit = MemoryWait::WorthWaitingFor(bytes)
+                                           ? MemoryWait::new_wait_ms.load(std::memory_order_relaxed)
+                                           : 0;
+                const auto now = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+                const MemoryWait::Step step = MemoryWait::Next(episode, now, limit, bytes);
+                if (step != MemoryWait::Step::GiveUp) {
+                    if (step == MemoryWait::Step::Start) {
+                        std::fprintf(stderr, "EDEN_NEW_WAIT start requested=%zu reason=%u limit_ms=%u\n",
+                                     bytes, reason, limit);
+                    }
+                    if (MemoryWait::TrimNow(episode, step, now) && eden_heap_trim) eden_heap_trim();
+                    usleep(20000);
+                    return;
+                }
+                // A line for a wait that ran out, not for the refusals of the cooldown after it.
+                if (limit != 0 && episode.cooldown_until_ms == now + MemoryWait::CooldownMs) {
+                    std::fprintf(stderr, "EDEN_NEW_WAIT gave up after %u ms; no waits on this thread for %llu s\n",
+                                 limit, static_cast<unsigned long long>(MemoryWait::CooldownMs / 1000));
+                }
+            }
             std::fprintf(stderr, "EDEN_HEAP_FAILURE requested=%zu reason=%u count=%zu\n", bytes,
                          reason, count);
             ps5_opengl_heap_snapshot("allocation_failure", 0);
@@ -812,6 +847,14 @@ int main(int argc, char** argv) {
                 setenv(entry.substr(0, split).c_str(), entry.c_str() + split + 1, 1);
                 std::printf("EDEN_ENV_TITLE %s\n", entry.c_str());
             }
+        }
+        // EDEN_UP_NEW_WAIT_MS (memory_wait.h): read with env.txt and this game's own env file in.
+        // 0 until here, so nothing in the launcher waits.
+        Eden::MemoryWait::new_wait_ms.store(Eden::MemoryWait::ReadMs("EDEN_UP_NEW_WAIT_MS", 0, 0, 60000),
+                                            std::memory_order_relaxed);
+        if (const unsigned wait = Eden::MemoryWait::new_wait_ms.load(std::memory_order_relaxed)) {
+            std::printf("EDEN_UP_NEW_WAIT_MS=%u: operator new waits that long for memory before it gives up\n",
+                        wait);
         }
 #ifndef EDEN_DEV_PROFILE
         // EDEN_UP_LEAN_DEV_TIMERS=1: the six timers only a development profile build reports
