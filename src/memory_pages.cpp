@@ -25,6 +25,8 @@
 
 #include "fastmem.h"
 #include "../headless/memory_wait.h" // WaitForBlock's limit (EDEN_GUEST_WRITE_WAIT_MS)
+// headless/heap_arenas.inc: gives the heap's empty spaces back to the pool (WaitForBlock).
+extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
 
 // EDEN_UP_* switches (guest_memory_service.inc). The host checks compile this file without the
 // core's include path (tools/check-jit-allocator.py): there, the same rule written out.

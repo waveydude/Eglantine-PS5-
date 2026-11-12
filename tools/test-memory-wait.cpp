@@ -182,7 +182,20 @@ static void HandlerLimit() {
     assert(!episode.active && episode.cooldown_until_ms == 0);
 }
 
+// A wait for a guest block trims the heap at its start and every 500 ms, not at every 20 ms try.
+static void GuestWaitTrims() {
+    using namespace Eden::MemoryWait;
+    static_assert(TrimAtTry(0) && !TrimAtTry(1) && !TrimAtTry(24) && TrimAtTry(25) && TrimAtTry(50));
+    unsigned trims = 0;
+    const unsigned limit = Steps(10000); // the console's EDEN_GUEST_WRITE_WAIT_MS
+    for (unsigned tries = 0; tries < limit; ++tries) trims += TrimAtTry(tries) ? 1 : 0;
+    assert(limit == 500 && trims == 20);
+    // The shortest wait still trims once, before its only try.
+    assert(Steps(20) == 1 && TrimAtTry(0));
+}
+
 int main() {
+    GuestWaitTrims();
     HandlerLimit();
     Parse();
     HopelessRequests();

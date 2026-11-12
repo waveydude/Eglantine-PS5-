@@ -1388,6 +1388,13 @@ bool WaitForBlock(Promote&& promote) noexcept {
     bool ok = false;
     const unsigned limit = ::Eden::MemoryWait::Steps(GuestWriteWaitMs());
     for (unsigned tries = 0; tries < limit && !ok; ++tries) {
+        // The heap's empty spaces first (memory_wait.h, TrimAtTry): when the waiting thread is the
+        // GPU thread, the graphics caches free nothing while it waits.
+        if (::Eden::MemoryWait::TrimAtTry(tries) && ::eden_heap_trim != nullptr) {
+            (void)::eden_heap_trim();
+            ok = promote();
+            if (ok) break;
+        }
         const timespec pause{0, 20'000'000};
         nanosleep(&pause, nullptr);
         ok = promote();

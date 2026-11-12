@@ -120,6 +120,18 @@ inline unsigned HandlerLimitMs(std::uint64_t bytes, unsigned configured_ms, bool
     return WorthWaitingFor(bytes) && !builds_pipelines ? configured_ms : 0;
 }
 
+// A wait for a block of the guest's memory (src/guest_memory_service.inc, WaitForBlock) tries
+// again every StepMs. Whether its `tries`-th try (0 for the first) gives the heap's empty spaces
+// back first: at the start and every TrimEveryMs. The graphics caches free memory on the GPU
+// thread, so when the GPU thread is the one waiting nothing else frees any: Wave Ocarina 05, Castle
+// Town, 12 Nov 2026: GPUBack faulted reading a texture's guest memory, the hang watch fired a
+// second before the end, the session ended with the pool at 1 MiB, and the heap's last report
+// showed 26 MiB of whole pages with no block in use that only a trim gives back.
+constexpr unsigned StepMs = 20;
+constexpr bool TrimAtTry(unsigned tries) {
+    return tries % static_cast<unsigned>(TrimEveryMs / StepMs) == 0;
+}
+
 // Number of 20 ms steps in a wait of `ms` (at least one).
 inline unsigned Steps(unsigned ms) {
     return ms < 20 ? 1u : ms / 20u;
