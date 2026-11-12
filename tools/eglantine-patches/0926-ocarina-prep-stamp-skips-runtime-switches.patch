@@ -1,0 +1,25 @@
+Subject: [PATCH] Keep switches that do not change a translation out of the kept-store stamp
+
+EDEN_NX2_TRANSCODE_WAIT and EDEN_NX2_PRELOAD_ALL_PIPELINES decide when work happens, not what a
+shader becomes. Setting either started an empty store: a 635 s boot for 4,681 pipelines.
+
+--- a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+@@ -737,6 +737,17 @@
+     };
+     u32 set = 0;
+     for (const char* const name : TranslationSwitches) {
++        // Switches the list names (it holds every switch the video core reads) that decide when
++        // something happens and never what a shader is translated to: turning one on started an
++        // empty store and a ten-minute boot for nothing (12 Nov 2026, 635 s for 4,681 pipelines).
++        // They stay out of the stamp, set or not.
++        static constexpr std::string_view NotTranslation[]{
++            "EDEN_NX2_TRANSCODE_WAIT",        // a refused ASTC decode waits for its image's next use
++            "EDEN_NX2_PRELOAD_ALL_PIPELINES", // which kept pipelines the boot builds
++        };
++        if (std::ranges::find(NotTranslation, std::string_view{name}) != std::end(NotTranslation)) {
++            continue;
++        }
+         if (const char* const value = std::getenv(name)) {
+             mix(name);
+             mix("=");
