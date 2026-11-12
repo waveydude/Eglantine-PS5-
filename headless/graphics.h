@@ -32,7 +32,7 @@ private:
     bool vulkan{};
     bool splash_hidden{};
     bool first_frame_reported{};
-    double frame_sample_start{-1}, frame_sample_last{}, frame_sample_worst{};
+    double frame_sample_start{-1}, frame_sample_last{}, frame_sample_worst{}, frame_sample_worst_end{};
     unsigned frame_sample_count{}, frame_total{};
     EGLDisplay display{EGL_NO_DISPLAY};
     EGLConfig config{};

@@ -1,6 +1,7 @@
     if constexpr (std::is_same_v<Runtime, Vulkan::TextureCacheRuntime>) {
         // Keep independent copies in one submission, then publish guest writes
         // in modification order. A staging allocation stays busy until its tick.
+        const ::Eden::StagingCaller::Scope staging_caller{"TC_DownloadMemory"};
         using Map = decltype(runtime.DownloadStagingBuffer(size_t{}));
         std::vector<std::pair<ImageId, Map>> pending;
         pending.reserve(16);

@@ -8,6 +8,10 @@ report = '--report' in sys.argv
 source, output = map(Path, [a for a in sys.argv[1:] if a != '--report'])
 port = Path(__file__).resolve().parents[1] / 'headless'
 broken = []
+
+def staging_scope(signature, caller):
+    return signature, signature + f'\n    const ::Eden::StagingCaller::Scope staging_caller{{"{caller}"}};'
+
 def adapt(relative, destination, replacements):
     text = (source / relative).read_text()
     for old, new in replacements:
@@ -783,7 +787,15 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.h',
 adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_staging_buffer_pool.cpp', [
     ('StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {',
      '''StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {
-    if (static unsigned rows{}; size >= (64ULL << 20) && rows++ < 96) {
+    static std::atomic<unsigned> rows{};
+    const bool trace_staging = size >= (64ULL << 20) &&
+                               rows.fetch_add(1, std::memory_order_relaxed) < 96;
+    const auto staging_start = trace_staging ? std::chrono::steady_clock::now()
+                                             : std::chrono::steady_clock::time_point{};
+    if (trace_staging) {
+        const auto host_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            staging_start.time_since_epoch()).count();
+        const auto frame = ::Eden::Display::gameplay_frame.load(std::memory_order_relaxed);
         for (unsigned kind = 0; kind < 3; ++kind) {
             auto& cache = kind == 0 ? device_local_cache : kind == 1 ? upload_cache : download_cache;
             size_t count = 0, pinned = 0, busy = 0, free = 0;
@@ -795,16 +807,17 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
                 else if (scheduler.IsFree(entry.tick)) ++free;
                 else ++busy;
             }
-            std::fprintf(stderr, "MKW_STAGING_MISS asked=%zu usage=%u deferred=%d kind=%u count=%zu bytes=%llu pinned=%zu busy=%zu free=%zu tick=%llu completed=%llu\\n",
+            std::fprintf(stderr, "MKW_STAGING_MISS asked=%zu usage=%u deferred=%d kind=%u count=%zu bytes=%llu pinned=%zu busy=%zu free=%zu tick=%llu completed=%llu caller=%s frame=%u host_ms=%lld\\n",
                          size, unsigned(usage), int(deferred), kind, count, bytes, pinned, busy, free,
                          static_cast<unsigned long long>(scheduler.CurrentTick()),
-                         static_cast<unsigned long long>(scheduler.GetMasterSemaphore().KnownGpuTick()));
+                         static_cast<unsigned long long>(scheduler.GetMasterSemaphore().KnownGpuTick()),
+                         ::Eden::StagingCaller::current, frame, static_cast<long long>(host_ms));
         }
     }
 '''),
     ('#include "video_core/vulkan_common/vulkan_wrapper.h"\n',
      '#include "video_core/vulkan_common/vulkan_wrapper.h"\n#include <atomic>\n#include <chrono>\n#include <cstdio>\n'
-     '#include "performance.h"\n#include "staging_buffers.h"\n'),
+     '#include "performance.h"\n#include "staging_buffers.h"\n#include "staging_caller.h"\n#include "display_refresh.h"\n'),
     ('void StagingBufferPool::TickFrame() {',
      '''void StagingBufferPool::ReportHeld() {
     const char* name = "device";
@@ -905,6 +918,13 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
      '            buffer_ci.size = (std::min<VkDeviceSize>)(made, Common::AlignUp(VkDeviceSize(size), VkDeviceSize{2} << 20));\n'
      '        }\n'
      '        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n'
+     '    }\n'
+     '    if (trace_staging) {\n'
+     '        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(\n'
+     '            std::chrono::steady_clock::now() - staging_start).count();\n'
+     '        std::fprintf(stderr, "EDEN_STAGING_ALLOC caller=%s asked=%zu allocated=%llu elapsed_us=%lld\\n",\n'
+     '                     ::Eden::StagingCaller::current, size,\n'
+     '                     static_cast<unsigned long long>(buffer_ci.size), static_cast<long long>(elapsed));\n'
      '    }\n'
      '    // A large buffer smaller than the power of two: the 1st, 2nd, 4th, 8th ... in the log.\n'
      '    if (exact && made >= (VkDeviceSize{64} << 20) && made < (VkDeviceSize{1} << log2_size)) {\n'
@@ -1290,6 +1310,7 @@ for old, new in [
     ('            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);\n',
      '            auto staged = [&] {\n'
      '                if constexpr (std::is_same_v<Runtime, Vulkan::TextureCacheRuntime>) {\n'
+     '                    const ::Eden::StagingCaller::Scope staging_caller{"TC_GcCleanup"};\n'
      '                    return runtime.TryDownloadStagingBuffer(image.unswizzled_size_bytes);\n'
      '                } else {\n'
      '                    return std::optional{runtime.DownloadStagingBuffer(image.unswizzled_size_bytes)};\n'
@@ -1373,11 +1394,12 @@ for signature, index in (
     texture_costs.append((anchor, anchor + scope))
 adapt('src/video_core/texture_cache/texture_cache.h',
       'vulkan-cache/video_core/texture_cache/texture_cache.h', [
-    ('namespace VideoCommon {', '#include "performance.h"\n#include "common/scope_exit.h"\nnamespace Vulkan { class TextureCacheRuntime; }\n\nnamespace VideoCommon {'),
+    ('namespace VideoCommon {', '#include "performance.h"\n#include "staging_caller.h"\n#include "common/scope_exit.h"\nnamespace Vulkan { class TextureCacheRuntime; }\n\nnamespace VideoCommon {'),
     ('    // If we can obtain the memory info, use it instead of the estimate.\n    if (runtime.CanReportMemoryUsage()) {',
      "    // The console: the images' own memory (performance.h texture_usage_from_images), the figure\n    // Eden keeps itself when the driver gives none, set right every 300 frames from the images there\n    // are (scaled ones hold their original too, as the collector counts them).\n    const bool from_images = std::is_same_v<Runtime, Vulkan::TextureCacheRuntime> &&\n                             ::Eden::Performance::texture_usage_from_images.load(std::memory_order_relaxed);\n    if (from_images && frame_tick % 300 == 0) {\n        u64 held = 0;\n        for (const auto [image_id, image] : slot_images) {\n            held += ImageMemoryBytes(*image) + (image->HasScaled() ? GetScaledImageSizeBytes(*image) : 0);\n        }\n        total_used_memory = held;\n    }\n    // If we can obtain the memory info, use it instead of the estimate.\n    if (runtime.CanReportMemoryUsage() && !from_images) {"),
     (download_prefix, download_prefix + (port / 'vulkan_download_batch.inc').read_text() + '\n'),
     (gc_original, gc),
+    staging_scope('void TextureCache<P>::RefusalDownloadEvict() {', 'TC_RefusalDownloadEvict'),
     # RADV reports all Vulkan allocations, not just cached textures. A game's
     # measured ~1.9 GiB working set triggered dirty eviction at the old 1.6 GiB
     # threshold despite a 4 GiB budget. Retain 40% headroom; keep the original
@@ -1403,7 +1425,14 @@ adapt('src/video_core/buffer_cache/buffer_cache.h',
      '        }\n'),
     ('++frames % 600 == 0', '++frames % 60 == 0'),
     ('#include "video_core/buffer_cache/buffer_cache_base.h"',
-     '#include "video_core/buffer_cache/buffer_cache_base.h"\n#include "performance.h"'),
+     '#include "video_core/buffer_cache/buffer_cache_base.h"\n#include "performance.h"\n#include "staging_caller.h"'),
+    staging_scope('void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64 size) {',
+                  'BC_DownloadBuffer'),
+    staging_scope('void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>> ranges) {',
+                  'BC_DownloadRanges'),
+    staging_scope('void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids) {',
+                  'BC_DownloadBuffers'),
+    staging_scope('void BufferCache<P>::CommitAsyncFlushesHigh() {', 'BC_CommitAsyncFlushesHigh'),
     ('void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {',
      'void BufferCache<P>::BindHostGeometryBuffers(bool is_indexed) {\n'
      '    long long since_geo = ::Eden::Performance::MarkStart();'),
@@ -1505,6 +1534,26 @@ for name in ('vk_graphics_pipeline', 'vk_compute_pipeline'):
     ]
     if name == 'vk_graphics_pipeline':
         anchors += configure_phases
+        worker_build = '    const auto create_pipeline = [&] {'
+        anchors.append((worker_build, worker_build + r'''
+#ifdef PS5_NATIVE
+        // RADV's NIR clone can dereference a failed C allocation. Fail through the existing
+        // worker retry before entering the driver when the shared pool is critically short.
+        static const bool guard = Common::PeSwitch("EDEN_NX2_GRAPHICS_PIPELINE_LOW_MEMORY_GUARD");
+        if (guard && on_worker) {
+            constexpr std::uint64_t minimum = 16ULL << 20;
+            const auto available = PipelineMemoryGate::LiveFree();
+            if (available != 0 && available < minimum) {
+                static std::atomic<unsigned> logged{};
+                if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+                    std::fprintf(stderr, "EDEN_GRAPHICS_PIPELINE_LOW_MEMORY_GUARD bytes=%llu\n",
+                                 static_cast<unsigned long long>(available));
+                }
+                throw vk::Exception(VK_ERROR_OUT_OF_HOST_MEMORY);
+            }
+        }
+#endif
+'''))
     adapt(f'src/video_core/renderer_vulkan/{name}.cpp', name + '_cost.cpp', anchors)
 shader_costs = [
     ('#include <algorithm>', '#include <algorithm>\n#include <cstdio>\n#include <unordered_set>\n'

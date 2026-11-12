@@ -92,6 +92,7 @@
                     image.info.num_samples != 1 || gc_downloads.size() == kBatchImages)
                     return true;
                 // No staging buffer: the images left stay for now, and Cleanup leaves them too.
+                const ::Eden::StagingCaller::Scope staging_caller{"TC_GcPrefetch"};
                 const auto staged = runtime.TryDownloadStagingBuffer(image.unswizzled_size_bytes, true);
                 if (!staged) return true;
                 auto map = *staged;
