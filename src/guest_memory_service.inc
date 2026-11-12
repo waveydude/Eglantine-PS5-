@@ -104,15 +104,19 @@ void L961Add(std::atomic<std::uint64_t>& counter, std::uint64_t bytes) noexcept 
 bool LockSlot(SparseRange& range, std::size_t slot, bool count_wait = false) noexcept {
     auto& state = range.state[slot];
     bool waited = false;
+    std::uint64_t wait_since = 0; // EDEN_UP_STALL_PROBE: when the spin began
     for (;;) {
         std::uint8_t value = state.load(std::memory_order_relaxed);
         if (!(value & SlotLock) &&
             state.compare_exchange_weak(value, value | SlotLock, std::memory_order_acquire, std::memory_order_relaxed))
             break;
+        if (!waited && StallProbe::On()) wait_since = StallProbe::NowNs();
         waited = true;
         sched_yield();
     }
     if (waited && count_wait) counters.waits.fetch_add(1, std::memory_order_relaxed);
+    if (waited) StallProbe::SlotWaited(wait_since);
+    StallProbe::SlotTaken();
     return waited;
 }
 std::size_t FineKept(SparseRange& range, std::size_t slot) noexcept {
@@ -123,6 +127,7 @@ std::uint8_t SlotState(SparseRange& range, std::size_t slot) noexcept {
 }
 // Sets the state and lets the slot go.
 void UnlockSlot(SparseRange& range, std::size_t slot, std::uint8_t to) noexcept {
+    StallProbe::SlotReleased();
     range.owned[slot].store(to != SlotZero, std::memory_order_release);
     range.state[slot].store(to, std::memory_order_release);
 }
@@ -1384,6 +1389,7 @@ unsigned GuestWriteWaitMs() noexcept {
 
 template <typename Promote>
 bool WaitForBlock(Promote&& promote) noexcept {
+    const std::uint64_t block_since = StallProbe::On() ? StallProbe::NowNs() : 0; // EDEN_UP_STALL_PROBE
     memory_waiters.fetch_add(1, std::memory_order_acq_rel);
     bool ok = false;
     const unsigned limit = ::Eden::MemoryWait::Steps(GuestWriteWaitMs());
@@ -1400,6 +1406,7 @@ bool WaitForBlock(Promote&& promote) noexcept {
         ok = promote();
     }
     memory_waiters.fetch_sub(1, std::memory_order_acq_rel);
+    if (block_since != 0) StallProbe::BlockWaited(block_since);
     (ok ? memory_waits_won : memory_waits_lost).fetch_add(1, std::memory_order_relaxed);
     Note(ok ? "EDEN_CRAM a written slot waited for the graphics caches to give memory back, and got a block\n"
             : "EDEN_CRAM a written slot waited its whole limit (EDEN_GUEST_WRITE_WAIT_MS, 2 s unset) for memory and found no block\n");
@@ -1650,6 +1657,32 @@ std::thread scanner;
 std::mutex scanner_mutex;
 std::condition_variable scanner_wake;
 bool scanner_stop = false;
+// EDEN_UP_STALL_PROBE (stall_probe.h): a thread that notices stalls and says what the service was
+// doing in them.
+std::thread stall_probe;
+std::atomic<bool> stall_probe_stop{false};
+void StartStallProbe() {
+    if (!StallProbe::ReadSwitch() || stall_probe.joinable()) return;
+    StallProbe::Get().start_ns.store(StallProbe::NowNs(), std::memory_order_relaxed);
+    stall_probe_stop.store(false, std::memory_order_relaxed);
+    stall_probe = std::thread([] {
+        if (::eden_crash_name_thread) ::eden_crash_name_thread("StallProbe");  // crash report, thread dump
+        StallProbe::ProbeLoop([] { return stall_probe_stop.load(std::memory_order_relaxed); },
+                              [](std::uint64_t ns) {
+                                  const timespec pause{static_cast<time_t>(ns / 1'000'000'000ull),
+                                                       static_cast<long>(ns % 1'000'000'000ull)};
+                                  nanosleep(&pause, nullptr);
+                              },
+                              StallProbe::NowNs, [](const char* line) { Report(line); });
+    });
+    Report("EDEN_UP_STALL_PROBE on: an EDEN_STALL line for each wake of a 10 ms sleep 100 ms or more late, "
+           "with the slot lock waits and holds and the block waits of 50 ms or more since the last one "
+           "(count/longest by role), and EDEN_SLOT_LOCK totals beside each EDEN_CRAM line\n");
+}
+void StopStallProbe() {
+    stall_probe_stop.store(true, std::memory_order_relaxed);
+    if (stall_probe.joinable()) stall_probe.join();
+}
 #ifdef PS5_NATIVE
 // The reserve kept full: every 100 ms, so a burst of writes that used it finds it whole again as
 // soon as the caches have given memory back (the scanner only passes every 20 s).
@@ -1657,6 +1690,7 @@ std::thread keeper;
 
 void ReserveKeeper() {
     if (::eden_crash_name_thread) ::eden_crash_name_thread("CramKeeper");  // crash report, thread dump
+    StallProbe::role = StallProbe::Keeper;
     std::unique_lock lock{scanner_mutex};
     while (!scanner_stop) {
         scanner_wake.wait_for(lock, std::chrono::milliseconds(100), [] { return scanner_stop; });
@@ -1896,6 +1930,7 @@ void CompactPackStore(SparseRange& range) noexcept {
             if ((value & SlotLock) || !range.state[slot].compare_exchange_strong(value, value | SlotLock, std::memory_order_acquire,
                                                                                  std::memory_order_relaxed))
                 continue;
+            StallProbe::SlotTaken(); // UnlockSlot below lets it go
             const std::int64_t place = range.physical[slot];
             if (SlotState(range, slot) != SlotOut || !InStore(place) || StoreSlab(place) != victim) {
                 UnlockSlot(range, slot, SlotState(range, slot));
@@ -2110,6 +2145,7 @@ std::size_t PackOnRefusal(SparseRange& range, std::size_t want) noexcept {
 
 std::thread swapper;
 void SwapLoop(SparseRange* range) {
+    StallProbe::role = StallProbe::Swapper;
     if (pack_pressure_ms.load(std::memory_order_relaxed) != 0) { // EDEN_UP_PACK_PRESSURE_MS
         PackPressureLoop(range);
         return;
@@ -2643,6 +2679,10 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         reserve_count.load(std::memory_order_relaxed) * (SparseSlot >> 20),
         (unsigned long long)counters.host_reserve_used.load() * (SparseSlot >> 20));
     if (length > 0) Report(line);
+    if (StallProbe::On()) { // EDEN_UP_STALL_PROBE: the totals beside each EDEN_CRAM line
+        char totals[1024];
+        if (StallProbe::TotalsLine(totals, sizeof(totals)) > 0) Report(totals);
+    }
     if (l961_zero_trim.load(std::memory_order_relaxed)) {
         char trim[224];
         const int written = std::snprintf(trim, sizeof(trim),
@@ -2860,6 +2900,7 @@ std::chrono::seconds L961Pass(SparseRange& range, std::chrono::seconds interval,
 
 void ScannerLoop(SparseRange* range) {
     if (::eden_crash_name_thread) ::eden_crash_name_thread("CramScanner");  // crash report, thread dump
+    StallProbe::role = StallProbe::Scanner;
     auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     // 20 s between passes, or with EDEN_UP_L961_ZERO_TRIM what the passes give back says (L961Pass).
     const bool adaptive = l961_zero_trim.load(std::memory_order_relaxed);
@@ -3055,6 +3096,7 @@ void ServiceStart(SparseRange& range) noexcept {
         const std::lock_guard lock{scanner_mutex};
         scanner_stop = false;
     }
+    StartStallProbe(); // EDEN_UP_STALL_PROBE
     scanner = std::thread(ScannerLoop, &range);
 #ifdef PS5_NATIVE
     keeper = std::thread(ReserveKeeper);
@@ -3112,6 +3154,7 @@ void ServiceStop(SparseRange& range) noexcept {
     if (keeper.joinable()) keeper.join();
     if (swapper.joinable()) swapper.join();
 #endif
+    StopStallProbe();
     ServiceReport(range, "end");
     MeasureFinePages(range);
     DisarmSlots(range);

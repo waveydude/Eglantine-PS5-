@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "fastmem.h"
+#include "stall_probe.h" // EDEN_UP_STALL_PROBE (guest_memory_service.inc)
 #include "../headless/memory_wait.h" // WaitForBlock's limit (EDEN_GUEST_WRITE_WAIT_MS)
 // headless/heap_arenas.inc: gives the heap's empty spaces back to the pool (WaitForBlock).
 extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
