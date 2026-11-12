@@ -1,0 +1,45 @@
+Subject: [PATCH] Keep retrying a refused texture upload instead of giving the image up
+
+Wave Ocarina 03 cleared CpuModified at an image's 8th refused upload and drew with whatever it
+held. Under a long shortage that is every waiting image, and one never uploaded is black. Retry
+for as long as the image is used, 128 frames apart at most (headless/upload_retry.h).
+EDEN_NX2_UPLOAD_MAX_RETRIES=<n> brings the limit back.
+
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -24,6 +24,7 @@
+ #include "common/container/unordered_map.h"
+ #include <boost/container/small_vector.hpp>
+ 
++#include "upload_retry.h" // headless/: when a refused upload is tried again
+ #include "common/alignment.h"
+ #include "common/settings.h"
+ #include "common/scope_exit.h"
+@@ -3999,12 +4000,12 @@
+                             "its upload waits for its next use",
+                     image.gpu_addr, MapSizeBytes(image), times);
+     }
+-    ++image.upload_fail_count;
+-    static const u32 max_retries = [] {
+-        const char* const env = std::getenv("EDEN_NX2_UPLOAD_MAX_RETRIES");
+-        return env ? static_cast<u32>(std::strtoul(env, nullptr, 10)) : 8U;
+-    }();
+-    if (image.upload_fail_count >= max_retries) {
++    image.upload_fail_count = Eden::UploadRetry::NextFailCount(image.upload_fail_count);
++    // No limit unless EDEN_NX2_UPLOAD_MAX_RETRIES asks for one: an image given up for good stays
++    // black until the game writes it again (headless/upload_retry.h).
++    static const u32 max_retries =
++        Eden::UploadRetry::ReadMaxRetries(std::getenv("EDEN_NX2_UPLOAD_MAX_RETRIES"));
++    if (Eden::UploadRetry::GiveUp(image.upload_fail_count, max_retries)) {
+         if (const char* value = std::getenv("EDEN_NX2_BAD_ALLOC_ENDS"); value && value[0] == '1') {
+             throw std::bad_alloc{};
+         }
+@@ -4017,7 +4018,7 @@
+         image.upload_retry_frame = 0;
+         return;
+     }
+-    const u64 backoff_frames = std::min<u64>(u64{1} << std::min<u32>(image.upload_fail_count + 2, 7), 128);
++    const u64 backoff_frames = Eden::UploadRetry::BackoffFrames(image.upload_fail_count);
+     image.upload_retry_frame = frame_tick + backoff_frames;
+     image.flags |= ImageFlagBits::CpuModified;
+     runtime.TransitionImageLayout(image);

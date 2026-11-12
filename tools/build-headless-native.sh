@@ -72,6 +72,8 @@ cmake -S "$scratch/source" -B "$scratch/native-local" -G Ninja \
 python3 -B "$root/headless/check_slab_lifetime.py" \
     "$scratch/native-local/headless/include/core/hle/kernel/slab_helpers.h" \
     "$scratch/source/src/core/hle/kernel/slab_helpers.h"
+# The kept shader translations are stamped with their sources, not with the installed eboot.
+python3 -B "$root/tools/gen-translation-id.py" "$scratch/source" "$root/headless/translation_id.h"
 echo "Building Eden with $jobs parallel jobs"
 cmake --build "$scratch/native-local" --target eden-headless core -j "$jobs"
 # In every build: an object that saw Eden's own table header would write a table the rest keeps sparse.

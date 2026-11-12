@@ -1,0 +1,38 @@
+Subject: [PATCH] Stamp kept shader translations with their sources, not the eboot
+
+The stamp held the installed eboot's size and write time, so every install started an empty
+store: 158 to 305 s of translating at the first boot against 36 to 38 s at a repeat boot.
+Use the hash of the translation sources made at build time (tools/gen-translation-id.py).
+EDEN_UP_SHADER_PREP_BY_EBOOT=1 brings the eboot back.
+
+--- a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+@@ -6,6 +6,9 @@
+ // with this tree's fields.
+ 
+ #include "video_core/renderer_vulkan/vk_pipeline_prep.h"
++#if __has_include("translation_id.h")
++#include "translation_id.h" // headless/, generated: EDEN_TRANSLATION_ID
++#endif
+ 
+ #include <algorithm>
+ #include <bit>
+@@ -181,6 +184,18 @@
+     if (const char* const named = std::getenv("EDEN_UP_SHADER_PREP_EXE")) {
+         candidates.emplace_back(named);
+     }
++#ifdef EDEN_TRANSLATION_ID
++    // The sources that translate a shader, hashed when this build was made
++    // (tools/gen-translation-id.py). An install that translates the same keeps its translations:
++    // with the eboot's size and write time here, the first boot after every install translated
++    // everything again (158 to 305 s against 36 to 38 s for a repeat boot, 12 Nov 2026).
++    // EDEN_UP_SHADER_PREP_EXE still names a file to go by instead, and
++    // EDEN_UP_SHADER_PREP_BY_EBOOT=1 brings the eboot back.
++    else if (const char* const by_eboot = std::getenv("EDEN_UP_SHADER_PREP_BY_EBOOT");
++             by_eboot == nullptr || by_eboot[0] != '1') {
++        return "src" EDEN_TRANSLATION_ID;
++    }
++#endif
+     for (const char* const folder : {"/app0", "/system_ex/app/PPSA98515",
+                                      "/data/homebrew/PPSA98515",
+                                      "/mnt/sandbox/PPSA98515_000/app0"}) {

@@ -4,3 +4,4 @@ dist/
 results/
 .local/
 __pycache__/
+headless/translation_id.h
