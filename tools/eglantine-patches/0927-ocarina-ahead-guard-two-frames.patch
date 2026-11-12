@@ -1,0 +1,1303 @@
+Subject: [PATCH] EDEN_UP_AHEAD_GUARD_SLOTS=2 and EDEN_UP_AHEAD_TWO: two frames in flight, each guarded; off by default
+
+GrowingBlackBeans ran two frames in flight on a base PS5 (12 Nov, his 0924,
+EDEN_GBB_FRAMES_AHEAD2, three runs a side): walking 23.1 -> 25.2 fps, slowest 1%
+75 -> 57 ms, the present's wait 11-16 ms -> under 1 ms. It flickered, because the copy
+guard (0491-0504) holds one frame: a present that finds it still up for the frame before
+only counts an overlap and leaves its own frame unguarded (9-15% of his presents).
+
+EDEN_UP_AHEAD_TWO=1 (with EDEN_NX2_FRAMES_AHEAD=1): a present waits for the frame two
+back instead of the previous one, and never for its own.
+
+EDEN_UP_AHEAD_GUARD_SLOTS=2 (with EDEN_UP_AHEAD_GUARD=1/2/3): the guard has a slot per
+frame in flight, with its own pages, trap and fence. A copy belongs to the slots that
+needed it when it was taken, so a page may have two (one for the older frame, made before
+the newer frame's present, and one made after it), and a write to a page both frames read
+takes one copy for both. The back records frames in order and runs ahead of the fences, so
+a read takes the copy of the frame the back records (BackPassed, run in order after each
+present's lists), failing that a newer guarded frame's copy (older than memory). With two
+slots a frame's read pages end when the back passes it, not at its fence: ended at the
+fence they mixed the next frames' reads in and the guess for the next guard missed pages
+(host stress test: 3-4% of reads wrong before, 0 after). What uploads read from a frame's
+copies goes back to the next gather once the back has passed it, and =3 holds a write only
+until the back has passed the newest frame guarded when it was made. A present also lifts
+a slot whose fence is reached but whose fence action has not run yet. A slot is lifted at
+its own fence; a writer that gives up waiting lifts the slots it waited for.
+
+Unset (one slot): as before. The log line per 300 presents adds slots and arms made beside
+another; the copies line adds copies shared by both slots and reads that took a newer
+frame's copy. Neither switch is in the shader-store stamp.
+
+Host tests (tools/experiments/ahead-guard-slots): unit cases for both slot counts and a
+full pool, and a threaded stress (game, back and fence threads, 400 frames, two in
+flight): two slots 0 wrong reads in 5 runs; one slot ~65% wrong (the control).
+
+Not covered, as before: texture data and descriptor tables the texture cache reads.
+
+diff --git a/src/core/hle/service/nx2_gsv.h b/src/core/hle/service/nx2_gsv.h
+index dccda9e..7973134 100644
+--- a/src/core/hle/service/nx2_gsv.h
++++ b/src/core/hle/service/nx2_gsv.h
+@@ -1992,11 +1992,21 @@ private:
+             // A live switch since T119 (common/live_switch.h): read at each present.
+             const bool ahead_always =
+                 Common::LiveSwitch::Value<Common::LiveSwitch::Id::AheadAlways>() != 0;
+-            const bool gpu_behind = frames_ahead == 1 && !ahead_always &&
++            // EDEN_UP_AHEAD_TWO=1 (with EDEN_NX2_FRAMES_AHEAD=1; after GrowingBlackBeans'
++            // EDEN_GBB_FRAMES_AHEAD2): two frames in flight. The present waits for the frame two
++            // back, not the previous one, and never for its own. GBB, 12 Nov, base PS5, three
++            // runs a side: walking 23.1 -> 25.2 fps, slowest 1% 75 -> 57 ms, the present's wait
++            // 11-16 ms -> under 1 ms; with the one-frame copy guard it flickered.
++            // EDEN_UP_AHEAD_GUARD_SLOTS=2 guards both frames.
++            static const bool ahead_two = Common::PeSwitch("EDEN_UP_AHEAD_TWO");
++            const bool two = frames_ahead == 1 && ahead_two;
++            const u32 wait_id = two ? m_previous2_fence_id : m_previous_fence_id;
++            const u32 wait_value = two ? m_previous2_fence_value : m_previous_fence_value;
++            const bool gpu_behind = frames_ahead == 1 && !ahead_always && !two &&
+                                     m_previous_fence_id < 192 &&
+                                     !system.Host1x().GetSyncpointManager().IsReadyGuest(
+                                         m_previous_fence_id, m_previous_fence_value);
+-            WaitForFrame(m_previous_fence_id, m_previous_fence_value);
++            WaitForFrame(wait_id, wait_value);
+             if (gpu_behind || ahead_load_wait) {
+                 WaitForFrame(~w[22], w[24]);
+             }
+@@ -2023,7 +2033,15 @@ private:
+             }
+             VideoCommon::AheadGuard::AtPresent(m_presents, ~w[22], w[24], previous_reached,
+                                                syncpoints, system.Host1x().MemoryManager());
++            // EDEN_UP_AHEAD_GUARD_SLOTS=2: runs on the back after this frame's command lists, so
++            // the guard knows which frame the back records (whose copies its reads take).
++            if (VideoCommon::AheadGuard::SlotCount() == 2) {
++                system.GPU().RunInOrder(
++                    [n = m_presents] { VideoCommon::AheadGuard::BackPassed(n); });
++            }
+         }
++        m_previous2_fence_id = m_previous_fence_id;
++        m_previous2_fence_value = m_previous_fence_value;
+         m_previous_fence_id = ~w[22];
+         m_previous_fence_value = w[24];
+         const auto waited = std::chrono::steady_clock::now();
+@@ -2153,6 +2171,9 @@ private:
+     } m_fps_window{};
+     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
+     u32 m_previous_fence_value{};
++    /// The present before the previous one (EDEN_UP_AHEAD_TWO waits for it).
++    u32 m_previous2_fence_id{~0U};
++    u32 m_previous2_fence_value{};
+     u32 m_frame_fence_relearn_logs{}; // EDEN_UP_FRITCHII_CLOCK: the first 8 frame-fence learn lines
+ 
+     // EDEN_UP_FRITCHII_CLOCK (Fritchii ddc5e2585c, fable_answer_17): the render-frame clock's
+diff --git a/src/video_core/ahead_guard.h b/src/video_core/ahead_guard.h
+index fd404d9..aaf9b49 100644
+--- a/src/video_core/ahead_guard.h
++++ b/src/video_core/ahead_guard.h
+@@ -75,6 +75,7 @@
+ ///   EDEN_UP_AHEAD_GUARD_FRONT=1       the front names the constant buffer pages a frame's lists
+ ///                                     bind, and the guard takes them too (for the frame after
+ ///                                     a scene cut)
++///   EDEN_UP_AHEAD_GUARD_SLOTS=2       two frames in flight, a guard each (SlotCount, below)
+ /// Covered: buffer uploads, streamed uniform blocks, and the texture handles and storage buffer
+ /// pointers read from constant buffers at a draw (ReadGpu). Not covered: texture data and
+ /// descriptor tables the texture cache reads.
+@@ -200,6 +201,40 @@ inline u32 CopyCapacity() {
+     return pages;
+ }
+ 
++/// EDEN_UP_AHEAD_GUARD_SLOTS=2 (with =1, =2 or =3; default 1): the guard covers two frames in
++/// flight, each in a slot of its own, for a present that returns before the frame two back is
++/// done (EDEN_UP_AHEAD_TWO). With one slot, a present that found the guard still up for the
++/// frame before left its own frame unguarded: GrowingBlackBeans' two-frames-in-flight runs
++/// (12 Nov, base PS5) found it so at 9-15% of presents, and those runs flickered.
++///
++/// With two slots:
++///  - each slot has its own guarded pages, fence and trap (+1 on the cached count per slot), so
++///    a page both frames read is trapped twice and a write to it takes one copy for both;
++///  - a copy belongs to the slots that needed it when it was taken (a page may have two: one
++///    made before the newer frame's present, for the older frame, and one made after it);
++///  - the GPU thread's reads take the copy of the frame the back is recording, which is the
++///    oldest guarded frame it has not passed (BackPassed, run in order after each present's
++///    lists), or failing that the copy of a newer frame, which is older than memory;
++///  - what uploads read from a frame's copies is handed back as guest writes once the back has
++///    passed that frame (not at its fence: the back records the next frame before the fence),
++///    and =3 holds a write only until the back has passed the newest frame guarded when it was
++///    made;
++///  - a slot is lifted at its own fence, as the one slot is.
++/// With one slot everything is as before.
++inline constexpr u32 MaxSlots = 2;
++
++inline u32 SlotCount() {
++    static const u32 slots = [] {
++        const char* value = std::getenv("EDEN_UP_AHEAD_GUARD_SLOTS");
++        const u32 parsed = value != nullptr && value[0] == '2' && value[1] == '\0' ? 2U : 1U;
++        if (parsed == 2 && Mode() != 0) {
++            LOG_INFO(HW_GPU, "EDEN_UP_AHEAD_GUARD_SLOTS=2: the guard covers two frames in flight");
++        }
++        return parsed;
++    }();
++    return slots;
++}
++
+ inline constexpr u64 AddressBits = 36; // the device address space
+ inline constexpr u64 PageBits = 12;
+ inline constexpr u64 PageSize = u64{1} << PageBits;
+@@ -209,15 +244,23 @@ inline constexpr u32 NoSlot = ~u32{0};
+ struct State {
+     using Clock = std::chrono::steady_clock;
+     using Run = std::pair<u64, size_t>; // device address, bytes
++    using Bits = std::unique_ptr<std::atomic<u64>[]>;
++
++    State() {
++        for (u32 slot = 0; slot < SlotCount(); ++slot) {
++            guarded[slot].reset(new std::atomic<u64>[PageLimit / 64]());
++            copied[slot].reset(new std::atomic<u64>[PageLimit / 64]());
++        }
++    }
+ 
+     std::mutex mutex;
+     std::condition_variable released;
+     /// Pages of `current` (under the mutex).
+     std::unique_ptr<u64[]> seen{new u64[PageLimit / 64]()};
+-    /// Pages guarded now: read by guest threads without the mutex.
+-    std::unique_ptr<std::atomic<u64>[]> guarded{new std::atomic<u64>[PageLimit / 64]()};
+-    /// Pages that have a copy now: read by the GPU thread without the mutex (ReadGpu).
+-    std::unique_ptr<std::atomic<u64>[]> copied{new std::atomic<u64>[PageLimit / 64]()};
++    /// [slot] pages guarded now for that slot's frame: read by guest threads without the mutex.
++    std::array<Bits, MaxSlots> guarded;
++    /// [slot] pages with a copy for that slot's frame: read without the mutex (ReadGpu, HasCopy).
++    std::array<Bits, MaxSlots> copied;
+     /// Pages the GPU thread read since the last frame end.
+     std::vector<u32> current;
+     struct Frame {
+@@ -227,20 +270,34 @@ struct State {
+     std::array<Frame, 4> frames; ///< by present number & 3
+     u64 last_ended{};            ///< newest present number whose frame end was noted
+ 
+-    std::atomic<bool> active{};
+-    std::vector<u32> armed_pages; ///< sorted; those whose `guarded` bit is still set are trapped
+-    u64 armed_frame{~u64{0}};
++    struct Slot {
++        bool armed{};
++        u64 frame{~u64{0}};
++        u64 serial{};
++        u32 fence_id{}, fence_value{}; ///< the present's fence (AtPresent looks at it too)
++        Clock::time_point armed_at{};
++        std::vector<u32> pages; ///< those whose `guarded` bit is still set are trapped
++        /// Ranges an upload read from this slot's copies (device address, bytes).
++        std::vector<std::pair<u64, u32>> served;
++    };
++    std::array<Slot, MaxSlots> slots;
++    std::atomic<bool> active{};     ///< a slot is armed
++    std::atomic<u32> armed_mask{};  ///< bit per armed slot
++    std::atomic<u64> newest_armed{}; ///< newest armed slot's frame + 1, 0: none
++    /// Present number + 1 of the newest present whose command lists the back has passed
++    /// (BackPassed): the back records that frame now. 0: none yet.
++    std::atomic<u64> back_recording{};
+     u64 arm_serial{};
+-    Clock::time_point armed_at{};
+ 
+     // Copy mode (all under the mutex).
+-    std::unique_ptr<u8[]> copy_bytes;  ///< CopyCapacity() pages, made at the first copy
+-    std::vector<u32> copy_page;        ///< [slot] the device page copied there
+-    std::vector<u32> copy_index;       ///< open addressing over page: slot + 1, 0 = empty
++    std::unique_ptr<u8[]> copy_bytes; ///< CopyCapacity() pages, made at the first copy
++    std::vector<u32> copy_page;       ///< [copy] the device page copied there
++    std::vector<u8> copy_mask;        ///< [copy] the slots it serves, 0 = free
++    std::vector<u32> copy_free;       ///< free copies, the next at the back
++    std::vector<u32> copy_index;      ///< open addressing over page: copy + 1, 0 = empty
+     u32 copies_used{};
+-    /// Ranges an upload read from copies in the guard armed now, and those of guards lifted
+-    /// since the last gather (device address, bytes).
+-    std::vector<std::pair<u64, u32>> served, redirty;
++    /// Ranges of slots passed or lifted since the last gather (device address, bytes).
++    std::vector<std::pair<u64, u32>> redirty;
+     std::atomic<bool> redirty_ready{}; ///< `redirty` is not empty
+ 
+     // EDEN_UP_AHEAD_GUARD_FRONT (all under the mutex).
+@@ -252,7 +309,7 @@ struct State {
+ 
+     // Per log window (under the mutex).
+     struct Stats {
+-        u32 presents{}, arms{}, overlaps{}, gave_up{}, gave_up_gpu{};
++        u32 presents{}, arms{}, overlaps{}, gave_up{}, gave_up_gpu{}, second_arms{};
+         u64 pages{}, runs{};
+         long long arm_us{}, max_arm_us{}, armed_us{};
+         u32 holds{};
+@@ -265,7 +322,8 @@ struct State {
+         };
+         std::array<Thread, 6> threads{}; ///< the first six guest threads that waited
+         u32 other_thread_holds{};
+-        u64 copies{}, copy_reads{}, copy_read_bytes{}, value_reads{};
++        u64 copies{}, shared_copies{}, copy_reads{}, copy_read_bytes{}, value_reads{};
++        u64 newer_copy_reads{};
+         u64 other_copies{}, other_skipped{};
+         u64 front_pages{}, front_late{};
+         u32 most_copies{}, pool_full{};
+@@ -279,83 +337,31 @@ inline State& Get() {
+     return *state;
+ }
+ 
+-/// The GPU thread reads [device_addr, device_addr + size) of guest memory for a buffer (an
+-/// upload or a streamed uniform block).
+-inline void NoteRead(u64 device_addr, u64 size) {
+-    constexpr u64 limit = u64{1} << AddressBits;
+-    if (size == 0 || device_addr >= limit) {
+-        return;
+-    }
+-    State& s = Get();
+-    const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
+-    std::scoped_lock lk{s.mutex};
+-    const bool armed = s.active.load(std::memory_order_relaxed);
+-    for (u64 page = device_addr >> PageBits; page <= last; ++page) {
+-        u64& word = s.seen[page / 64];
+-        const u64 bit = u64{1} << (page % 64);
+-        if ((word & bit) == 0) {
+-            word |= bit;
+-            s.current.push_back(static_cast<u32>(page));
+-            if (armed) {
+-                // A page this frame reads for the first time while its guard is up: was it in
+-                // the guard (still trapped, or copied)? If not, the guess from the frames
+-                // before missed it and a guest write to it goes unseen.
+-                ++s.stats.armed_new_pages;
+-                if ((s.guarded[page / 64].load(std::memory_order_relaxed) & bit) == 0 &&
+-                    (s.copied[page / 64].load(std::memory_order_relaxed) & bit) == 0) {
+-                    ++s.stats.armed_unguarded_pages;
+-                }
+-            }
+-        }
+-    }
++namespace Detail {
++
++inline u64 Bit(u64 page) {
++    return u64{1} << (page % 64);
+ }
+ 
+-/// EDEN_UP_AHEAD_GUARD_FRONT, on the split's front: a command list binds a constant buffer of
+-/// `size` bytes at `device_addr`. Its pages go into the next guard; with a guard up they are
+-/// trapped now (a list parsed late, or the next frame's, whose buffer no thread should write
+-/// again before its frame is drawn).
+-inline void NoteFront(u64 device_addr, u64 size) {
+-    constexpr u64 limit = u64{1} << AddressBits;
+-    if (size == 0 || device_addr >= limit) {
+-        return;
+-    }
+-    State& s = Get();
+-    const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
+-    std::vector<State::Run> late;
+-    std::scoped_lock lk{s.mutex};
+-    if (!s.front_seen) {
+-        s.front_seen.reset(new u64[PageLimit / 64]());
+-    }
+-    const bool armed = s.active.load(std::memory_order_relaxed) && s.trap != nullptr;
+-    for (u64 page = device_addr >> PageBits; page <= last; ++page) {
+-        const u64 bit = u64{1} << (page % 64);
+-        u64& word = s.front_seen[page / 64];
+-        if ((word & bit) != 0) {
+-            continue;
+-        }
+-        word |= bit;
+-        s.front_pages.push_back(static_cast<u32>(page));
+-        ++s.stats.front_pages;
+-        if (armed && ((s.guarded[page / 64].load(std::memory_order_relaxed) |
+-                       s.copied[page / 64].load(std::memory_order_relaxed)) &
+-                      bit) == 0) {
+-            s.guarded[page / 64].fetch_or(bit, std::memory_order_relaxed);
+-            s.armed_pages.push_back(static_cast<u32>(page));
+-            if (!late.empty() && late.back().first + late.back().second == page << PageBits) {
+-                late.back().second += PageSize;
+-            } else {
+-                late.emplace_back(page << PageBits, static_cast<size_t>(PageSize));
+-            }
+-            ++s.stats.front_late;
++inline bool GuardedBit(const State& s, u32 slot, u64 page) {
++    return (s.guarded[slot][page / 64].load(std::memory_order_relaxed) & Bit(page)) != 0;
++}
++
++inline bool CopiedBit(const State& s, u32 slot, u64 page) {
++    return (s.copied[slot][page / 64].load(std::memory_order_acquire) & Bit(page)) != 0;
++}
++
++/// The slots whose bit is set for `page` in `bits` (guarded or copied).
++inline u32 SlotsWith(const std::array<State::Bits, MaxSlots>& bits, u64 page) {
++    u32 mask = 0;
++    for (u32 slot = 0; slot < SlotCount(); ++slot) {
++        if ((bits[slot][page / 64].load(std::memory_order_acquire) & Bit(page)) != 0) {
++            mask |= 1U << slot;
+         }
+     }
+-    if (!late.empty()) {
+-        s.trap(s.trap_context, late, 1);
+-    }
++    return mask;
+ }
+ 
+-namespace Detail {
+-
+ inline void EndFrameLocked(State& s, u64 number) {
+     if (number <= s.last_ended) {
+         return;
+@@ -365,15 +371,11 @@ inline void EndFrameLocked(State& s, u64 number) {
+     frame.pages.swap(s.current);
+     s.current.clear();
+     for (const u32 page : frame.pages) {
+-        s.seen[page / 64] &= ~(u64{1} << (page % 64));
++        s.seen[page / 64] &= ~Bit(page);
+     }
+     s.last_ended = number;
+ }
+ 
+-inline bool GuardedBit(const State& s, u64 page) {
+-    return (s.guarded[page / 64].load(std::memory_order_relaxed) & (u64{1} << (page % 64))) != 0;
+-}
+-
+ /// Consecutive pages of a sorted list as device ranges.
+ template <class Keep>
+ void RunsOf(const std::vector<u32>& pages, std::vector<State::Run>& runs, Keep&& keep) {
+@@ -392,61 +394,199 @@ void RunsOf(const std::vector<u32>& pages, std::vector<State::Run>& runs, Keep&&
+     }
+ }
+ 
+-inline u32 FindCopy(const State& s, u64 page) {
++inline size_t IndexHome(const State& s, u64 page) {
++    return (page * 0x9E3779B97F4A7C15ULL >> 40) & (s.copy_index.size() - 1);
++}
++
++/// The copy of `page` that serves `slot`, or NoSlot.
++inline u32 FindCopy(const State& s, u64 page, u32 slot) {
+     if (s.copies_used == 0 || s.copy_index.empty()) {
+         return NoSlot;
+     }
+     const size_t mask = s.copy_index.size() - 1;
+-    for (size_t at = (page * 0x9E3779B97F4A7C15ULL >> 40) & mask;; at = (at + 1) & mask) {
++    for (size_t at = IndexHome(s, page);; at = (at + 1) & mask) {
+         const u32 entry = s.copy_index[at];
+         if (entry == 0) {
+             return NoSlot;
+         }
+-        if (s.copy_page[entry - 1] == page) {
++        if (s.copy_page[entry - 1] == page && (s.copy_mask[entry - 1] & (1U << slot)) != 0) {
+             return entry - 1;
+         }
+     }
+ }
+ 
++inline void IndexInsert(State& s, u64 page, u32 copy) {
++    const size_t mask = s.copy_index.size() - 1;
++    size_t at = IndexHome(s, page);
++    while (s.copy_index[at] != 0) {
++        at = (at + 1) & mask;
++    }
++    s.copy_index[at] = copy + 1;
++}
++
++/// Copies `page` as it is now for the slots in `slots`. NoSlot: the pool is full.
+ template <class DeviceMemory>
+-void DisarmLocked(State& s, DeviceMemory& device_memory) {
+-    if (!s.active.load(std::memory_order_relaxed)) {
++u32 NewCopyLocked(State& s, u64 page, u32 slots, DeviceMemory& device_memory) {
++    const u32 capacity = CopyCapacity();
++    if (s.copies_used == capacity) {
++        return NoSlot;
++    }
++    if (!s.copy_bytes) {
++        s.copy_bytes.reset(new u8[u64{capacity} * PageSize]);
++        s.copy_page.assign(capacity, 0U);
++        s.copy_mask.assign(capacity, u8{0});
++        s.copy_free.resize(capacity);
++        for (u32 copy = 0; copy < capacity; ++copy) {
++            s.copy_free[copy] = capacity - 1 - copy; // copy 0 first, as the bump pool did
++        }
++        size_t index_size = 256;
++        while (index_size < size_t{capacity} * 2) {
++            index_size *= 2;
++        }
++        s.copy_index.assign(index_size, 0U);
++    }
++    const u32 copy = s.copy_free.back();
++    s.copy_free.pop_back();
++    ++s.copies_used;
++    s.stats.most_copies = (std::max)(s.stats.most_copies, s.copies_used);
++    device_memory.ReadBlockUnsafe(page << PageBits, s.copy_bytes.get() + u64{copy} * PageSize,
++                                  PageSize);
++    s.copy_page[copy] = static_cast<u32>(page);
++    s.copy_mask[copy] = static_cast<u8>(slots);
++    IndexInsert(s, page, copy);
++    for (u32 slot = 0; slot < SlotCount(); ++slot) {
++        if ((slots & (1U << slot)) != 0) {
++            s.copied[slot][page / 64].fetch_or(Bit(page), std::memory_order_release);
++        }
++    }
++    return copy;
++}
++
++inline void PublishArmedLocked(State& s) {
++    u32 mask = 0;
++    u64 newest = 0;
++    for (u32 slot = 0; slot < SlotCount(); ++slot) {
++        if (s.slots[slot].armed) {
++            mask |= 1U << slot;
++            newest = (std::max)(newest, s.slots[slot].frame + 1);
++        }
++    }
++    s.armed_mask.store(mask, std::memory_order_release);
++    s.newest_armed.store(newest, std::memory_order_release);
++    s.active.store(mask != 0, std::memory_order_release);
++}
++
++inline void HandBackServedLocked(State& s, State::Slot& slot) {
++    if (!slot.served.empty()) {
++        // What uploads took from the copies is a guest write for the next gather.
++        s.redirty.insert(s.redirty.end(), slot.served.begin(), slot.served.end());
++        slot.served.clear();
++        s.redirty_ready.store(true, std::memory_order_release);
++    }
++}
++
++/// Lifts the guard of one slot: its pages lose their trap and its copies go (a copy another
++/// slot still uses stays for that slot).
++template <class DeviceMemory>
++void ReleaseSlotLocked(State& s, u32 index, DeviceMemory& device_memory) {
++    State::Slot& slot = s.slots[index];
++    if (!slot.armed) {
+         return;
+     }
+     // The pages still trapped: a copied page gave its trap back when it was copied. Sorted
+     // again: NoteFront adds pages while the guard is up.
+-    std::sort(s.armed_pages.begin(), s.armed_pages.end());
+-    s.armed_pages.erase(std::unique(s.armed_pages.begin(), s.armed_pages.end()),
+-                        s.armed_pages.end());
++    std::sort(slot.pages.begin(), slot.pages.end());
++    slot.pages.erase(std::unique(slot.pages.begin(), slot.pages.end()), slot.pages.end());
+     std::vector<State::Run> runs;
+-    RunsOf(s.armed_pages, runs, [&s](u32 page) { return GuardedBit(s, page); });
+-    for (const u32 page : s.armed_pages) {
+-        s.guarded[page / 64].fetch_and(~(u64{1} << (page % 64)), std::memory_order_relaxed);
++    RunsOf(slot.pages, runs, [&s, index](u32 page) { return GuardedBit(s, index, page); });
++    for (const u32 page : slot.pages) {
++        s.guarded[index][page / 64].fetch_and(~Bit(page), std::memory_order_relaxed);
+     }
+-    s.active.store(false, std::memory_order_release);
++    slot.armed = false;
++    PublishArmedLocked(s);
+     device_memory.UpdatePagesCachedBatch(runs, -1);
+-    s.armed_pages.clear();
++    slot.pages.clear();
+     if (s.copies_used != 0) {
+         // The frame is done: its copies go.
+-        s.stats.most_copies = (std::max)(s.stats.most_copies, s.copies_used);
+-        for (u32 slot = 0; slot < s.copies_used; ++slot) {
+-            const u32 page = s.copy_page[slot];
+-            s.copied[page / 64].fetch_and(~(u64{1} << (page % 64)), std::memory_order_relaxed);
++        const u8 bit = static_cast<u8>(1U << index);
++        bool freed = false;
++        for (u32 copy = 0; copy < static_cast<u32>(s.copy_mask.size()); ++copy) {
++            if ((s.copy_mask[copy] & bit) == 0) {
++                continue;
++            }
++            const u32 page = s.copy_page[copy];
++            s.copied[index][page / 64].fetch_and(~Bit(page), std::memory_order_relaxed);
++            s.copy_mask[copy] = static_cast<u8>(s.copy_mask[copy] & ~bit);
++            if (s.copy_mask[copy] == 0) {
++                s.copy_free.push_back(copy);
++                --s.copies_used;
++                freed = true;
++            }
++        }
++        if (freed) {
++            std::fill(s.copy_index.begin(), s.copy_index.end(), 0U);
++            for (u32 copy = 0; copy < static_cast<u32>(s.copy_mask.size()); ++copy) {
++                if (s.copy_mask[copy] != 0) {
++                    IndexInsert(s, s.copy_page[copy], copy);
++                }
++            }
+         }
+-        s.copies_used = 0;
+-        std::fill(s.copy_index.begin(), s.copy_index.end(), 0U);
+-    }
+-    if (!s.served.empty()) {
+-        // What uploads took from the copies is a guest write for the next gather.
+-        s.redirty.insert(s.redirty.end(), s.served.begin(), s.served.end());
+-        s.served.clear();
+-        s.redirty_ready.store(true, std::memory_order_release);
+     }
++    HandBackServedLocked(s, slot);
+     s.stats.armed_us += std::chrono::duration_cast<std::chrono::microseconds>(
+-                            State::Clock::now() - s.armed_at)
++                            State::Clock::now() - slot.armed_at)
+                             .count();
+ }
+ 
++/// Lifts every slot (a writer gave up waiting).
++template <class DeviceMemory>
++void DisarmLocked(State& s, DeviceMemory& device_memory) {
++    for (u32 slot = 0; slot < SlotCount(); ++slot) {
++        ReleaseSlotLocked(s, slot, device_memory);
++    }
++}
++
++/// Lifts the slots armed for frames up to `number`.
++template <class DeviceMemory>
++bool ReleaseUpToLocked(State& s, u64 number, DeviceMemory& device_memory) {
++    bool lifted = false;
++    for (u32 slot = 0; slot < SlotCount(); ++slot) {
++        if (s.slots[slot].armed && s.slots[slot].frame <= number) {
++            ReleaseSlotLocked(s, slot, device_memory);
++            lifted = true;
++        }
++    }
++    return lifted;
++}
++
++/// The slots whose copies a GPU thread read may take now, oldest frame first. One slot: the
++/// armed one. Two: the armed slots of frames the back has not passed.
++inline u32 ReadOrderLocked(const State& s, std::array<u32, MaxSlots>& order) {
++    const u64 recording = s.back_recording.load(std::memory_order_acquire);
++    u32 count = 0;
++    for (u32 slot = 0; slot < SlotCount(); ++slot) {
++        const State::Slot& candidate = s.slots[slot];
++        if (candidate.armed && (SlotCount() == 1 || candidate.frame >= recording)) {
++            order[count++] = slot;
++        }
++    }
++    if (count == 2 && s.slots[order[0]].frame > s.slots[order[1]].frame) {
++        std::swap(order[0], order[1]);
++    }
++    return count;
++}
++
++/// The copy a GPU thread read of `page` takes, and the slot it is read for; NoSlot: memory.
++inline std::pair<u32, u32> CopyForRead(const State& s, u64 page,
++                                       const std::array<u32, MaxSlots>& order, u32 count) {
++    for (u32 i = 0; i < count; ++i) {
++        if (const u32 copy = FindCopy(s, page, order[i]); copy != NoSlot) {
++            return {copy, i};
++        }
++    }
++    return {NoSlot, 0};
++}
++
+ inline void LogWindowLocked(State& s, u64 present_number) {
+     State::Stats& st = s.stats;
+     if (++st.presents < 300) {
+@@ -458,12 +598,12 @@ inline void LogWindowLocked(State& s, u64 present_number) {
+              "EDEN_UP_AHEAD_GUARD: last 300 presents (to #{}): armed {} ({} while one was still "
+              "armed), {} pages in {} runs each, arming {} us (max {}), armed {} us each; {} "
+              "writes waited, {} us each (max {}), by core {}/{}/{}/{}/{}/{}/other {}; lifted "
+-             "early {} ({} for a waiting GPU channel)",
++             "early {} ({} for a waiting GPU channel); {} slots, {} armed beside another",
+              present_number, st.arms, st.overlaps, st.pages / arms, st.runs / arms,
+              st.arm_us / arms, st.max_arm_us, st.armed_us / arms, st.holds, st.held_us / holds,
+              st.max_held_us, st.core_holds[0], st.core_holds[1], st.core_holds[2],
+              st.core_holds[3], st.core_holds[4], st.core_holds[5], st.core_holds[6], st.gave_up,
+-             st.gave_up_gpu);
++             st.gave_up_gpu, SlotCount(), st.second_arms);
+     if (st.holds != 0) {
+         LOG_INFO(HW_GPU,
+                  "EDEN_UP_AHEAD_GUARD: guest threads that waited (id: writes, ms in all): {}: {}, "
+@@ -482,33 +622,136 @@ inline void LogWindowLocked(State& s, u64 present_number) {
+                  "{} of {}), the pool was full {} times; {} GPU thread reads took {} KiB from "
+                  "copies, and {} handle or pointer reads; of {} pages first read with a guard "
+                  "up, {} were not in it; {} pages outside the guard copied before a write ({} "
+-                 "left for a full pool); the front named {} pages, {} of them with a guard up",
++                 "left for a full pool); the front named {} pages, {} of them with a guard up; "
++                 "{} copies served both slots, {} reads took a newer frame's copy",
+                  st.copies, st.copies / arms, st.most_copies, CopyCapacity(), st.pool_full,
+                  st.copy_reads, st.copy_read_bytes >> 10, st.value_reads, st.armed_new_pages,
+                  st.armed_unguarded_pages, st.other_copies, st.other_skipped, st.front_pages,
+-                 st.front_late);
++                 st.front_late, st.shared_copies, st.newer_copy_reads);
+     }
+     st = {};
+ }
+ 
+ } // namespace Detail
+ 
++/// The GPU thread reads [device_addr, device_addr + size) of guest memory for a buffer (an
++/// upload or a streamed uniform block).
++inline void NoteRead(u64 device_addr, u64 size) {
++    constexpr u64 limit = u64{1} << AddressBits;
++    if (size == 0 || device_addr >= limit) {
++        return;
++    }
++    State& s = Get();
++    const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
++    std::scoped_lock lk{s.mutex};
++    const bool armed = s.active.load(std::memory_order_relaxed);
++    for (u64 page = device_addr >> PageBits; page <= last; ++page) {
++        u64& word = s.seen[page / 64];
++        const u64 bit = Detail::Bit(page);
++        if ((word & bit) == 0) {
++            word |= bit;
++            s.current.push_back(static_cast<u32>(page));
++            if (armed) {
++                // A page this frame reads for the first time while a guard is up: was it in
++                // one (still trapped, or copied)? If not, the guess from the frames before
++                // missed it and a guest write to it goes unseen.
++                ++s.stats.armed_new_pages;
++                if (Detail::SlotsWith(s.guarded, page) == 0 &&
++                    Detail::SlotsWith(s.copied, page) == 0) {
++                    ++s.stats.armed_unguarded_pages;
++                }
++            }
++        }
++    }
++}
++
++/// EDEN_UP_AHEAD_GUARD_FRONT, on the split's front: a command list binds a constant buffer of
++/// `size` bytes at `device_addr`. Its pages go into the next guard; with a guard up they are
++/// trapped now for the newest guarded frame (a list parsed late, or the next frame's, whose
++/// buffer no thread should write again before its frame is drawn).
++inline void NoteFront(u64 device_addr, u64 size) {
++    constexpr u64 limit = u64{1} << AddressBits;
++    if (size == 0 || device_addr >= limit) {
++        return;
++    }
++    State& s = Get();
++    const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
++    std::vector<State::Run> late;
++    std::scoped_lock lk{s.mutex};
++    if (!s.front_seen) {
++        s.front_seen.reset(new u64[PageLimit / 64]());
++    }
++    u32 newest = NoSlot;
++    for (u32 slot = 0; slot < SlotCount(); ++slot) {
++        if (s.slots[slot].armed &&
++            (newest == NoSlot || s.slots[slot].frame > s.slots[newest].frame)) {
++            newest = slot;
++        }
++    }
++    const bool armed = newest != NoSlot && s.trap != nullptr;
++    for (u64 page = device_addr >> PageBits; page <= last; ++page) {
++        const u64 bit = Detail::Bit(page);
++        u64& word = s.front_seen[page / 64];
++        if ((word & bit) != 0) {
++            continue;
++        }
++        word |= bit;
++        s.front_pages.push_back(static_cast<u32>(page));
++        ++s.stats.front_pages;
++        if (armed && ((s.guarded[newest][page / 64].load(std::memory_order_relaxed) |
++                       s.copied[newest][page / 64].load(std::memory_order_relaxed)) &
++                      bit) == 0) {
++            s.guarded[newest][page / 64].fetch_or(bit, std::memory_order_relaxed);
++            s.slots[newest].pages.push_back(static_cast<u32>(page));
++            if (!late.empty() && late.back().first + late.back().second == page << PageBits) {
++                late.back().second += PageSize;
++            } else {
++                late.emplace_back(page << PageBits, static_cast<size_t>(PageSize));
++            }
++            ++s.stats.front_late;
++        }
++    }
++    if (!late.empty()) {
++        s.trap(s.trap_context, late, 1);
++    }
++}
++
+ /// The frame of present `number` ended (its fence was reached): its pages become a finished
+-/// frame's, and a guard armed for it is lifted. Runs on the thread that makes the fence's
+-/// increment, or on the present's thread when the fence was reached already.
++/// frame's, and the guards armed for it and for frames before it are lifted. Runs on the thread
++/// that makes the fence's increment, or on the present's thread when the fence was reached
++/// already.
+ template <class DeviceMemory>
+ void AtFence(u64 number, DeviceMemory& device_memory) {
+     State& s = Get();
+     {
+         std::scoped_lock lk{s.mutex};
+         Detail::EndFrameLocked(s, number);
+-        if (s.active.load(std::memory_order_relaxed) && s.armed_frame <= number) {
+-            Detail::DisarmLocked(s, device_memory);
+-        }
++        Detail::ReleaseUpToLocked(s, number, device_memory);
+     }
+     s.released.notify_all();
+ }
+ 
++/// EDEN_UP_AHEAD_GUARD_SLOTS=2: the back has passed every command list submitted before present
++/// `number` (run in order on it after them), so it records the next frame now. What uploads read
++/// from that frame's copies goes back to the next gather as guest writes, and =3 lets the writes
++/// held for it go.
++inline void BackPassed(u64 number) {
++    State& s = Get();
++    std::scoped_lock lk{s.mutex};
++    if (number + 1 > s.back_recording.load(std::memory_order_relaxed)) {
++        s.back_recording.store(number + 1, std::memory_order_release);
++    }
++    // The pages frame `number` read are all read now. Its fence can come frames later, and the
++    // back reads the next frames meanwhile: ended at the fence, a frame's pages would be some of
++    // its own and some of the frames after it, and the guess for the next guard would miss pages.
++    Detail::EndFrameLocked(s, number);
++    for (u32 slot = 0; slot < SlotCount(); ++slot) {
++        if (s.slots[slot].armed && s.slots[slot].frame <= number) {
++            Detail::HandBackServedLocked(s, s.slots[slot]);
++        }
++    }
++}
++
+ /// From nx2:vi2 PresentClientBuffer after its waits, before the reply. `previous_reached`: the
+ /// previous present's fence is known to be reached.
+ template <class DeviceMemory, class Syncpoints>
+@@ -521,17 +764,32 @@ void AtPresent(u64 number, u32 fence_id, u32 fence_value, bool previous_reached,
+         if (previous_reached && number != 0) {
+             // Its fence action may still be queued behind this thread's own wake.
+             Detail::EndFrameLocked(s, number - 1);
+-            if (s.active.load(std::memory_order_relaxed) && s.armed_frame < number) {
+-                Detail::DisarmLocked(s, device_memory);
+-                lifted = true;
++            lifted = Detail::ReleaseUpToLocked(s, number - 1, device_memory);
++        }
++        // Two slots: the frame two back is done too when this present waited for it
++        // (EDEN_UP_AHEAD_TWO), and its fence action may be queued in the same way.
++        for (u32 slot = 0; slot < SlotCount(); ++slot) {
++            const State::Slot& armed = s.slots[slot];
++            if (SlotCount() == 2 && armed.armed &&
++                syncpoints.IsReadyGuest(armed.fence_id, armed.fence_value)) {
++                const u64 frame = armed.frame;
++                Detail::EndFrameLocked(s, frame);
++                lifted |= Detail::ReleaseUpToLocked(s, frame, device_memory);
+             }
+         }
+         if (!syncpoints.IsReadyGuest(fence_id, fence_value)) {
+-            if (s.active.load(std::memory_order_relaxed)) {
++            u32 free_slot = NoSlot;
++            for (u32 slot = 0; slot < SlotCount() && free_slot == NoSlot; ++slot) {
++                if (!s.slots[slot].armed) {
++                    free_slot = slot;
++                }
++            }
++            if (free_slot == NoSlot) {
+                 ++s.stats.overlaps;
+             } else {
+                 const auto start = State::Clock::now();
+-                std::vector<u32>& pages = s.armed_pages;
++                State::Slot& slot = s.slots[free_slot];
++                std::vector<u32>& pages = slot.pages;
+                 pages.assign(s.current.begin(), s.current.end());
+                 // EDEN_UP_AHEAD_GUARD_FRONT: what the front has parsed of this frame's binds.
+                 pages.insert(pages.end(), s.front_pages.begin(), s.front_pages.end());
+@@ -565,16 +823,22 @@ void AtPresent(u64 number, u32 fence_id, u32 fence_value, bool previous_reached,
+                     std::vector<State::Run> runs;
+                     Detail::RunsOf(pages, runs, [](u32) { return true; });
+                     for (const u32 page : pages) {
+-                        s.guarded[page / 64].fetch_or(u64{1} << (page % 64),
+-                                                      std::memory_order_relaxed);
++                        s.guarded[free_slot][page / 64].fetch_or(Detail::Bit(page),
++                                                                 std::memory_order_relaxed);
+                     }
+                     device_memory.UpdatePagesCachedBatch(runs, 1);
+-                    s.armed_frame = number;
+-                    ++s.arm_serial;
+-                    s.armed_at = State::Clock::now();
+-                    s.active.store(true, std::memory_order_release);
++                    if (s.active.load(std::memory_order_relaxed)) {
++                        ++s.stats.second_arms;
++                    }
++                    slot.armed = true;
++                    slot.frame = number;
++                    slot.serial = ++s.arm_serial;
++                    slot.fence_id = fence_id;
++                    slot.fence_value = fence_value;
++                    slot.armed_at = State::Clock::now();
++                    Detail::PublishArmedLocked(s);
+                     const long long arm_us = std::chrono::duration_cast<std::chrono::microseconds>(
+-                                                 s.armed_at - start)
++                                                 slot.armed_at - start)
+                                                  .count();
+                     ++s.stats.arms;
+                     s.stats.pages += pages.size();
+@@ -588,7 +852,7 @@ void AtPresent(u64 number, u32 fence_id, u32 fence_value, bool previous_reached,
+         // frame's lists are submitted after this present returns.
+         if (!s.front_pages.empty()) {
+             for (const u32 page : s.front_pages) {
+-                s.front_seen[page / 64] &= ~(u64{1} << (page % 64));
++                s.front_seen[page / 64] &= ~Detail::Bit(page);
+             }
+             s.front_pages.clear();
+         }
+@@ -613,14 +877,39 @@ inline bool Active() {
+     return Enabled() && Get().active.load(std::memory_order_acquire);
+ }
+ 
+-/// =3: a guard is up, so a guest write collected now that went to a copied page is a later
+-/// frame's and is applied after the guard is lifted (GPU::GatherAndApply).
++/// =3: a guard is up for a frame the back is still to record past, so a guest write collected
++/// now that went to a copied page is a later frame's and is applied after that
++/// (GPU::GatherAndApply). One slot: while the guard is up, as before.
+ inline bool HoldWrites() {
+-    return Mode() == 3 && Get().active.load(std::memory_order_acquire);
++    if (Mode() != 3) {
++        return false;
++    }
++    State& s = Get();
++    if (SlotCount() == 1) {
++        return s.active.load(std::memory_order_acquire);
++    }
++    const u64 newest = s.newest_armed.load(std::memory_order_acquire);
++    return newest != 0 && newest > s.back_recording.load(std::memory_order_acquire);
++}
++
++/// =3: what a write held now waits for (HoldWrites was true): the newest guarded frame.
++inline u64 HoldTag() {
++    const u64 newest = Get().newest_armed.load(std::memory_order_acquire);
++    return newest != 0 ? newest - 1 : 0;
++}
++
++/// =3: whether a write held with `tag` must wait still. One slot: while any guard is up, as
++/// before. Two: until the back has passed frame `tag`.
++inline bool StillHeld(u64 tag) {
++    State& s = Get();
++    if (SlotCount() == 1) {
++        return Mode() == 3 && s.active.load(std::memory_order_acquire);
++    }
++    return s.back_recording.load(std::memory_order_acquire) <= tag;
+ }
+ 
+-/// Whether a page of [device_addr, device_addr + size) has a copy now: a guest thread wrote it
+-/// after the present of the frame in flight. Lock-free.
++/// Whether a page of [device_addr, device_addr + size) has a copy now, for any frame in flight:
++/// a guest thread wrote it after the present of a guarded frame. Lock-free.
+ inline bool HasCopy(u64 device_addr, u64 size) {
+     constexpr u64 limit = u64{1} << AddressBits;
+     if (size == 0 || device_addr >= limit) {
+@@ -629,12 +918,13 @@ inline bool HasCopy(u64 device_addr, u64 size) {
+     State& s = Get();
+     const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
+     for (u64 page = device_addr >> PageBits; page <= last; ++page) {
+-        if ((s.copied[page / 64].load(std::memory_order_acquire) & (u64{1} << (page % 64))) != 0) {
++        if (Detail::SlotsWith(s.copied, page) != 0) {
+             return true;
+         }
+     }
+     return false;
+ }
++
+ inline bool Guarded(u64 device_addr, u64 size) {
+     constexpr u64 limit = u64{1} << AddressBits;
+     if (size == 0 || device_addr >= limit) {
+@@ -643,16 +933,19 @@ inline bool Guarded(u64 device_addr, u64 size) {
+     State& s = Get();
+     const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
+     for (u64 page = device_addr >> PageBits; page <= last; ++page) {
+-        if (Detail::GuardedBit(s, page)) {
+-            return true;
++        for (u32 slot = 0; slot < SlotCount(); ++slot) {
++            if (Detail::GuardedBit(s, slot, page)) {
++                return true;
++            }
+         }
+     }
+     return false;
+ }
+ 
+-/// Copy mode: a guest thread is about to write guarded pages. Each is copied as it is now, loses
+-/// its guard (and its trap: later writes to it are ordinary ones) and the write may go on. False:
+-/// the pool is full, the writer must wait instead (HoldWriter).
++/// Copy mode: a guest thread is about to write guarded pages. Each is copied once as it is now,
++/// for every slot that guards it (and with EDEN_UP_AHEAD_GUARD_ALL_WRITES for every other armed
++/// slot without a copy of it), loses those guards and their traps, and the write may go on.
++/// False: the pool is full, the writer must wait instead (HoldWriter).
+ template <class DeviceMemory>
+ bool CopyBeforeWrite(u64 device_addr, u64 size, DeviceMemory& device_memory) {
+     constexpr u64 limit = u64{1} << AddressBits;
+@@ -665,45 +958,39 @@ bool CopyBeforeWrite(u64 device_addr, u64 size, DeviceMemory& device_memory) {
+     if (!s.active.load(std::memory_order_relaxed)) {
+         return true;
+     }
++    const u32 armed = s.armed_mask.load(std::memory_order_relaxed);
+     for (u64 page = device_addr >> PageBits; page <= last; ++page) {
+-        if (!Detail::GuardedBit(s, page)) {
++        const u32 guards = Detail::SlotsWith(s.guarded, page) & armed;
++        if (guards == 0) {
+             continue;
+         }
+-        const u32 capacity = CopyCapacity();
+-        if (s.copies_used == capacity) {
++        u32 slots = guards;
++        if (AllWrites()) {
++            slots |= armed & ~Detail::SlotsWith(s.copied, page);
++        }
++        if (Detail::NewCopyLocked(s, page, slots, device_memory) == NoSlot) {
+             ++s.stats.pool_full;
+             return false;
+         }
+-        if (!s.copy_bytes) {
+-            s.copy_bytes.reset(new u8[u64{capacity} * PageSize]);
+-            s.copy_page.assign(capacity, 0U);
+-            size_t index_size = 256;
+-            while (index_size < size_t{capacity} * 2) {
+-                index_size *= 2;
++        int traps = 0;
++        for (u32 slot = 0; slot < SlotCount(); ++slot) {
++            if ((guards & (1U << slot)) != 0) {
++                s.guarded[slot][page / 64].fetch_and(~Detail::Bit(page),
++                                                     std::memory_order_relaxed);
++                ++traps;
+             }
+-            s.copy_index.assign(index_size, 0U);
+-        }
+-        const u32 slot = s.copies_used++;
+-        device_memory.ReadBlockUnsafe(page << PageBits, s.copy_bytes.get() + u64{slot} * PageSize,
+-                                      PageSize);
+-        s.copy_page[slot] = static_cast<u32>(page);
+-        const size_t mask = s.copy_index.size() - 1;
+-        size_t at = (page * 0x9E3779B97F4A7C15ULL >> 40) & mask;
+-        while (s.copy_index[at] != 0) {
+-            at = (at + 1) & mask;
+-        }
+-        s.copy_index[at] = slot + 1;
+-        s.copied[page / 64].fetch_or(u64{1} << (page % 64), std::memory_order_release);
+-        s.guarded[page / 64].fetch_and(~(u64{1} << (page % 64)), std::memory_order_relaxed);
+-        device_memory.UpdatePagesCachedCount(page << PageBits, PageSize, -1);
++        }
++        device_memory.UpdatePagesCachedCount(page << PageBits, PageSize, -traps);
+         ++s.stats.copies;
++        s.stats.shared_copies += (slots & (slots - 1)) != 0 ? 1 : 0;
+     }
+     return true;
+ }
+ 
+ /// EDEN_UP_AHEAD_GUARD_ALL_WRITES: a guest thread is about to write pages the caches track that
+-/// the guard did not guess. Each page without a copy gets one (while the pool has room); nothing
+-/// else changes for it: the cache that tracks the page still collects the write.
++/// the guard did not guess. Each page gets one copy for the armed slots that have none (while
++/// the pool has room); nothing else changes for it: the cache that tracks the page still
++/// collects the write.
+ template <class DeviceMemory>
+ void CopyOtherBeforeWrite(u64 device_addr, u64 size, DeviceMemory& device_memory) {
+     constexpr u64 limit = u64{1} << AddressBits;
+@@ -712,67 +999,54 @@ void CopyOtherBeforeWrite(u64 device_addr, u64 size, DeviceMemory& device_memory
+     }
+     State& s = Get();
+     const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
++    const auto wants = [&s](u64 page, u32 armed) {
++        return armed & ~(Detail::SlotsWith(s.copied, page) | Detail::SlotsWith(s.guarded, page));
++    };
+     bool wanted = false;
+-    for (u64 page = device_addr >> PageBits; page <= last && !wanted; ++page) {
+-        const u64 bit = u64{1} << (page % 64);
+-        wanted = ((s.copied[page / 64].load(std::memory_order_relaxed) |
+-                   s.guarded[page / 64].load(std::memory_order_relaxed)) &
+-                  bit) == 0;
++    {
++        const u32 armed = s.armed_mask.load(std::memory_order_acquire);
++        for (u64 page = device_addr >> PageBits; page <= last && !wanted; ++page) {
++            wanted = wants(page, armed) != 0;
++        }
+     }
+     if (!wanted) {
+         return;
+     }
+     std::scoped_lock lk{s.mutex};
+-    if (!s.active.load(std::memory_order_relaxed)) {
++    const u32 armed = s.armed_mask.load(std::memory_order_relaxed);
++    if (armed == 0) {
+         return;
+     }
+     for (u64 page = device_addr >> PageBits; page <= last; ++page) {
+-        const u64 bit = u64{1} << (page % 64);
+-        if (((s.copied[page / 64].load(std::memory_order_relaxed) |
+-              s.guarded[page / 64].load(std::memory_order_relaxed)) &
+-             bit) != 0) {
++        if (Detail::SlotsWith(s.guarded, page) != 0) {
++            continue; // CopyBeforeWrite's
++        }
++        const u32 slots = wants(page, armed);
++        if (slots == 0) {
+             continue;
+         }
+-        const u32 capacity = CopyCapacity();
+-        if (s.copies_used == capacity) {
++        if (Detail::NewCopyLocked(s, page, slots, device_memory) == NoSlot) {
+             ++s.stats.other_skipped;
+             return;
+         }
+-        if (!s.copy_bytes) {
+-            s.copy_bytes.reset(new u8[u64{capacity} * PageSize]);
+-            s.copy_page.assign(capacity, 0U);
+-            size_t index_size = 256;
+-            while (index_size < size_t{capacity} * 2) {
+-                index_size *= 2;
+-            }
+-            s.copy_index.assign(index_size, 0U);
+-        }
+-        const u32 slot = s.copies_used++;
+-        device_memory.ReadBlockUnsafe(page << PageBits, s.copy_bytes.get() + u64{slot} * PageSize,
+-                                      PageSize);
+-        s.copy_page[slot] = static_cast<u32>(page);
+-        const size_t mask = s.copy_index.size() - 1;
+-        size_t at = (page * 0x9E3779B97F4A7C15ULL >> 40) & mask;
+-        while (s.copy_index[at] != 0) {
+-            at = (at + 1) & mask;
+-        }
+-        s.copy_index[at] = slot + 1;
+-        s.copied[page / 64].fetch_or(bit, std::memory_order_release);
+         ++s.stats.other_copies;
+     }
+ }
+ 
+ /// Copy mode: the GPU thread's read of guest memory for a buffer. Bytes of a page copied for the
+-/// frame in flight come from its copy, the rest through `live(address, out, size)`. Under the
+-/// guard's lock, which a guest thread's CopyBeforeWrite takes before its write goes on: a read
+-/// sees a page either whole as presented or from its copy. `upload`: the bytes go into a host
+-/// buffer that the buffer cache then takes for memory's; what came from a copy is noted, and
+-/// handed to a gather as a guest write once the guard is lifted (TakeRedirty).
++/// frame the back records come from its copy (failing that, a newer guarded frame's copy), the
++/// rest through `live(address, out, size)`. Under the guard's lock, which a guest thread's
++/// CopyBeforeWrite takes before its write goes on: a read sees a page either whole as presented
++/// or from its copy. `upload`: the bytes go into a host buffer that the buffer cache then takes
++/// for memory's; what came from a copy is noted, and handed to a gather as a guest write once
++/// that frame is passed or lifted (TakeRedirty).
+ template <class Live>
+ void Read(u64 device_addr, u8* out, u64 size, bool upload, Live&& live) {
+     State& s = Get();
+     std::scoped_lock lk{s.mutex};
+-    if (s.copies_used == 0) {
++    std::array<u32, MaxSlots> order{};
++    const u32 count = s.copies_used == 0 ? 0 : Detail::ReadOrderLocked(s, order);
++    if (count == 0) {
+         live(device_addr, out, size);
+         return;
+     }
+@@ -780,20 +1054,22 @@ void Read(u64 device_addr, u8* out, u64 size, bool upload, Live&& live) {
+     for (u64 at = device_addr; at < end;) {
+         const u64 page = at >> PageBits;
+         u64 piece_end = (std::min)(end, (page + 1) << PageBits);
+-        const u32 slot = page < PageLimit ? Detail::FindCopy(s, page) : NoSlot;
+-        if (slot != NoSlot) {
++        const auto [copy, rank] = page < PageLimit ? Detail::CopyForRead(s, page, order, count)
++                                                   : std::pair<u32, u32>{NoSlot, 0};
++        if (copy != NoSlot) {
+             std::memcpy(out + (at - device_addr),
+-                        s.copy_bytes.get() + u64{slot} * PageSize + (at & (PageSize - 1)),
++                        s.copy_bytes.get() + u64{copy} * PageSize + (at & (PageSize - 1)),
+                         piece_end - at);
+             ++s.stats.copy_reads;
++            s.stats.newer_copy_reads += rank != 0 ? 1 : 0;
+             s.stats.copy_read_bytes += piece_end - at;
+             if (upload) {
+-                s.served.emplace_back(at, static_cast<u32>(piece_end - at));
++                s.slots[order[rank]].served.emplace_back(at, static_cast<u32>(piece_end - at));
+             }
+         } else {
+             // On over the pages after it that have no copy either.
+             while (piece_end < end && (piece_end >> PageBits) < PageLimit &&
+-                   Detail::FindCopy(s, piece_end >> PageBits) == NoSlot) {
++                   Detail::CopyForRead(s, piece_end >> PageBits, order, count).first == NoSlot) {
+                 piece_end = (std::min)(end, ((piece_end >> PageBits) + 1) << PageBits);
+             }
+             live(at, out + (at - device_addr), piece_end - at);
+@@ -804,8 +1080,8 @@ void Read(u64 device_addr, u8* out, u64 size, bool upload, Live&& live) {
+ 
+ /// Copy mode: a small value the GPU thread reads from guest memory at a GPU address when it draws
+ /// (a texture handle or a storage buffer's pointer in a constant buffer): from the page's copy
+-/// when it has one. The page's bit is looked at without the lock; a value that crosses a page, or
+-/// has no device address, is read as before.
++/// when it has one for the frame the back records. The page's bits are looked at without the
++/// lock; a value that crosses a page, or has no device address, is read as before.
+ template <class T, class GpuMemory>
+ [[nodiscard]] T ReadGpu(GpuMemory& gpu_memory, u64 gpu_addr) {
+     if (!CopyMode() || (gpu_addr & (PageSize - 1)) > PageSize - sizeof(T)) {
+@@ -820,29 +1096,31 @@ template <class T, class GpuMemory>
+         return gpu_memory.template Read<T>(gpu_addr);
+     }
+     const u64 page = static_cast<u64>(*device_addr) >> PageBits;
+-    if (page >= PageLimit || (s.copied[page / 64].load(std::memory_order_acquire) &
+-                              (u64{1} << (page % 64))) == 0) {
++    if (page >= PageLimit || Detail::SlotsWith(s.copied, page) == 0) {
+         return gpu_memory.template Read<T>(gpu_addr);
+     }
+     std::scoped_lock lk{s.mutex};
+-    const u32 slot = Detail::FindCopy(s, page);
+-    if (slot == NoSlot) {
++    std::array<u32, MaxSlots> order{};
++    const u32 count = Detail::ReadOrderLocked(s, order);
++    const auto [copy, rank] = Detail::CopyForRead(s, page, order, count);
++    if (copy == NoSlot) {
+         return gpu_memory.template Read<T>(gpu_addr);
+     }
+     T value{};
+     std::memcpy(&value,
+-                s.copy_bytes.get() + u64{slot} * PageSize +
++                s.copy_bytes.get() + u64{copy} * PageSize +
+                     (static_cast<u64>(*device_addr) & (PageSize - 1)),
+                 sizeof(T));
+     ++s.stats.value_reads;
++    s.stats.newer_copy_reads += rank != 0 ? 1 : 0;
+     return value;
+ }
+ 
+-/// Copy mode: the ranges uploads read from copies in guards lifted since the last call, as guest
+-/// writes (`write(device_addr, size)`) for the gather that applies them: a buffer uploaded from
+-/// a copy holds the presented frame's bytes, and memory has the newer ones. Only those ranges:
+-/// an upload range is the guest's (GPU-written bytes are left out of uploads), a whole page may
+-/// not be.
++/// Copy mode: the ranges uploads read from copies of frames passed or lifted since the last
++/// call, as guest writes (`write(device_addr, size)`) for the gather that applies them: a buffer
++/// uploaded from a copy holds the presented frame's bytes, and memory has the newer ones. Only
++/// those ranges: an upload range is the guest's (GPU-written bytes are left out of uploads), a
++/// whole page may not be.
+ template <class Write>
+ void TakeRedirty(Write&& write) {
+     if (!Enabled()) {
+@@ -863,29 +1141,55 @@ void TakeRedirty(Write&& write) {
+     }
+ }
+ 
+-/// A guest thread on a CPU core is about to write a guarded page: waits until the guard is lifted
+-/// (the caller leaves other host threads alone: the GPU threads never wait here). `stop()`
+-/// returns 1 when the wait must end at once (power off) and 2 while a GPU channel is suspended
+-/// (with EDEN_UP_AHEAD_GUARD_GPU_ESCAPE=1 the wait then ends after 3 ms). Ending a wait early
+-/// lifts the guard for the frame, so later writers don't wait in turn.
++/// A guest thread on a CPU core is about to write a guarded page: waits until the slots that
++/// guard it are lifted (the caller leaves other host threads alone: the GPU threads never wait
++/// here). `stop()` returns 1 when the wait must end at once (power off) and 2 while a GPU channel
++/// is suspended (with EDEN_UP_AHEAD_GUARD_GPU_ESCAPE=1 the wait then ends after 3 ms). Ending a
++/// wait early lifts those slots, so later writers don't wait in turn.
+ template <class DeviceMemory, class Stop>
+ void HoldWriter(u64 device_addr, u64 size, size_t core, u64 thread_id, DeviceMemory& device_memory,
+                 Stop&& stop) {
++    constexpr u64 limit = u64{1} << AddressBits;
+     State& s = Get();
+     const auto start = State::Clock::now();
+     bool lifted = false;
+     {
+         std::unique_lock lk{s.mutex};
+-        if (!s.active.load(std::memory_order_relaxed)) {
++        if (!s.active.load(std::memory_order_relaxed) || size == 0 || device_addr >= limit) {
+             return;
+         }
+-        const u64 serial = s.arm_serial;
+-        const u64 frame = s.armed_frame;
++        // The slots this write waits for, as armed now.
++        u32 waits_for = 0;
++        const u64 last = ((std::min)(device_addr + size, limit) - 1) >> PageBits;
++        for (u64 page = device_addr >> PageBits; page <= last; ++page) {
++            waits_for |= Detail::SlotsWith(s.guarded, page);
++        }
++        waits_for &= s.armed_mask.load(std::memory_order_relaxed);
++        if (waits_for == 0) {
++            return;
++        }
++        std::array<u64, MaxSlots> serials{};
++        u64 frame = ~u64{0};
++        for (u32 slot = 0; slot < SlotCount(); ++slot) {
++            if ((waits_for & (1U << slot)) != 0) {
++                serials[slot] = s.slots[slot].serial;
++                frame = (std::min)(frame, s.slots[slot].frame);
++            }
++        }
++        const auto still_up = [&] {
++            for (u32 slot = 0; slot < SlotCount(); ++slot) {
++                if ((waits_for & (1U << slot)) != 0 && s.slots[slot].armed &&
++                    s.slots[slot].serial == serials[slot]) {
++                    return true;
++                }
++            }
++            return false;
++        };
+         bool gpu_waited = false;
+         int gave_up = 0;
+-        while (s.active.load(std::memory_order_relaxed) && s.arm_serial == serial) {
++        while (still_up()) {
+             s.released.wait_for(lk, std::chrono::milliseconds{1});
+-            if (!s.active.load(std::memory_order_relaxed) || s.arm_serial != serial) {
++            if (!still_up()) {
+                 break;
+             }
+             lk.unlock();
+@@ -902,8 +1206,13 @@ void HoldWriter(u64 device_addr, u64 size, size_t core, u64 thread_id, DeviceMem
+                 break;
+             }
+         }
+-        if (gave_up != 0 && s.active.load(std::memory_order_relaxed) && s.arm_serial == serial) {
+-            Detail::DisarmLocked(s, device_memory);
++        if (gave_up != 0 && still_up()) {
++            for (u32 slot = 0; slot < SlotCount(); ++slot) {
++                if ((waits_for & (1U << slot)) != 0 && s.slots[slot].armed &&
++                    s.slots[slot].serial == serials[slot]) {
++                    Detail::ReleaseSlotLocked(s, slot, device_memory);
++                }
++            }
+             lifted = true;
+             ++s.stats.gave_up;
+             s.stats.gave_up_gpu += gave_up == 2 ? 1 : 0;
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index b5781fc..c91688a 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -193,6 +193,9 @@ struct GPU::Impl {
+     ///      page the frame in flight reads: it is kept (in ForEachPendingCpuWrite's view, and out
+     ///      of the GPU-written ranges at once, so no download lands over it) and applied by the
+     ///      first gather after the guard is lifted. Every other write is applied as before.
++    ///      EDEN_UP_AHEAD_GUARD_SLOTS=2: a kept write waits only until the back has passed the
++    ///      newest frame guarded when it was kept (AheadGuard::StillHeld), since with two frames
++    ///      in flight a guard may be up at every gather.
+     void GatherForApply(std::function<void(PAddr, size_t)>& callback_writes) {
+         if (!VideoCommon::AheadGuard::Enabled()) [[likely]] {
+             system.GatherGPUDirtyMemory(callback_writes);
+@@ -203,15 +206,23 @@ struct GPU::Impl {
+             callback_writes(address, size);
+         }
+         ahead_gathered_writes.clear();
+-        if (!VideoCommon::AheadGuard::HoldWrites()) {
+-            for (const auto& [address, size] : ahead_held_writes) {
+-                callback_writes(address, size);
++        std::erase_if(ahead_held_writes, [&](const AheadHeldWrite& held) {
++            if (VideoCommon::AheadGuard::StillHeld(held.frame)) {
++                return false;
+             }
+-            ahead_held_writes.clear();
++            callback_writes(held.address, held.size);
++            return true;
++        });
++        if (!VideoCommon::AheadGuard::HoldWrites()) {
+             system.GatherGPUDirtyMemory(callback_writes);
+             VideoCommon::AheadGuard::TakeRedirty(callback_writes);
+             return;
+         }
++        if (VideoCommon::AheadGuard::SlotCount() == 2) {
++            // A frame the back has passed while the newer one is still guarded.
++            VideoCommon::AheadGuard::TakeRedirty(callback_writes);
++        }
++        const u64 frame = VideoCommon::AheadGuard::HoldTag();
+         std::vector<std::pair<DAddr, u64>> kept;
+         std::function<void(PAddr, size_t)> split([&](PAddr address, size_t size) {
+             if (VideoCommon::AheadGuard::HasCopy(address, size)) {
+@@ -223,7 +234,9 @@ struct GPU::Impl {
+         system.GatherGPUDirtyMemory(split);
+         if (!kept.empty()) {
+             renderer->ReadRasterizer()->ClaimCpuWrites(kept);
+-            ahead_held_writes.insert(ahead_held_writes.end(), kept.begin(), kept.end());
++            for (const auto& [address, size] : kept) {
++                ahead_held_writes.push_back({address, size, frame});
++            }
+         }
+     }
+ 
+@@ -325,8 +338,8 @@ struct GPU::Impl {
+             for (const auto& [address, size] : ahead_gathered_writes) {
+                 callback(address, size);
+             }
+-            for (const auto& [address, size] : ahead_held_writes) {
+-                callback(address, size);
++            for (const AheadHeldWrite& held : ahead_held_writes) {
++                callback(held.address, held.size);
+             }
+         }
+         // EDEN_UP_L1028_ASYNC_READBACK or EDEN_UP_FRITCHII_DOWNLOAD_LANDING: the gathered writes
+@@ -696,7 +709,13 @@ struct GPU::Impl {
+     /// next GatherAndApply, and those kept until a guard is lifted; the mutex also keeps the two
+     /// gathers apart.
+     std::vector<std::pair<DAddr, u64>> ahead_gathered_writes;
+-    std::vector<std::pair<DAddr, u64>> ahead_held_writes;
++    /// EDEN_UP_AHEAD_GUARD=3: a write kept while a guard is up, and the newest guarded frame then.
++    struct AheadHeldWrite {
++        DAddr address;
++        u64 size;
++        u64 frame;
++    };
++    std::vector<AheadHeldWrite> ahead_held_writes;
+     std::mutex ahead_gather_mutex;
+ 
+     const bool is_async;
