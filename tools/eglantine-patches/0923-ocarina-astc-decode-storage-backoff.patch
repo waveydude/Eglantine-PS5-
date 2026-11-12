@@ -1,0 +1,100 @@
+Subject: [PATCH] Back off repeated ASTC decode storage allocation failures
+
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -336,6 +336,18 @@
+     /// See TakeUploadRefused.
+     bool upload_refused = false;
+ 
++    /// Backoff for ASTC decode storage image allocations (tex_storage).
++    u64 astc_decode_retry_frame = 0;
++    u32 astc_decode_fail_count = 0;
++    u64 runtime_frame_index = 0;
++
++    [[nodiscard]] bool CanAllocateAstcDecodeStorage() const noexcept {
++        return runtime_frame_index >= astc_decode_retry_frame;
++    }
++
++    void NoteAstcDecodeStorageRefusal() noexcept;
++    void NoteAstcDecodeStorageSuccess() noexcept;
++
+     /// Temporary decode images, reusable once the GPU is past `tick`.
+     struct PendingTranscode {
+         u64 tick;
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -3209,6 +3209,7 @@
+ }
+ 
+ void TextureCacheRuntime::TickFrame() {
++    ++runtime_frame_index;
+     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
+     // EDEN_NX2_CLEAN_BY_TIME=1: the unused-frame counters below (decode images, copy buffers, MSAA
+     // scratch images) advance by the 60 fps frames this frame took, up to 8, instead of by 1: at
+@@ -5390,6 +5391,24 @@
+     astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
+ }
+ 
++void TextureCacheRuntime::NoteAstcDecodeStorageRefusal() noexcept {
++    ++astc_decode_fail_count;
++    const u64 backoff_frames =
++        std::min<u64>(u64{1} << std::min<u32>(astc_decode_fail_count + 2, 6), 64);
++    astc_decode_retry_frame = runtime_frame_index + backoff_frames;
++    upload_refused = true;
++    if ((astc_decode_fail_count & (astc_decode_fail_count - 1)) == 0) {
++        LOG_WARNING(Render_Vulkan,
++                    "ASTC decode storage allocation refused ({} times so far): backing off for {} frames",
++                    astc_decode_fail_count, backoff_frames);
++    }
++}
++
++void TextureCacheRuntime::NoteAstcDecodeStorageSuccess() noexcept {
++    astc_decode_fail_count = 0;
++    astc_decode_retry_frame = 0;
++}
++
+ void TextureCacheRuntime::TranscodeAstcToBcn(
+     Image& image, const StagingBufferRef& map,
+     std::span<const VideoCommon::SwizzleParameters> swizzles) {
+@@ -5493,6 +5512,10 @@
+         pending = std::move(*reusable);
+         free_transcodes.erase(reusable);
+     } else {
++        if (!CanAllocateAstcDecodeStorage()) {
++            upload_refused = true;
++            return;
++        }
+         // With no memory the allocator gives an image with nothing bound (or, with no room for
+         // that either, throws).
+         vk::Image decode_image;
+@@ -5520,9 +5543,10 @@
+             }
+         }
+         if (!decode_image || (wait_for_memory && decode_image.IsUnbacked())) {
+-            upload_refused = true;
++            NoteAstcDecodeStorageRefusal();
+             return;
+         }
++        NoteAstcDecodeStorageSuccess();
+         pending = PendingTranscode{
+             .tick = 0,
+             .image = std::move(decode_image),
+@@ -5720,12 +5744,17 @@
+         scratch = std::move(*reusable);
+         free_transcodes.erase(reusable);
+     } else {
++        if (!CanAllocateAstcDecodeStorage()) {
++            upload_refused = true;
++            return;
++        }
+         vk::Image scratch_image = make_decode_image(plan.scratch_width, plan.scratch_height,
+                                                     plan.scratch_levels, plan.scratch_layers);
+         if (!scratch_image || (wait_for_memory && scratch_image.IsUnbacked())) {
+-            upload_refused = true;
++            NoteAstcDecodeStorageRefusal();
+             return;
+         }
++        NoteAstcDecodeStorageSuccess();
+         scratch = PendingTranscode{
+             .tick = 0,
+             .image = std::move(scratch_image),

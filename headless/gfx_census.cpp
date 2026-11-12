@@ -233,7 +233,14 @@ void Refused(Owner owner, VkResult result, const char* what, unsigned long long 
     if (fails_logged.fetch_add(1, std::memory_order_relaxed) < 64)
         std::fprintf(stderr, "EDEN_GFX_CENSUS_FAIL owner=%s result=%d %s %llux%llux%llu format=%u\n",
                      OwnerNames[static_cast<std::size_t>(owner)], static_cast<int>(result), what, a, b, c, format);
-    wake.notify_one();
+    static std::atomic<std::uint64_t> last_wake_ms{0};
+    const auto now_ms = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    auto prev_ms = last_wake_ms.load(std::memory_order_relaxed);
+    if (now_ms >= prev_ms + 1000 && last_wake_ms.compare_exchange_strong(prev_ms, now_ms, std::memory_order_relaxed)) {
+        wake.notify_one();
+    }
 }
 } // namespace
 } // namespace Eden::GfxCensus
