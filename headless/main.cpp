@@ -27,6 +27,8 @@
 #include <sys/stat.h>
 extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 extern "C" size_t eden_heap_trim(void) __attribute__((weak));
+// headless/heap_arenas.inc: whether the heap itself waits for this thread, and the thread's name.
+extern "C" int eden_heap_thread_builds_pipelines(char* name, size_t name_size) __attribute__((weak));
 // headless/heap_pages.cpp (the native build only): the pool switches, read once env.txt is in.
 extern "C" void eden_heap_pool_init(void) __attribute__((weak));
 
@@ -369,9 +371,12 @@ int main(int argc, char** argv) {
             {
                 namespace MemoryWait = Eden::MemoryWait;
                 thread_local MemoryWait::Episode episode;
-                const unsigned limit = MemoryWait::WorthWaitingFor(bytes)
-                                           ? MemoryWait::new_wait_ms.load(std::memory_order_relaxed)
-                                           : 0;
+                char thread_name[16] = "?";
+                const bool builds_pipelines =
+                    eden_heap_thread_builds_pipelines != nullptr &&
+                    eden_heap_thread_builds_pipelines(thread_name, sizeof(thread_name)) != 0;
+                const unsigned limit = MemoryWait::HandlerLimitMs(
+                    bytes, MemoryWait::new_wait_ms.load(std::memory_order_relaxed), builds_pipelines);
                 const auto now = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
@@ -379,8 +384,8 @@ int main(int argc, char** argv) {
                 const MemoryWait::Step step = MemoryWait::Next(episode, now, limit, bytes);
                 if (step != MemoryWait::Step::GiveUp) {
                     if (step == MemoryWait::Step::Start) {
-                        std::fprintf(stderr, "EDEN_NEW_WAIT start requested=%zu reason=%u limit_ms=%u\n",
-                                     bytes, reason, limit);
+                        std::fprintf(stderr, "EDEN_NEW_WAIT start requested=%zu reason=%u limit_ms=%u thread=%s\n",
+                                     bytes, reason, limit, thread_name);
                     }
                     if (MemoryWait::TrimNow(episode, step, now) && eden_heap_trim) eden_heap_trim();
                     usleep(20000);
@@ -392,8 +397,14 @@ int main(int argc, char** argv) {
                                  limit, static_cast<unsigned long long>(MemoryWait::CooldownMs / 1000));
                 }
             }
-            std::fprintf(stderr, "EDEN_HEAP_FAILURE requested=%zu reason=%u count=%zu\n", bytes,
-                         reason, count);
+            {
+                char failed_on[16] = "?";
+                if (eden_heap_thread_builds_pipelines) {
+                    (void)eden_heap_thread_builds_pipelines(failed_on, sizeof(failed_on));
+                }
+                std::fprintf(stderr, "EDEN_HEAP_FAILURE requested=%zu reason=%u count=%zu thread=%s\n",
+                             bytes, reason, count, failed_on);
+            }
             ps5_opengl_heap_snapshot("allocation_failure", 0);
             std::fflush(stdout);
             Eden::Report("allocation failure", "operator new: heap exhausted");

@@ -2,6 +2,7 @@
 // Host test for headless/memory_wait.h (how long operator new, the JIT code cache and guest writes
 // wait for memory before the session ends).
 //   c++ -std=c++20 -O1 -Iheadless tools/test-memory-wait.cpp -o /tmp/test-memory-wait && /tmp/test-memory-wait
+#include <cassert>
 #include <cstdio>
 
 #include "memory_wait.h"
@@ -162,7 +163,27 @@ static void HopelessRequests() {
     CHECK(!e.active);
 }
 
+// The handler adds no wait of its own on a thread that builds pipelines (Wave Ocarina 05, Kakariko:
+// two builds waited the whole 5 s for 16 MiB and 11.4 MiB, got nothing, and the picture stood still
+// 3.98 s and 6.80 s), nor for a request no wait can serve; every other thread keeps its wait.
+static void HandlerLimit() {
+    using namespace Eden::MemoryWait;
+    assert(HandlerLimitMs(16777216, 5000, true) == 0);
+    assert(HandlerLimitMs(11960320, 5000, true) == 0);
+    assert(HandlerLimitMs(16777216, 5000, false) == 5000);  // GPUBack, CPU cores: as before
+    assert(HandlerLimitMs(32435200, 5000, false) == 5000);  // the Lost Woods request still waits
+    assert(HandlerLimitMs(std::uint64_t{2} << 40, 5000, false) == 0);
+    assert(HandlerLimitMs(std::uint64_t{2} << 40, 5000, true) == 0);
+    assert(HandlerLimitMs(4096, 0, false) == 0);  // the switch off
+    // A limit of 0 gives up at once and starts no cooldown, so the thread's next request is free
+    // to wait again if it is asked on another kind of thread's behalf later.
+    Episode episode;
+    assert(Next(episode, 1000, HandlerLimitMs(16777216, 5000, true), 16777216) == Step::GiveUp);
+    assert(!episode.active && episode.cooldown_until_ms == 0);
+}
+
 int main() {
+    HandlerLimit();
     Parse();
     HopelessRequests();
     Off();

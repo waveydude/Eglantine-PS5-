@@ -112,6 +112,14 @@ inline bool WorthWaitingFor(std::uint64_t bytes) {
     return bytes <= LargestWaitedRequest;
 }
 
+// The handler's limit for one refused request. No wait of its own for a request no wait can serve,
+// nor on a thread that builds pipelines: the heap already waits for those threads
+// (EDEN_UP_HEAP_WAIT_MS, EDEN_UP_HEAP_WAIT_GPU_MS), and a build that finds no memory fails its
+// pipeline and the picture goes on, so five more seconds there are five seconds of a still picture.
+inline unsigned HandlerLimitMs(std::uint64_t bytes, unsigned configured_ms, bool builds_pipelines) {
+    return WorthWaitingFor(bytes) && !builds_pipelines ? configured_ms : 0;
+}
+
 // Number of 20 ms steps in a wait of `ms` (at least one).
 inline unsigned Steps(unsigned ms) {
     return ms < 20 ? 1u : ms / 20u;

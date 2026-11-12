@@ -2018,6 +2018,21 @@ void eden_heap_wait_scope(int enter) {
     --self->wait_scope;
 }
 
+/* Whether the heap itself waits for this thread's requests (a pipeline builder thread, or a thread
+ * inside a run-time pipeline build), and the thread's name for a report. operator new's handler
+ * (headless/main.cpp) asks: on such a thread its own wait came on top of the heap's, and a pipeline
+ * build that finds no memory fails that pipeline and the picture goes on. Wave Ocarina 05, Kakariko,
+ * 12 Nov 2026: a build's 16 MiB and 11.4 MiB requests each waited the handler's whole 5 s and got
+ * nothing, and the picture stood still 3.98 s and 6.80 s. */
+int eden_heap_thread_builds_pipelines(char *name, size_t name_size) {
+  struct eden_heap_thread *self = eden_heap_self();
+  if (name != NULL && name_size != 0)
+    snprintf(name, name_size, "%s", self != NULL && self->name[0] != 0 ? self->name : "?");
+  if (self == NULL)
+    return 0;
+  return strncmp(self->name, "VkPipeline", 10) == 0 || self->wait_scope != 0;
+}
+
 void eden_heap_wait_gpu_stats(unsigned long long *count, unsigned long long *total_ms, unsigned long long *lost) {
   *count = atomic_load_explicit(&eden_heap_wait_gpu_count, memory_order_relaxed);
   *total_ms = atomic_load_explicit(&eden_heap_wait_gpu_total_ms, memory_order_relaxed);
