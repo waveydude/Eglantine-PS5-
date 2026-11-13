@@ -1,0 +1,74 @@
+Subject: [PATCH] EDEN_UP_DRIVER_CACHE_EXIT_ONLY=1: the driver pipeline cache is written at boot and at exit, not during play; off by default
+
+The driver's pipeline cache is written whole every 128 new pipelines, at most every 30 s (or one
+second per MiB of cache): vkGetPipelineCacheData into one buffer, then a file beside it, then a
+rename. For Ocarina with ~8,700 pipelines the file is 123 MiB (vulkan_pipelines.bin). On a base PS5
+near its memory limit that write took 24-55 s, and while it ran everything touching guest memory
+stalled: frames of ~960 ms in clusters, one every ~2 s, the guest cores more idle than in smooth
+play, single GPU-front reads of guest memory taking 400-920 ms.
+
+waveydude, Jabu-Jabu's Belly, base PS5 13.60:
+| Run  | Slow stretch | Write began (from its length) | Write ended (its log line) |
+| W-11 | ~211-264 s   | ~206 s (55.4 s)               | 261.3 s                    |
+| W-11 | ~419-462 s   | ~415 s (42.1 s)               | 456.8 s                    |
+| W-10 | ~423-460 s   | ~433 s (23.9 s)               | ~457 s                     |
+(pipeline_cache_save in EDEN_PERF_COST, the 5 s report the stretch ends in.)
+
+With the switch, QueueVulkanPipelineCacheFlush counts the pipeline (the exit write's
+EDEN_PE_PIPELINE_CACHE_EXIT check still sees it) and returns. The writes at boot
+(LoadDiskResources) and at the end of the session (~PipelineCache) are as before. A crash loses the
+driver builds made since boot: those pipelines take their driver compile again next session.
+Translations (vulkan.bin) are not this file and are kept as before. One log line at the first new
+pipeline. The switch is in the shader-store stamp's list and in its list of switches that never
+change a translation (0926), so setting it does not start an empty store.
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index b64bf28..dace56e 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -2253,6 +2253,25 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
+         return;
+     }
+     pipelines_counted.fetch_add(1, std::memory_order_acq_rel);
++    // EDEN_UP_DRIVER_CACHE_EXIT_ONLY=1: the driver's pipeline cache is written when the session
++    // ends (~PipelineCache) and at boot (LoadDiskResources), never during play. Each write copies
++    // the whole cache: 123 MiB for Ocarina with ~8,700 pipelines (vulkan_pipelines.bin). On a base
++    // PS5 near its memory limit that copy took 24-55 s, and the whole time everything touching
++    // guest memory stalled: frames of ~960 ms in clusters, one every ~2 s, in Jabu-Jabu's Belly
++    // (W-10 and W-11; the write's end lines up with each stretch's end: 261.3 s and 456.8 s).
++    // A crash loses the driver builds made since the boot's write (those pipelines take their
++    // driver compile again next time); translations (vulkan.bin) are kept as before.
++    static const bool exit_only = [] {
++        const bool on = Common::PeSwitch("EDEN_UP_DRIVER_CACHE_EXIT_ONLY");
++        if (on) {
++            LOG_INFO(Render_Vulkan, "EDEN_UP_DRIVER_CACHE_EXIT_ONLY=1: the driver pipeline cache is "
++                                    "written at boot and when the session ends, not during play");
++        }
++        return on;
++    }();
++    if (exit_only) {
++        return;
++    }
+     if (++pipelines_since_flush < VULKAN_CACHE_FLUSH_PIPELINES) {
+         return;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+index 28c2eef..b872fa4 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp
+@@ -135,6 +135,7 @@ constexpr const char* TranslationSwitches[] = {
+     "EDEN_UP_BIND_ON_BACK", "EDEN_UP_BLIT_EDGE_CLAMP", "EDEN_UP_BUFFER_USE_MARKS",
+     "EDEN_UP_COMPUTE_INDIRECT_ORDER", "EDEN_UP_DEFERRED_CLEAR_PASS", "EDEN_UP_DJ_CHANNEL_IDS",
+     "EDEN_UP_DJ_FRAG_BARRIER", "EDEN_UP_DJ_GATHER_OWNERS", "EDEN_UP_DRAIN_SKIP_SAME",
++    "EDEN_UP_DRIVER_CACHE_EXIT_ONLY",
+     "EDEN_UP_EVICT_KEEP_SSBO",
+     "EDEN_UP_FAST_DRAW", "EDEN_UP_FAST_DRAW_OOT_EXEMPT", "EDEN_UP_FAST_DRAW_VERIFY",
+     "EDEN_UP_FAST_POLL", "EDEN_UP_FRITCHII_BLITSTATE", "EDEN_UP_FRITCHII_CHURN",
+@@ -744,6 +745,7 @@ std::string MakeStamp(u32 cache_version, u32 driver_id, u32 driver_version) {
+         static constexpr std::string_view NotTranslation[]{
+             "EDEN_NX2_TRANSCODE_WAIT",        // a refused ASTC decode waits for its image's next use
+             "EDEN_NX2_PRELOAD_ALL_PIPELINES", // which kept pipelines the boot builds
++            "EDEN_UP_DRIVER_CACHE_EXIT_ONLY", // when the driver cache file is written
+         };
+         if (std::ranges::find(NotTranslation, std::string_view{name}) != std::end(NotTranslation)) {
+             continue;
