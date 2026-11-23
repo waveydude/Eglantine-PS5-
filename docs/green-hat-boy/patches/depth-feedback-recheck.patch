@@ -1,0 +1,14 @@
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -4785,7 +4785,10 @@
+         return;
+     }
+ 
+-    if (render_targets_serial == last_feedback_loop_serial &&
++    // The same serials can describe a draw with different bound depth views.
++    // When enabled, use the original hazard predicate on this draw's views.
++    static const bool recheck = Common::PeSwitch("EDEN_UP_DEPTH_FEEDBACK_RECHECK");
++    if (!recheck && render_targets_serial == last_feedback_loop_serial &&
+         texture_bindings_serial == last_feedback_texture_serial) {
+         if (last_feedback_loop_result) {
+             runtime.BarrierFeedbackLoop();

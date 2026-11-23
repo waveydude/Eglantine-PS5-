@@ -1,0 +1,104 @@
+diff --git a/headless/minimap_steer.h b/headless/minimap_steer.h
+index 56badf2..117b263 100644
+--- a/headless/minimap_steer.h
++++ b/headless/minimap_steer.h
+@@ -72,9 +72,13 @@ inline Fix Find(const unsigned char* bgra, unsigned width, unsigned height, bool
+             red[at] = detail::Red(p) ? 1 : 0;
+         }
+     }
+-    // No map (a menu, a loading screen, indoors), or a screen that is yellow all over.
++    // No map (a menu, a loading screen, indoors), or a screen that is yellow all over. 17 Nov 2026: the
++    // region also holds the grass behind the map; standing in Hyrule Field's bright grass at the route's
++    // fourth point it read 0.52-0.62 for 90 s, so "over 0.5" called the map gone, the stick was let go and
++    // Link stood there (11 of 36 runs). The map was there in every one of those frames (Find at 0.8:
++    // marker and wedge found at Link's place in all 30 stall frames; tools/test-steer-blind.cpp).
+     const double share = static_cast<double>(yellow) / static_cast<double>(grid.size());
+-    if (share < 0.03 || share > 0.5) return fix;
++    if (share < 0.03 || share > 0.8) return fix;
+     fix.map = true;
+ 
+     // The wedge round a point: the pale share of each 10 degree slice of a ring. One run of
+diff --git a/headless/test_harness.h b/headless/test_harness.h
+index a219e13..3377837 100644
+--- a/headless/test_harness.h
++++ b/headless/test_harness.h
+@@ -147,6 +147,23 @@ inline constexpr std::chrono::seconds kShotWait{10};
+ inline constexpr std::uint64_t kLookEvery = 500;  // ms
+ inline constexpr std::size_t kMaxSteerPoints = 64;
+ inline constexpr unsigned kSteerLostLooks = 4;  // looks without Link's marker before the stick is let go
++// EDEN_TEST_STEER_BLIND_LOOKS=<n> (1..240, digits only; unset or anything else: kSteerLostLooks): how many
++// looks without the marker the stick keeps its last direction before Link stands. 17 Nov 2026: a Peahat
++// crosses the field route; when it hits Link the marker is lost, the stick was let go after 4 looks (2 s),
++// and Link stood under it for 50-97 s in 11 of 36 runs. Running on carries him past it.
++inline unsigned SteerLostLooks() {
++    static const unsigned looks = [] {
++        const char* v = std::getenv("EDEN_TEST_STEER_BLIND_LOOKS");
++        if (v == nullptr || *v == '\0') return kSteerLostLooks;
++        unsigned n = 0;
++        for (const char* c = v; *c; ++c) {
++            if (*c < '0' || *c > '9' || n > 1000) return kSteerLostLooks;
++            n = n * 10 + static_cast<unsigned>(*c - '0');
++        }
++        return n >= 1 && n <= 240 ? n : kSteerLostLooks;
++    }();
++    return looks;
++}
+ inline constexpr unsigned kMaxCells = 256;  // so a timeout's seen= grid fits a Report line (900 characters)
+ 
+ struct NamedButton {
+@@ -988,7 +1005,16 @@ private:
+                 ++looks;
+                 steer::Stick stick;
+                 const std::size_t reached = walk.point;
+-                const steer::Walk::Do todo = walk.Look(fix, wait.points, wait.radius, kSteerLostLooks, stick);
++                const unsigned lost_before = walk.lost;
++                const steer::Walk::Do todo = walk.Look(fix, wait.points, wait.radius, SteerLostLooks(), stick);
++                // A lost marker says which half went (arrowhead or wedge), and its end how long it was gone.
++                if (walk.lost == 1)
++                    Report("test", ("EDEN_TEST steer_lost " + where() + " arrowhead=" + (fix.found ? "1" : "0") +
++                                    " wedge=" + (fix.view ? "1" : "0")).c_str());
++                if (walk.lost == SteerLostLooks() && todo == steer::Walk::Do::Stand)
++                    Report("test", ("EDEN_TEST steer_stand " + where()).c_str());
++                if (lost_before != 0 && walk.lost == 0)
++                    Report("test", ("EDEN_TEST steer_back " + where() + " lost_looks=" + std::to_string(lost_before)).c_str());
+                 if (walk.point != reached) Report("test", ("EDEN_TEST steer_point " + where()).c_str());
+                 if (todo == steer::Walk::Do::Done) {
+                     Report("test", ("EDEN_TEST steer_met " + where()).c_str());
+diff --git a/tools/test-steer-blind.cpp b/tools/test-steer-blind.cpp
+new file mode 100644
+index 0000000..0336a12
+--- /dev/null
++++ b/tools/test-steer-blind.cpp
+@@ -0,0 +1,32 @@
++// Host test for EDEN_TEST_STEER_BLIND_LOOKS (17 Nov 2026): with the marker lost for a stretch (a Peahat hit),
++// the stick keeps its direction for the set number of looks, then Link stands; the old limit (4) stands at once.
++#include "../headless/minimap_steer.h"
++#include <cstdio>
++#include <utility>
++#include <vector>
++using steer::Walk;
++static int fails = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++fails; } } while (0)
++// looks: true = marker and wedge seen at (500,500), false = lost. Returns how the looks went.
++static std::vector<Walk::Do> Run(const std::vector<bool>& looks, unsigned lost_looks) {
++    Walk w; std::vector<std::pair<unsigned, unsigned>> pts{{500, 100}}; std::vector<Walk::Do> out;
++    for (bool s : looks) {
++        steer::Fix f; f.found = s; f.view = s; f.x = 500; f.y = 500; f.angle = 0;
++        steer::Stick st; out.push_back(w.Look(f, pts, 6, lost_looks, st));
++    }
++    return out;
++}
++int main() {
++    std::vector<bool> hit{true, true}; hit.insert(hit.end(), 10, false); hit.push_back(true);
++    auto old = Run(hit, 4);    // as before: 3 looks keep, the 4th stands
++    CHECK(old[2] == Walk::Do::Keep && old[4] == Walk::Do::Keep && old[5] == Walk::Do::Stand);
++    CHECK(old[11] == Walk::Do::Stand && old[12] == Walk::Do::Hold);
++    auto blind = Run(hit, 16); // 10 lost looks < 16: never stands, keeps running through the hit
++    for (int i = 2; i <= 11; ++i) CHECK(blind[i] == Walk::Do::Keep);
++    CHECK(blind[12] == Walk::Do::Hold);
++    std::vector<bool> menu{true}; menu.insert(menu.end(), 30, false);
++    auto longer = Run(menu, 16); // a real menu or talk: still stands, after 16 looks (8 s)
++    CHECK(longer[15] == Walk::Do::Keep && longer[16] == Walk::Do::Stand && longer[30] == Walk::Do::Stand);
++    std::printf(fails ? "%d FAILED\n" : "all passed\n", fails);
++    return fails != 0;
++}

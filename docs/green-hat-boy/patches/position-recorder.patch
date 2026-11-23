@@ -1,0 +1,317 @@
+diff --git a/headless/test_harness.h b/headless/test_harness.h
+index db7dfac..a219e13 100644
+--- a/headless/test_harness.h
++++ b/headless/test_harness.h
+@@ -20,6 +20,15 @@
+ //                                   logs/recorded-input.txt in the same format, so a route is
+ //                                   recorded by playing it; the session before moves to
+ //                                   logs/recorded-input.prev.txt. A script in env.txt wins.
++//                                   While it records, the app also reads the frame back every
++//                                   kLookEvery (as a LOOK does) and writes where Link's arrowhead
++//                                   is on the minimap as comment lines, "# POS <s> <x> <y> <angle>"
++//                                   (per mille of the picture, as STEER points; angle -1 when the
++//                                   camera's wedge was not found) and "# POS <s> lost" when the map
++//                                   or the arrowhead goes. A script reader skips them, so the file
++//                                   still replays as before; tools/route-from-recording.py turns
++//                                   them into STEER legs, so the walk is steered instead of
++//                                   replayed blind. EDEN_TEST_RECORD_POSITIONS=0 leaves them out.
+ //   EDEN_TEST_SHOTS=<s>[,<s>...]    One lossless picture of the game at each of these times, in
+ //                                   the script's seconds (below), to logs/game-frame-<s>.ppm
+ //                                   (game-frame-95.ppm, game-frame-95.5.ppm): the same frame of
+@@ -878,7 +887,10 @@ public:
+ 
+     // What the script presses now. Empty without a script, and between its presses.
+     std::optional<ps5::pad::Data> Sample() {
+-        if (!player) return {};
++        if (!player) {
++            if (detail::recording_on.load(std::memory_order_relaxed)) TrackPosition();
++            return {};
++        }
+         const Ms now = detail::Since(origin);
+         if (const Wait* wait = player->Waiting(now)) Check(*wait, now);
+         auto sample = player->Sample(now);
+@@ -1013,6 +1025,46 @@ private:
+             pending = {};
+         }
+     }
++    // EDEN_TEST_RECORD: where Link is on the minimap, every kLookEvery while recording, as comment
++    // lines in the recording (the header says why). The picture is asked for as a LOOK asks; the
++    // line carries the time it was asked. Only the input worker runs this, as Record does, so the
++    // recorder's text needs no lock.
++    void TrackPosition() {
++        static const bool on = detail::Trimmed("EDEN_TEST_RECORD_POSITIONS") != "0";
++        if (!on || !look) return;
++        const Ms now = detail::Since(origin);
++        if (pending.valid() && pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
++            std::shared_ptr<const Picture> picture;
++            try {
++                picture = pending.get();
++            } catch (...) {  // dropped: another picture was pending
++            }
++            pending = {};
++            if (picture && picture->bgra.size() >= std::size_t{picture->width} * picture->height * 4) {
++                const steer::Fix fix =
++                    steer::Find(picture->bgra.data(), picture->width, picture->height, picture->flip);
++                std::string& text = detail::record_state.recorder.text;
++                if (fix.map && fix.found) {
++                    char line[96];
++                    std::snprintf(line, sizeof(line), "# POS %s %.1f %.1f %.0f\n", SecondsText(asked_at).c_str(),
++                                  fix.x, fix.y, fix.view ? fix.angle : -1.0);
++                    text += line;
++                    position_known = true;
++                } else if (position_known) {
++                    text += "# POS " + SecondsText(asked_at) + " lost\n";
++                    position_known = false;
++                }
++            }
++        }
++        if (pending.valid() || now < next_look) return;
++        next_look = now + kLookEvery;
++        asked_at = now;
++        try {
++            pending = look();
++        } catch (...) {
++            pending = {};
++        }
++    }
+     // A new WAIT: a picture still on its way was asked for the last one and is not used.
+     void Reset(Ms now) {
+         walk = {};
+@@ -1051,7 +1103,8 @@ private:
+             Report("test", ("EDEN_TEST record_error file=" + path).c_str());
+             return;
+         }
+-        state.recorder.text = "# EDEN_TEST recorded input: <seconds> <BUTTON> <hold_ms>, <seconds> LSTICK <x> <y> <hold_ms>\n";
++        state.recorder.text = "# EDEN_TEST recorded input: <seconds> <BUTTON> <hold_ms>, <seconds> LSTICK <x> <y> <hold_ms>\n"
++                              "# POS <seconds> <x> <y> <angle>: Link on the minimap (per mille), for route-from-recording.py\n";
+         detail::recording_on.store(true);
+         Report("test", ("EDEN_TEST record_start file=" + path).c_str());
+     }
+@@ -1066,6 +1119,8 @@ private:
+     int best = -100;
+     Ms next_look = 0;
+     steer::Walk walk;  // the STEER that is walking: points reached, looks with and without Link's marker
++    Ms asked_at = 0;              // TrackPosition: when the pending picture was asked for
++    bool position_known = false;  // TrackPosition: the last picture had Link's arrowhead
+ };
+ 
+ // EDEN_TEST_SHOTS's times for this session: empty without the setting, and in any game but the
+diff --git a/tools/route-from-recording.py b/tools/route-from-recording.py
+new file mode 100644
+index 0000000..5773c2a
+--- /dev/null
++++ b/tools/route-from-recording.py
+@@ -0,0 +1,140 @@
++#!/usr/bin/env python3
++"""Turn a recording with minimap positions into a steered route script.
++
++  route-from-recording.py <recorded-input.txt> [-o route.txt]
++
++EDEN_TEST_RECORD writes what player 1 pressed and, every 0.5 s, where Link's arrowhead was on the
++minimap ("# POS <s> <x> <y> <angle>", "# POS <s> lost"; headless/test_harness.h). A plain replay
++of the presses drifts: loads and lag move the timing, so Link ends up off the path. Here every walk
++(a run of positions with the map up, at least MIN_WALK_S long and MIN_TRAVEL per mille of travel)
++becomes a STEER leg through points taken from the walk every SPACING per mille, so the app walks to
++where Link actually went instead of pushing the stick blind. Everything else (menus, talks, doors,
++the last TAIL_S seconds of a walk, which push through a load trigger) is replayed as recorded.
++
++Sections: the harness times the lines after a STEER from the moment it is met, so each line after
++a walk is written relative to the end of that walk in the recording. Lines inside a walk (stick
++moves and buttons) are left out and listed as comments, so nothing is lost silently.
++Check the result with the GBB lint (tools/GrowingBlackBeans/steer/kokiri-four-stops/lint.py).
++"""
++import argparse
++import math
++import re
++import sys
++
++SPACING = 12.0     # per mille between STEER points
++RADIUS = 6         # r= of each STEER (the harness default)
++MIN_WALK_S = 3.0   # a shorter walk is replayed as recorded
++MIN_TRAVEL = 30.0  # per mille; less is standing or turning
++JUMP = 60.0        # per mille between two looks: a new map (area change), so a new walk
++GAP_S = 1.6        # seconds between two positions (more than three looks): the walk ends
++TAIL_S = 1.0       # the last second of a walk is replayed as recorded (pushes through a door)
++
++EVENT = re.compile(r'^\s*(\d+(?:\.\d+)?)\s+(\S+)(.*)$')
++POS = re.compile(r'^#\s*POS\s+(\d+(?:\.\d+)?)\s+(?:(lost)|(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?))')
++
++
++def read(lines):
++    events, positions = [], []
++    for raw in lines:
++        line = raw.rstrip('\n')
++        m = POS.match(line)
++        if m:
++            t = float(m.group(1))
++            positions.append((t, None) if m.group(2) else (t, (float(m.group(3)), float(m.group(4)))))
++            continue
++        if line.lstrip().startswith('#') or not line.strip():
++            continue
++        m = EVENT.match(line)
++        if not m:
++            raise ValueError(f'unreadable line: {line!r}')
++        events.append((float(m.group(1)), m.group(2), m.group(3).strip()))
++    events.sort(key=lambda e: e[0])
++    return events, positions
++
++
++def walks(positions):
++    """Runs of known positions on one map, split at a lost map, a jump or a gap."""
++    out, cur = [], []
++    for t, p in positions:
++        if p is None:
++            if cur: out.append(cur)
++            cur = []
++            continue
++        if cur and (t - cur[-1][0] > GAP_S or math.dist(p, cur[-1][1]) > JUMP):
++            out.append(cur)
++            cur = []
++        cur.append((t, p))
++    if cur: out.append(cur)
++    keep = []
++    for w in out:
++        travel = sum(math.dist(a[1], b[1]) for a, b in zip(w, w[1:]))
++        if w[-1][0] - w[0][0] >= MIN_WALK_S and travel >= MIN_TRAVEL:
++            keep.append(w)
++    return keep
++
++
++def points(walk):
++    pts = [walk[0][1]]
++    for _, p in walk[1:]:
++        if math.dist(p, pts[-1]) >= SPACING:
++            pts.append(p)
++    if math.dist(walk[-1][1], pts[-1]) > 0.5:
++        pts.append(walk[-1][1])
++    return pts[1:] if len(pts) > 1 else pts  # Link already stands on the first
++
++
++def fmt(s):
++    return f'{max(s, 0.0):.3f}'.rstrip('0').rstrip('.') if s > 0 else '0'
++
++
++def convert(lines, name='recording'):
++    events, positions = read(lines)
++    ws = walks(positions)
++    out = [f'# Steered route made by route-from-recording.py from {name}: {len(ws)} STEER legs, '
++           f'points every {SPACING:g} per mille, r={RADIUS}; everything else as recorded.']
++    cursor = 0.0
++    i = 0
++    for w in ws:
++        start, end = w[0][0], w[-1][0]
++        # Recorded lines before the walk, timed from the section start.
++        while i < len(events) and events[i][0] < start:
++            t, what, rest = events[i]
++            out.append(f'{fmt(t - cursor)} {what} {rest}'.rstrip())
++            i += 1
++        dropped = []
++        while i < len(events) and events[i][0] < end - TAIL_S:
++            dropped.append(events[i])
++            i += 1
++        pts = points(w)
++        timeout = max(20, int(2 * (end - start) + 10))
++        out.append(f'# walk {start:.1f}-{end:.1f} s ({len(pts)} points); recorded inside it and left out: '
++                   f'{len(dropped)} lines' + (f' (buttons: {", ".join(sorted({d[1] for d in dropped if "STICK" not in d[1]}))})'
++                                             if any('STICK' not in d[1] for d in dropped) else ''))
++        out.append(f'{fmt(start - cursor)} STEER {timeout} ' +
++                   ' '.join(f'{x:.0f},{y:.0f}' for x, y in pts) + f' r={RADIUS}')
++        cursor = end
++        # The walk's last second (a push through a door or a load) is replayed from the moment the STEER is met.
++    while i < len(events):
++        t, what, rest = events[i]
++        out.append(f'{fmt(t - cursor)} {what} {rest}'.rstrip())
++        i += 1
++    return out, ws
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument('recording')
++    ap.add_argument('-o', '--out')
++    a = ap.parse_args()
++    with open(a.recording) as f:
++        out, ws = convert(f, a.recording.split('/')[-1])
++    text = '\n'.join(out) + '\n'
++    if a.out:
++        open(a.out, 'w').write(text)
++    else:
++        sys.stdout.write(text)
++    print(f'{len(ws)} walks steered', file=sys.stderr)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/tools/test-route-from-recording.py b/tools/test-route-from-recording.py
+new file mode 100644
+index 0000000..a2d7d6b
+--- /dev/null
++++ b/tools/test-route-from-recording.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++"""Checks for tools/route-from-recording.py: python3 tools/test-route-from-recording.py"""
++import importlib.util
++import pathlib
++import re
++
++spec = importlib.util.spec_from_file_location('rfr', pathlib.Path(__file__).with_name('route-from-recording.py'))
++rfr = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(rfr)
++
++fails = 0
++
++
++def check(cond, what):
++    global fails
++    if not cond:
++        fails += 1
++        print('FAIL', what)
++
++
++rec = ['# EDEN_TEST recorded input: ...',
++       '20.000 CIRCLE 150',          # title
++       '22.000 DOWN 120',            # menu
++       '23.000 CIRCLE 150']          # load
++# Walk 1: 30 s to 40 s, straight up the map from 800,800 to 800,700, one position every 0.5 s.
++for k in range(21):
++    rec.append(f'# POS {30 + 0.5 * k:.3f} 800.0 {800 - 5 * k:.1f} 0')
++rec += ['30.100 LSTICK 128 0 9000', '35.000 CROSS 100',  # inside the walk: left out
++        '39.500 LSTICK 128 0 400']                         # in the last second: replayed after the STEER
++rec.append('# POS 40.500 lost')                           # the load
++# Standing in the new area (positions that barely move): not a walk.
++for k in range(10):
++    rec.append(f'# POS {50 + 0.5 * k:.3f} 300.0 300.0 90')
++rec += ['52.000 TRIANGLE 200', '# ended at 60.000']
++
++out, ws = rfr.convert(rec, 'synthetic')
++text = '\n'.join(out)
++check(len(ws) == 1, f'one walk, got {len(ws)}')
++steer = [l for l in out if ' STEER ' in l and not l.startswith('#')]
++check(len(steer) == 1, 'one STEER line')
++if steer:
++    s = steer[0].split()
++    check(s[0] == '30', f'STEER at 30 s from the section start (lines in a section count from its start), got {s[0]}')
++    check(s[2] == '30', f'timeout 2*10+10 = 30, got {s[2]}')
++    pts = [tuple(map(int, p.split(','))) for p in s[3:] if ',' in p]
++    check(pts[-1] == (800, 700), f'last point is where the walk ended, got {pts[-1] if pts else None}')
++    check(all(abs(a[1] - b[1]) >= 12 for a, b in zip(pts[:-1], pts[1:-1])), 'points at least 12 apart (the end point may be closer)')
++    check((800, 800) not in pts, 'the start point (where Link stands) is not a target')
++    check(s[-1] == 'r=6', 'radius')
++check(re.search(r'^20 CIRCLE 150$', text, re.M) and re.search(r'^22 DOWN 120$', text, re.M),
++      'menu lines before the walk keep their times from the section start')
++body = '\n'.join(l for l in out if not l.startswith('#'))
++check('9000' not in body,
++      'the walk\'s long stick push is left out after the STEER')
++check(any(l.startswith('# walk') and 'CROSS' in l for l in out), 'a button pressed during the walk is named in the walk comment')
++check(re.search(r'^0 LSTICK 128 0 400$', text, re.M) is not None, 'the last second\'s push replays at 0 after the STEER')
++check(re.search(r'^12 TRIANGLE 200$', text, re.M) is not None, 'a later press is timed from the walk end (52 - 40)')
++# No positions at all: the recording comes back as a plain replay.
++plain, ws2 = rfr.convert(['10.000 CIRCLE 100', '12.500 LSTICK 128 0 300'], 'plain')
++check(len(ws2) == 0 and plain[1:] == ['10 CIRCLE 100', '12.5 LSTICK 128 0 300'], f'no positions: unchanged, got {plain[1:]}')
++# A jump on the map (area change without a lost line) splits the walk.
++jump = [f'# POS {k * 0.5:.3f} 500.0 {500 - 6 * k:.1f} 0' for k in range(10)] + \
++       [f'# POS {5 + k * 0.5:.3f} 100.0 {900 - 6 * k:.1f} 0' for k in range(10)]
++_, ws3 = rfr.convert(jump, 'jump')
++check(len(ws3) == 2, f'a 400 per mille jump splits into two walks, got {len(ws3)}')
++print(f'{fails} FAILED' if fails else 'all route-from-recording checks passed')
++raise SystemExit(1 if fails else 0)

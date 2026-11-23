@@ -1,0 +1,1835 @@
+diff --git a/headless/CMakeLists.txt b/headless/CMakeLists.txt
+index 6724980..131bf33 100644
+--- a/headless/CMakeLists.txt
++++ b/headless/CMakeLists.txt
+@@ -2880,12 +2880,18 @@ target_include_directories(eden-headless PRIVATE "${PORT_BUILD_DIR}/version")
+ target_link_libraries(eden-headless PRIVATE core eden-pad)
+ # A game's text entry on the PS5's own on-screen keyboard (system_keyboard.h, keyboard_applet.h).
+ target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/system_keyboard.cpp")
++if(PS5_NATIVE)
++    # EDEN_UP_MIC_PROBE: the PS5 controller's mic (mic_capture.h).
++    target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/mic_capture.cpp")
++endif()
+ target_sources(eden-headless PRIVATE "${EDEN_PORT_DIR}/multiplayer.cpp")
+ target_include_directories(eden-headless BEFORE PRIVATE "${MULTIPLAYER_SOCKET_HEADERS}" "${MULTIPLAYER_OUTPUT}")
+ if(PS5_NATIVE)
+     target_link_libraries(eden-headless PRIVATE
+         "${sdk}/target/lib/libSceImeDialog.so" "${sdk}/target/lib/libSceSysmodule.so"
+-        "${PORT_ROOT}/build/stubs/libSceCommonDialog.so")
++        "${PORT_ROOT}/build/stubs/libSceCommonDialog.so"
++        # The controller's mic (mic_capture.cpp; tools/build-audio-in-stub.sh).
++        "${PORT_ROOT}/build/stubs/libSceAudioIn.so")
+     # Games on NFS servers (headless/nfs/nfs.h): libnfs, and the app's layer that passes the C library's file
+     # calls through it (the final link wraps them: tools/link-headless-native.sh).
+     set(libnfs_dir "${PORT_ROOT}/third_party/libnfs")
+diff --git a/headless/check_package.py b/headless/check_package.py
+index a2537ac..c16c5ba 100644
+--- a/headless/check_package.py
++++ b/headless/check_package.py
+@@ -70,7 +70,8 @@ def check():
+     needed = sorted(imports.split('NeededLibraries [', 1)[1].split(']', 1)[0].split())
+     # libSceCommonDialog, libSceImeDialog and libSceSysmodule: the PS5 keyboard for a game's text
+     # entry (headless/system_keyboard.cpp); RADV loads system modules as well.
+-    expected = ['libSceAudioOut.sprx', 'libSceCommonDialog.sprx', 'libSceImeDialog.sprx', 'libSceLibcInternal.sprx', 'libSceNet.sprx',
++    # libSceAudioIn: the controller's mic (headless/mic_capture.cpp).
++    expected = ['libSceAudioIn.sprx', 'libSceAudioOut.sprx', 'libSceCommonDialog.sprx', 'libSceImeDialog.sprx', 'libSceLibcInternal.sprx', 'libSceNet.sprx',
+                 'libScePad.sprx', 'libSceSysmodule.sprx', 'libSceUserService.sprx', 'libkernel.sprx']
+     if json.loads((OUT / 'frontend.json').read_text())['renderer'] == 'opengl-4.6-compatibility':
+         assert b'[ps5-batch-summary] config gpu-present=1 multidraw=1 deferred=1 ' in (OUT / 'llvm-pie.elf').read_bytes(), 'SDK batching disabled or missing compiled receipt'
+diff --git a/headless/hum_notes.h b/headless/hum_notes.h
+new file mode 100644
+index 0000000..3e1ac17
+--- /dev/null
++++ b/headless/hum_notes.h
+@@ -0,0 +1,195 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// EDEN_UP_MIC_NOTES=1 (mic_capture.cpp, pad.cpp): a hum into the PS5 controller's mic plays the
++// ocarina. W-14 showed Ocarina of Time never attaches its raw mic input stream under Eden (indices
++// 0/0 with the ocarina out), so instead of feeding that stream the hum's pitch is turned into the
++// ocarina's five buttons, which the game reads as if they were pressed: low D, F, A, B, high D on
++// the Switch 2's L, R, A, Y, X.
++//
++// Pure functions, no platform calls (tools/test-hum-notes.cpp tests them on the host):
++// - DetectPitch: the fundamental of one window of 16 kHz mono samples (YIN), 0 when the window is
++//   too quiet or has no clear pitch.
++// - Classify: which of the five notes a pitch is. Octaves do not matter (people hum where their
++//   voice sits), only the note's name: D, F, A or B within KeepCents of it, nothing between them.
++//   A D is the high one when it is above the last other note hummed in the last few seconds (the
++//   songs that go up to it: B-D in Zelda's Lullaby), the low one otherwise.
++// - Tracker: which note is held now. A note starts after two windows in a row agree (a stray
++//   window of noise presses nothing), stays while windows keep agreeing, and ends at the first
++//   window that does not; a new note always needs two windows, so the game sees a release between
++//   two notes. Nothing is held unless armed; arming ends after IdleDisarmMs without a note.
++#pragma once
++
++#include <array>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++
++namespace Eden::Hum {
++
++constexpr unsigned Rate = 16000;     ///< DetectPitch's sample rate
++constexpr std::size_t Window = 1024; ///< samples per detection (64 ms)
++constexpr float MinHz = 70.0f;       ///< a low male hum
++constexpr float MaxHz = 1100.0f;     ///< above a high whistle's fundamental
++constexpr float MinRms = 300.0f;     ///< about -40 dBFS: quieter windows are silence
++constexpr float YinThreshold = 0.15f;
++constexpr float KeepCents = 75.0f;   ///< how far off a note's name a pitch may be and count
++constexpr std::int64_t HighDContextMs = 3000;
++constexpr std::int64_t IdleDisarmMs = 20000;
++
++enum Note : int { None = -1, LowD = 0, F = 1, A = 2, B = 3, HighD = 4 };
++
++/// The fundamental frequency of `n` samples at `rate` Hz, or 0 for silence or no clear pitch.
++inline float DetectPitch(const std::int16_t* samples, std::size_t n, unsigned rate = Rate) {
++    if (samples == nullptr || rate == 0) return 0.0f;
++    const std::size_t min_lag = static_cast<std::size_t>(static_cast<float>(rate) / MaxHz);
++    const std::size_t max_lag = static_cast<std::size_t>(static_cast<float>(rate) / MinHz) + 1;
++    if (n < 2 * max_lag + 2 || min_lag < 2) return 0.0f;
++    double energy = 0;
++    double mean = 0;
++    for (std::size_t i = 0; i < n; ++i) mean += samples[i];
++    mean /= static_cast<double>(n);
++    for (std::size_t i = 0; i < n; ++i) {
++        const double s = samples[i] - mean;
++        energy += s * s;
++    }
++    if (std::sqrt(energy / static_cast<double>(n)) < MinRms) return 0.0f;
++
++    // YIN: d(tau) = sum (x[i] - x[i + tau])^2 over a fixed span, then the cumulative mean
++    // normalised difference; the first tau under the threshold, at its local minimum.
++    const std::size_t span = n - max_lag - 1;
++    std::array<float, 1024> cmnd{};
++    if (max_lag + 2 > cmnd.size()) return 0.0f;
++    double running = 0;
++    cmnd[0] = 1.0f;
++    for (std::size_t tau = 1; tau <= max_lag + 1; ++tau) {
++        double d = 0;
++        for (std::size_t i = 0; i < span; ++i) {
++            const double diff = static_cast<double>(samples[i]) - samples[i + tau];
++            d += diff * diff;
++        }
++        running += d;
++        cmnd[tau] = running > 0 ? static_cast<float>(d * static_cast<double>(tau) / running) : 1.0f;
++    }
++    std::size_t best = 0;
++    for (std::size_t tau = min_lag; tau <= max_lag; ++tau) {
++        if (cmnd[tau] < YinThreshold) {
++            while (tau + 1 <= max_lag && cmnd[tau + 1] < cmnd[tau]) ++tau;
++            best = tau;
++            break;
++        }
++    }
++    if (best == 0) return 0.0f;
++    // Parabolic interpolation between the neighbours for a fractional lag.
++    float lag = static_cast<float>(best);
++    const float a = cmnd[best - 1], b = cmnd[best], c = cmnd[best + 1];
++    const float denom = a - 2 * b + c;
++    if (denom > 1e-6f) lag += 0.5f * (a - c) / denom;
++    const float hz = static_cast<float>(rate) / lag;
++    return hz >= MinHz && hz <= MaxHz ? hz : 0.0f;
++}
++
++/// A pitch as a MIDI note number (69 = A4 = 440 Hz), fractional.
++inline float Midi(float hz) {
++    return 69.0f + 12.0f * std::log2(hz / 440.0f);
++}
++
++/// Which note `hz` is; `last_other_midi` is the last F, A or B hummed lately (NaN for none).
++inline Note Classify(float hz, float last_other_midi) {
++    if (!(hz > 0.0f)) return None;
++    const float midi = Midi(hz);
++    float pc = std::fmod(midi, 12.0f);
++    if (pc < 0) pc += 12.0f;
++    struct Name {
++        float pc;
++        Note note;
++    };
++    static constexpr std::array<Name, 4> names{{{2.0f, LowD}, {5.0f, F}, {9.0f, A}, {11.0f, B}}};
++    Note found = None;
++    float closest = 12.0f;
++    for (const auto& name : names) {
++        float d = std::fabs(pc - name.pc);
++        d = std::fmin(d, 12.0f - d);
++        if (d < closest) {
++            closest = d;
++            found = name.note;
++        }
++    }
++    if (closest * 100.0f > KeepCents) return None;
++    if (found == LowD && !std::isnan(last_other_midi) && midi > last_other_midi) return HighD;
++    return found;
++}
++
++class Tracker {
++public:
++    void Arm(std::int64_t now_ms) {
++        armed = true;
++        last_activity_ms = now_ms;
++        Reset();
++    }
++    void Disarm() {
++        armed = false;
++        Reset();
++    }
++    bool Armed() const {
++        return armed;
++    }
++    Note Held() const {
++        return armed ? held : None;
++    }
++
++    /// One window's pitch (0 for none) at `now_ms`; returns the note held after it.
++    Note Feed(float hz, std::int64_t now_ms) {
++        if (!armed) return None;
++        if (now_ms - last_activity_ms > IdleDisarmMs) {
++            Disarm();
++            return None;
++        }
++        const float context =
++            now_ms - last_other_ms <= HighDContextMs ? last_other_midi : std::nanf("");
++        const Note note = Classify(hz, context);
++        if (note == F || note == A || note == B) {
++            last_other_midi = Midi(hz);
++            last_other_ms = now_ms;
++        }
++        if (note == None) {
++            held = None;
++            candidate = None;
++            run = 0;
++            return held;
++        }
++        last_activity_ms = now_ms;
++        if (held != None && note == held) return held;
++        // Anything else ends the held note; a new one needs two windows in a row.
++        held = None;
++        if (note == candidate) {
++            ++run;
++        } else {
++            candidate = note;
++            run = 1;
++        }
++        if (run >= 2) {
++            held = note;
++            candidate = None;
++            run = 0;
++        }
++        return held;
++    }
++
++private:
++    void Reset() {
++        held = None;
++        candidate = None;
++        run = 0;
++        last_other_midi = std::nanf("");
++        last_other_ms = -HighDContextMs - 1;
++    }
++
++    bool armed = false;
++    Note held = None;
++    Note candidate = None;
++    int run = 0;
++    float last_other_midi = std::nanf("");
++    std::int64_t last_other_ms = -HighDContextMs - 1;
++    std::int64_t last_activity_ms = 0;
++};
++
++} // namespace Eden::Hum
+diff --git a/headless/mic_capture.cpp b/headless/mic_capture.cpp
+new file mode 100644
+index 0000000..cda4f0e
+--- /dev/null
++++ b/headless/mic_capture.cpp
+@@ -0,0 +1,389 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// EDEN_UP_MIC_PROBE (mic_capture.h).
++#include "mic_capture.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include "common/logging.h"
++#include "hum_notes.h"
++
++extern "C" {
++int sceAudioInOpen(int user, unsigned type, unsigned index, unsigned length, unsigned rate, unsigned param);
++int sceAudioInInput(int handle, void* samples);
++int sceAudioInClose(int handle);
++int sceUserServiceGetForegroundUser(std::int32_t* user_id);
++}
++
++namespace Eden::Mic {
++namespace {
++
++using OpenFn = int (*)(std::int32_t user, std::uint32_t type, std::uint32_t index, std::uint32_t length,
++                       std::uint32_t rate, std::uint32_t param);
++using InputFn = int (*)(int handle, void* samples);
++using CloseFn = int (*)(int handle);
++
++struct Api {
++    OpenFn open{};
++    InputFn input{};
++    CloseFn close{};
++};
++
++bool Exactly1(const char* name) {
++    const char* value = std::getenv(name);
++    return value != nullptr && value[0] == '1' && value[1] == '\0';
++}
++
++// EDEN_UP_MIC_NOTES=1 (hum_notes.h): the hum's pitch presses the ocarina's buttons. It needs the
++// capture, so it starts it as EDEN_UP_MIC_PROBE=1 does.
++bool NotesSwitched() {
++    static const bool on = Exactly1("EDEN_UP_MIC_NOTES");
++    return on;
++}
++
++// EDEN_UP_MIC_NOTES_ALWAYS=1: the hum is armed all the time (no D-pad left needed; W-17: the
++// user's ocarina is not on D-pad left, so a loud hum never armed). Only B disarms it, for one
++// window; it re-arms at once.
++bool AlwaysArmed() {
++    static const bool on = Exactly1("EDEN_UP_MIC_NOTES_ALWAYS");
++    return on;
++}
++
++// EDEN_UP_MIC_FEED: streaming raw PCM into the Switch 2 mixer's raw mic stream (TrueRawAudioIn).
++// Also needs mic capture running.
++bool FeedSwitched() {
++    const char* val = std::getenv("EDEN_UP_MIC_FEED");
++    return val != nullptr && val[0] != '\0' && std::strcmp(val, "0") != 0 && std::strcmp(val, "off") != 0;
++}
++
++bool Switched() {
++    return Exactly1("EDEN_UP_MIC_PROBE") || NotesSwitched() || FeedSwitched();
++}
++
++// The functions come from libSceAudioIn, imported at link time (tools/stubs/libSceAudioIn.c; the
++// app's loader resolves them by NID as it does libSceAudioOut's). W-14/W-15 loaded the module at
++// run time instead and sceKernelDlsym refused every name and NID (0x80020003).
++bool LoadApi(Api& api) {
++    api.open = &sceAudioInOpen;
++    api.input = &sceAudioInInput;
++    api.close = &sceAudioInClose;
++    LOG_INFO(Audio_Sink, "EDEN_MIC functions imported: open {}, input {}, close {}",
++             reinterpret_cast<void*>(api.open), reinterpret_cast<void*>(api.input),
++             reinterpret_cast<void*>(api.close));
++    return api.open != nullptr && api.input != nullptr && api.close != nullptr;
++}
++
++// One second of 48 kHz mono for eden_mic_read, bounded to 100 ms max backlog to preserve real-time responsiveness.
++static constexpr std::size_t kRingCapacity = 48000;
++static constexpr std::size_t kMaxLatencyFrames = 4800; // 100 ms at 48 kHz
++std::mutex ring_mutex;
++std::array<std::int16_t, kRingCapacity> ring{};
++std::size_t ring_write = 0, ring_count = 0;
++std::uint64_t ring_overruns = 0, ring_underruns = 0;
++
++void Push(const std::int16_t* samples, std::size_t count, std::uint32_t rate) {
++    // 16 kHz is taken three times over (the hum's pitch stays where it was); 48 kHz as it is.
++    const std::size_t repeat = rate == 16000 ? 3 : 1;
++    std::scoped_lock lock{ring_mutex};
++    for (std::size_t i = 0; i < count; ++i) {
++        for (std::size_t r = 0; r < repeat; ++r) {
++            ring[ring_write] = samples[i];
++            ring_write = (ring_write + 1) % ring.size();
++            if (ring_count < kMaxLatencyFrames) {
++                ++ring_count;
++            } else {
++                // Drop oldest sample beyond 100 ms so humming pitch recognition remains low-latency
++                ++ring_overruns;
++            }
++        }
++    }
++}
++
++std::atomic<bool> stopping{false};
++
++// EDEN_UP_MIC_NOTES: the pad thread arms and disarms (ArmNotes/DisarmNotes), the capture thread
++// runs the tracker and publishes the note held (HeldNote). Arm requests are counted so one made
++// between two windows is never lost.
++std::atomic<unsigned> arm_requests{0}, disarm_requests{0};
++std::atomic<int> held_note{Hum::None};
++
++std::int64_t NowMs() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(
++               std::chrono::steady_clock::now().time_since_epoch())
++        .count();
++}
++
++// 48 kHz (or 16 kHz) blocks into 16 kHz windows of Hum::Window, every half window.
++struct NoteRunner {
++    std::vector<std::int16_t> window = std::vector<std::int16_t>(Hum::Window);
++    std::size_t filled = 0;
++    std::uint32_t phase = 0; // 48 kHz: one sample of three, the mean of the three
++    std::int32_t sum3 = 0;
++    Hum::Tracker tracker;
++    unsigned arms_seen = 0, disarms_seen = 0;
++    Hum::Note last_logged = Hum::None;
++    unsigned logged = 0;
++
++    void Take(std::int16_t sample) {
++        window[filled++] = sample;
++        if (filled < window.size()) return;
++        Step();
++        // Half the window again: a window every 32 ms.
++        std::copy(window.begin() + window.size() / 2, window.end(), window.begin());
++        filled = window.size() / 2;
++    }
++
++    void Push(const std::int16_t* samples, std::size_t count, std::uint32_t rate) {
++        for (std::size_t i = 0; i < count; ++i) {
++            if (rate == Hum::Rate) {
++                Take(samples[i]);
++            } else if (rate == 48000) {
++                sum3 += samples[i];
++                if (++phase == 3) {
++                    Take(static_cast<std::int16_t>(sum3 / 3));
++                    sum3 = 0;
++                    phase = 0;
++                }
++            }
++        }
++    }
++
++    void Step() {
++        const auto now = NowMs();
++        const unsigned arms = arm_requests.load(std::memory_order_acquire);
++        const unsigned disarms = disarm_requests.load(std::memory_order_acquire);
++        if (disarms != disarms_seen) {
++            disarms_seen = disarms;
++            if (tracker.Armed()) LOG_INFO(Audio_Sink, "EDEN_MIC_NOTE disarmed (B or the ocarina again)");
++            tracker.Disarm();
++        }
++        if (arms != arms_seen) {
++            arms_seen = arms;
++            tracker.Arm(now);
++            LOG_INFO(Audio_Sink, "EDEN_MIC_NOTE armed: hum D, F, A, B or a higher D");
++        }
++        if (AlwaysArmed() && !tracker.Armed()) tracker.Arm(now);
++        const bool was_armed = tracker.Armed();
++        const float hz = Hum::DetectPitch(window.data(), window.size());
++        const Hum::Note note = tracker.Feed(hz, now);
++        if (was_armed && !tracker.Armed() && !AlwaysArmed()) LOG_INFO(Audio_Sink, "EDEN_MIC_NOTE disarmed: no note for 20 s");
++        held_note.store(note, std::memory_order_release);
++        if (note != last_logged && logged < 2000) {
++            static constexpr const char* names[]{"low D (L)", "F (R)", "A (A)", "B (Y)", "high D (X)"};
++            if (note == Hum::None) {
++                LOG_INFO(Audio_Sink, "EDEN_MIC_NOTE release");
++            } else {
++                LOG_INFO(Audio_Sink, "EDEN_MIC_NOTE {} at {:.1f} Hz", names[note], hz);
++            }
++            ++logged;
++            last_logged = note;
++        }
++    }
++};
++
++// Detached: sceAudioInInput may block, and the app's exit must not wait for it.
++std::thread worker;
++std::once_flag started;
++
++void Run() {
++    Api api;
++    if (!LoadApi(api)) {
++        LOG_WARNING(Audio_Sink, "EDEN_MIC the PS5's mic functions are not there: no capture");
++        return;
++    }
++    std::int32_t user = -1;
++    const int user_result = sceUserServiceGetForegroundUser(&user);
++    LOG_INFO(Audio_Sink, "EDEN_MIC foreground user: result {:#x}", static_cast<unsigned>(user_result));
++    // Types and rates to try, most useful first: 48 kHz needs no conversion. param 0 = 16-bit mono.
++    struct Try {
++        std::uint32_t type, rate, length;
++    };
++    static constexpr Try tries[]{{0, 48000, 256}, {1, 48000, 256}, {2, 48000, 256}, {3, 48000, 256},
++                                 {0, 16000, 256}, {1, 16000, 256}, {2, 16000, 256}, {3, 16000, 256}};
++    int handle = -1;
++    Try chosen{};
++    for (const Try& t : tries) {
++        handle = api.open(user, t.type, 0, t.length, t.rate, 0);
++        LOG_INFO(Audio_Sink, "EDEN_MIC open type {} {} Hz {} frames: {:#x}", t.type, t.rate, t.length,
++                 static_cast<unsigned>(handle));
++        if (handle >= 0) {
++            chosen = t;
++            break;
++        }
++    }
++    if (handle < 0) {
++        LOG_WARNING(Audio_Sink, "EDEN_MIC no open setting was accepted: no capture");
++        return;
++    }
++    std::vector<std::int16_t> block(chosen.length);
++    std::unique_ptr<NoteRunner> notes;
++    if (NotesSwitched()) {
++        notes = std::make_unique<NoteRunner>();
++        if (AlwaysArmed()) LOG_INFO(Audio_Sink, "EDEN_UP_MIC_NOTES_ALWAYS=1: the hum is always armed");
++        LOG_INFO(Audio_Sink, "EDEN_UP_MIC_NOTES=1: D-pad left arms the hum (the ocarina comes out), B or "
++                             "D-pad left again or 20 s without a note disarms it");
++    }
++    double sum = 0;
++    int peak = 0;
++    std::uint64_t frames = 0, calls = 0, failures = 0;
++    std::uint64_t voice_frames = 0;
++    std::int64_t last_input_us = 0;
++    auto next = std::chrono::steady_clock::now() + std::chrono::seconds(1);
++    while (!stopping.load(std::memory_order_relaxed)) {
++        const auto t0 = std::chrono::steady_clock::now();
++        const int result = api.input(handle, block.data());
++        const auto t1 = std::chrono::steady_clock::now();
++        last_input_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
++        ++calls;
++        if (result < 0) {
++            if (++failures == 1 || failures % 100 == 0)
++                LOG_WARNING(Audio_Sink, "EDEN_MIC input failed: {:#x} ({} times)", static_cast<unsigned>(result),
++                            failures);
++            if (failures >= 1000) break;
++            std::this_thread::sleep_for(std::chrono::milliseconds(5));
++            continue;
++        }
++        Push(block.data(), block.size(), chosen.rate);
++        if (notes) notes->Push(block.data(), block.size(), chosen.rate);
++        double block_sum = 0;
++        int block_peak = 0;
++        for (const std::int16_t s : block) {
++            block_sum += double(s) * s;
++            block_peak = std::max(block_peak, std::abs(int(s)));
++        }
++        const double block_rms = block.empty() ? 0 : std::sqrt(block_sum / double(block.size()));
++        if (block_rms > 100.0) { // voice activity > -50 dBFS
++            voice_frames += block.size();
++        }
++        sum += block_sum;
++        peak = std::max(peak, block_peak);
++        frames += block.size();
++        if (std::chrono::steady_clock::now() >= next) {
++            const double rms = frames ? std::sqrt(sum / double(frames)) : 0;
++            const double vad_pct = frames ? (100.0 * double(voice_frames) / double(frames)) : 0.0;
++            std::size_t buffered = 0;
++            std::uint64_t drops = 0;
++            {
++                std::scoped_lock lock{ring_mutex};
++                buffered = ring_count;
++                drops = ring_overruns;
++            }
++            LOG_INFO(Audio_Sink,
++                     "EDEN_MIC level: rms {:.0f} ({:.1f} dBFS), peak {}, vad {:.0f}% active, "
++                     "{} frames in {} reads ({} us/read, {} failed), ring {}/{} (drops {})",
++                     rms, rms > 0 ? 20 * std::log10(rms / 32768.0) : -120.0, peak, vad_pct,
++                     frames, calls, last_input_us, failures, buffered, kMaxLatencyFrames, drops);
++            sum = 0;
++            peak = 0;
++            frames = calls = voice_frames = 0;
++            next += std::chrono::seconds(1);
++        }
++    }
++    held_note.store(Hum::None, std::memory_order_release);
++    api.close(handle);
++    LOG_INFO(Audio_Sink, "EDEN_MIC closed");
++}
++
++} // namespace
++
++void Start() {
++    if (!Switched()) return;
++    std::call_once(started, [] {
++        LOG_INFO(Audio_Sink, "EDEN_UP_MIC_PROBE=1: opening the PS5 controller's mic (a level line every second)");
++        worker = std::thread([] { Run(); });
++        worker.detach();
++    });
++}
++
++bool NotesOn() {
++    return NotesSwitched();
++}
++
++void ArmNotes() {
++    if (NotesSwitched()) arm_requests.fetch_add(1, std::memory_order_acq_rel);
++}
++
++void DisarmNotes() {
++    if (NotesSwitched()) disarm_requests.fetch_add(1, std::memory_order_acq_rel);
++}
++
++int HeldNote() {
++    return NotesSwitched() ? held_note.load(std::memory_order_acquire) : Hum::None;
++}
++
++void Stop() {
++    stopping.store(true, std::memory_order_relaxed); // the thread closes the mic at its next read
++}
++
++// Observe the PCM returned to sysmix. Retain only a short pitch-analysis window.
++void LogDeliveredSignal(const std::int16_t* samples, std::size_t count) {
++    static const bool enabled = Exactly1("EDEN_UP_MIC_SIGNAL");
++    if (!enabled || count == 0) return;
++
++    static std::mutex mutex;
++    static std::array<std::int16_t, Hum::Window> window{};
++    static std::size_t filled = 0;
++    static std::size_t frames = 0, clipped = 0;
++    static unsigned phase = 0;
++    static int sum = 0, peak = 0;
++    static double energy = 0.0;
++    static float pitch = 0.0f;
++    static unsigned lines = 0;
++    std::scoped_lock lock{mutex};
++    if (lines >= 120) return;
++
++    for (std::size_t i = 0; i < count; ++i) {
++        const int sample = samples[i];
++        const int magnitude = std::abs(sample);
++        peak = std::max(peak, magnitude);
++        clipped += (sample == -32768 || sample == 32767);
++        energy += double(sample) * sample;
++        ++frames;
++        sum += sample;
++        if (++phase == 3) {
++            window[filled++] = static_cast<std::int16_t>(sum / 3);
++            phase = 0;
++            sum = 0;
++        }
++        if (filled == window.size()) {
++            if (pitch == 0.0f) pitch = Hum::DetectPitch(window.data(), window.size());
++            filled = 0;
++        }
++    }
++    if (frames < 48000) return;
++    LOG_INFO(Audio_Sink, "EDEN_MIC_SIGNAL delivered: {} frames, rms {:.0f}, peak {}, "
++                         "{} clipped, first clear pitch {:.1f} Hz",
++             frames, std::sqrt(energy / double(frames)), peak, clipped, pitch);
++    ++lines;
++    frames = clipped = 0;
++    peak = 0;
++    energy = 0.0;
++    pitch = 0.0f;
++}
++
++} // namespace Eden::Mic
++
++extern "C" std::size_t eden_mic_read(std::int16_t* out, std::size_t frames) {
++    using namespace Eden::Mic;
++    std::size_t take;
++    {
++        std::scoped_lock lock{ring_mutex};
++        take = std::min(frames, ring_count);
++        ring_underruns += frames - take;
++        const std::size_t start = (ring_write + kRingCapacity - ring_count) % kRingCapacity;
++        for (std::size_t i = 0; i < take; ++i) out[i] = ring[(start + i) % kRingCapacity];
++        ring_count -= take;
++    }
++    LogDeliveredSignal(out, take);
++    return take;
++}
+diff --git a/headless/mic_capture.h b/headless/mic_capture.h
+new file mode 100644
+index 0000000..3e9cdea
+--- /dev/null
++++ b/headless/mic_capture.h
+@@ -0,0 +1,34 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// EDEN_UP_MIC_PROBE=1: the PS5 controller's microphone, captured for the Switch 2 sound mixer's
++// input streams (Ocarina of Time plays the ocarina from a hum: it opens "InputStream-1 <= 1ch 48k
++// Q15 <= TrueRawAudioIn" at boot, and Eden feeds it nothing).
++//
++// This first step only finds out whether a homebrew app may open the mic, and how: the PS5's
++// libSceAudioIn is not in the Payload SDK: it is imported through a link-time facade
++// (tools/stubs/libSceAudioIn.c), as the keyboard's libSceCommonDialog is; looking it up at run
++// time (W-14/W-15) found none of its functions. It tries a few open settings, logs each answer, then logs the level
++// once a second and keeps the last second of samples, at 48 kHz mono, for eden_mic_read.
++// Off: nothing is loaded or started.
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace Eden::Mic {
++/// Starts the capture thread when EDEN_UP_MIC_PROBE=1 (once; later calls do nothing).
++void Start();
++/// Asks the thread to close the mic and end (does not wait: a read may block).
++void Stop();
++
++/// EDEN_UP_MIC_NOTES=1 (hum_notes.h): whether the hum plays the ocarina's buttons.
++bool NotesOn();
++/// Arms the hum (the player took the ocarina out); nothing is pressed until armed.
++void ArmNotes();
++/// Disarms it (the ocarina was put away).
++void DisarmNotes();
++/// The ocarina note the hum holds now: 0 low D, 1 F, 2 A, 3 B, 4 high D, -1 none (or switch off).
++int HeldNote();
++} // namespace Eden::Mic
++
++/// Up to `frames` samples (48 kHz, mono, s16) captured since the last call; 0 when the mic is not open.
++extern "C" std::size_t eden_mic_read(std::int16_t* out, std::size_t frames);
+diff --git a/headless/pad.cpp b/headless/pad.cpp
+index b4c3aa8..984b311 100644
+--- a/headless/pad.cpp
++++ b/headless/pad.cpp
+@@ -7,6 +7,9 @@
+ #include "common/input.h"
+ #include "common/logging.h"
+ #include "gameplay_test.h"
++#ifdef PS5_NATIVE
++#include "mic_capture.h"
++#endif
+ #include "input_common/input_poller.h"
+ #include "test_harness.h"
+ #include <utility>
+@@ -332,6 +335,7 @@ void Pad::Consume(std::size_t player, std::span<const ps5::pad::Data> samples) {
+         constexpr ButtonMask menu_chord = kButtonTouchPad | kButtonL1;
+         constexpr ButtonMask hud_chord = kButtonTouchPad | kButtonR1;
+         const auto pressed = sample.buttons;
++        const auto previous = last_buttons;
+         if ((pressed & menu_chord) == menu_chord &&
+             (last_buttons & menu_chord) != menu_chord)
+             return_to_menu = true;
+@@ -373,6 +377,24 @@ void Pad::Consume(std::size_t player, std::span<const ps5::pad::Data> samples) {
+                                                         (pad == pad_l2 && left) || (pad == pad_r2 && right));
+         }
+         set_touch(sample.buttons);
++#ifdef PS5_NATIVE
++        // EDEN_UP_MIC_NOTES=1 (hum_notes.h): D-pad left takes the ocarina out and arms the hum, B
++        // puts it away and disarms it (the capture thread also disarms after 20 s without a note).
++        // While armed, the note hummed holds its ocarina button as the Switch 2 has them: low D,
++        // F, A, B, high D on L, R, A, Y, X. Player 1 in the usual grip only; the real buttons
++        // still work, the hum only adds presses.
++        if (player == 0 && grip == Grip::usual && Eden::Mic::NotesOn()) {
++            if ((pressed & kButtonLeft) != 0 && (previous & kButtonLeft) == 0) Eden::Mic::ArmNotes();
++            if (down(game_b, sample.buttons, left, right)) Eden::Mic::DisarmNotes();
++            static constexpr Button kNotes[]{Button::TriggerL, Button::TriggerR, Button::ButtonA,
++                                             Button::ButtonY, Button::ButtonX};
++            const int note = Eden::Mic::HeldNote();
++            if (note >= 0 && note < static_cast<int>(std::size(kNotes)))
++                engine->SetButtonState(player, kNotes[note], true);
++        }
++#else
++        (void)previous;
++#endif
+         last_left = left;
+         last_right = right;
+         float left_x = axis(sample.left_stick.x), left_y = -axis(sample.left_stick.y);
+diff --git a/tools/build-audio-in-stub.sh b/tools/build-audio-in-stub.sh
+new file mode 100755
+index 0000000..c67f6e1
+--- /dev/null
++++ b/tools/build-audio-in-stub.sh
+@@ -0,0 +1,17 @@
++#!/usr/bin/env bash
++# SPDX-License-Identifier: GPL-3.0-or-later
++# Builds build/stubs/libSceAudioIn.so, the libSceAudioIn import facade the controller mic
++# capture links against (tools/stubs/libSceAudioIn.c), with the Payload SDK's compiler.
++set -euo pipefail
++root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
++sdk="$root/../ps5-native-app-boilerplate/.deps/native/ps5-payload-sdk"
++source="$root/tools/stubs/libSceAudioIn.c"
++out="$root/build/stubs/libSceAudioIn.so"
++[[ -f $out && $out -nt $source ]] && exit 0
++test -x "$sdk/bin/prospero-clang" || { echo "Missing the Payload SDK; run make deps" >&2; exit 1; }
++mkdir -p "$root/build/stubs"
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++PS5_PAYLOAD_SDK="$sdk" "$sdk/bin/prospero-clang" -fPIC -c "$source" -o "$work/libSceAudioIn.o"
++"$sdk/bin/prospero-lld" --shared -soname libSceAudioIn.sprx -o "$work/libSceAudioIn.so" "$work/libSceAudioIn.o"
++mv "$work/libSceAudioIn.so" "$out"
+diff --git a/tools/eglantine-patches/1200-ocarina-mic-stream-dump.patch b/tools/eglantine-patches/1200-ocarina-mic-stream-dump.patch
+new file mode 100644
+index 0000000..a5cfb07
+--- /dev/null
++++ b/tools/eglantine-patches/1200-ocarina-mic-stream-dump.patch
+@@ -0,0 +1,120 @@
++Subject: [PATCH] EDEN_UP_MIC_DUMP=1: what a Switch 2 sysmix input stream's ring looks like (for the ocarina hum); off by default
++
++The Switch 2 Ocarina of Time plays the ocarina from a hum into the microphone. At boot it opens
++two sysmix input streams (kind 1): "InputStream-0<=1ch48kQ15<=AudioVirtualOutput0" and
++"InputStream-1<=1ch48kQ15<=TrueRawAudioIn", each 4800 frames of mono Q15 at 48 kHz in a 0xd000-byte
++ring. Eden fills neither. To feed the PS5 controller's mic into the second, where the samples go in
++the ring has to be known: only the two indices are (read at +0x44, write at +0x1004), and 0xd000
++bytes is far more than 4801 16-bit frames.
++
++With the switch, for each input stream: at open and at each attach/engage, every non-zero 32-bit
++word of the first 0x3000 bytes (at most 64), and while open both indices about once a second
++(EDEN_MIC_DUMP lines, at most 200 a session). The stream keeps CreateStream's kind for this.
++Nothing else changes, on or off.
++
++diff --git a/src/core/hle/service/audio/nx2_audio_device_manager.h b/src/core/hle/service/audio/nx2_audio_device_manager.h
++index 7464546..10eade8 100644
++--- a/src/core/hle/service/audio/nx2_audio_device_manager.h
+++++ b/src/core/hle/service/audio/nx2_audio_device_manager.h
++@@ -17,6 +17,7 @@
++ 
++ #include <fmt/ranges.h>
++ 
+++#include "common/pe_switch.h"
++ #include "common/string_util.h"
++ #include "core/core.h"
++ #include "core/core_timing.h"
++@@ -46,6 +47,8 @@ struct Nx2SysmixStream {
++     u32 frames{};
++     bool open{};
++     bool engaged{};
+++    u32 kind{};           ///< CreateStream's kind: 1 for an input (a mic, or a device's loopback)
+++    u32 dump_ticks{};     ///< EDEN_UP_MIC_DUMP: drains since the last index line
++     double owed_frames{};
++     u32 data_mode{};      ///< command 7's mode; 0 leaves the data event alone
++     s32 data_threshold{}; ///< free frames that signal the data event
++@@ -66,6 +69,39 @@ inline std::shared_ptr<Nx2SysmixStreams> Nx2SysmixStreamList() {
++     return list;
++ }
++ 
+++// EDEN_UP_MIC_DUMP=1: what an input stream's ring looks like, to learn where a mic's samples go.
+++// Ocarina of Time opens "InputStream-1<=1ch48kQ15<=TrueRawAudioIn" (kind 1, 4800 frames, mono Q15,
+++// a 0xd000-byte buffer) to play the ocarina from a hum; only the two indices are known (read at
+++// +0x44, write at +0x1004), and 0xd000 is far more than 4801 16-bit frames. At open and at each
+++// engage: every non-zero 32-bit word of the first 0x3000 bytes (at most 64); while open, both
+++// indices about once a second. At most 200 lines a session.
+++inline bool Nx2MicDump() {
+++    static const bool on = Common::PeSwitch("EDEN_UP_MIC_DUMP");
+++    return on;
+++}
+++inline std::atomic<u32> nx2_mic_dump_lines{0};
+++inline void Nx2MicDumpStream(Core::System& system, const Nx2SysmixStream& stream, const char* why) {
+++    if (!Nx2MicDump() || stream.kind != 1 || !stream.buffer || nx2_mic_dump_lines.fetch_add(1) >= 200) {
+++        return;
+++    }
+++    auto& memory = system.ApplicationMemory();
+++    std::string words;
+++    u32 found = 0;
+++    const u64 span = (std::min<u64>)(stream.size, 0x3000);
+++    for (u64 offset = 0; offset + 4 <= span && found < 64; offset += 4) {
+++        const u32 value = memory.Read32(stream.buffer + offset);
+++        if (value != 0) {
+++            words += fmt::format(" {:#x}={:#x}", offset, value);
+++            ++found;
+++        }
+++    }
+++    LOG_INFO(Service_Audio,
+++             "EDEN_MIC_DUMP stream {} {}: size {:#x}, {} frames, {} ch, {} Hz, type {}, engaged {}, "
+++             "non-zero words in the first {:#x} bytes:{}",
+++             stream.id, why, stream.size, stream.frames, stream.channels, stream.sample_rate,
+++             stream.sample_type, stream.engaged, span, found == 0 ? std::string(" none") : words);
+++}
+++
++ // Switch 2 virtual output devices (nn::audio::ListVirtualOutputDevices and friends), reached through
++ // the object auddmg:u command 0 returns. Eden plays everything through one stereo 48 kHz output, so
++ // there is one virtual device. The nx2: name keeps the other commands auto-stubbed and logged.
++@@ -196,6 +232,7 @@ private:
++         if (const auto it = list->streams.find(stream_id); it != list->streams.end()) {
++             it->second->engaged = engaged;
++             it->second->owed_frames = 0;
+++            Nx2MicDumpStream(system, *it->second, engaged ? "attach" : "detach");
++             if (it->second->state_event) {
++                 it->second->state_event->Signal(system.Kernel());
++             }
++@@ -297,6 +334,7 @@ private:
++             stream->frames = frames;
++             stream->owed_frames = 0;
++             stream->open = true;
+++            Nx2MicDumpStream(system, *stream, "open");
++             stream->state_event->Signal(system.Kernel());
++         }
++         IPC::ResponseBuilder rb{ctx, 2};
++@@ -435,6 +473,12 @@ private:
++                 continue;
++             }
++             u32 filled = (write + capacity - read) % capacity;
+++            if (Nx2MicDump() && stream->kind == 1 && ++stream->dump_ticks >= 200 &&
+++                nx2_mic_dump_lines.fetch_add(1) < 200) { // every 200 drains of 5 ms: about 1 s
+++                stream->dump_ticks = 0;
+++                LOG_INFO(Service_Audio, "EDEN_MIC_DUMP stream {} indices: read(+0x44) {} write(+0x1004) {} of {}, engaged {}",
+++                         id, read, write, capacity, stream->engaged);
+++            }
++             if (stream->engaged) {
++                 stream->owed_frames += stream->sample_rate *
++                                        std::chrono::duration<double>(DrainInterval).count();
++@@ -464,6 +508,7 @@ private:
++         const auto name = Common::StringFromBuffer(ctx.ReadBuffer(0));
++         auto stream = std::make_shared<Nx2SysmixStream>();
++         stream->buffer = buffer;
+++        stream->kind = kind;
++         stream->size = size;
++         {
++             std::scoped_lock lk{streams->mutex};
++@@ -489,6 +534,7 @@ private:
++                 if (const auto it = streams->streams.find(id); it != streams->streams.end()) {
++                     it->second->engaged = engaged;
++                     it->second->owed_frames = 0;
+++                    Nx2MicDumpStream(system, *it->second, engaged ? "engage" : "disengage");
++                     if (it->second->state_event) {
++                         it->second->state_event->Signal(system.Kernel());
++                     }
+diff --git a/tools/eglantine-patches/1201-ocarina-mic-feed.patch b/tools/eglantine-patches/1201-ocarina-mic-feed.patch
+new file mode 100644
+index 0000000..9c9610b
+--- /dev/null
++++ b/tools/eglantine-patches/1201-ocarina-mic-feed.patch
+@@ -0,0 +1,166 @@
++diff --git a/src/core/hle/service/audio/nx2_audio_device_manager.h b/src/core/hle/service/audio/nx2_audio_device_manager.h
++index 10eade8..63da122 100644
++--- a/src/core/hle/service/audio/nx2_audio_device_manager.h
+++++ b/src/core/hle/service/audio/nx2_audio_device_manager.h
++@@ -18,6 +18,10 @@
++ #include <fmt/ranges.h>
++ 
++ #include "common/pe_switch.h"
+++#include <cstdint>
+++#include <cstdio>
+++#include <cstdlib>
+++#include <cstring>
++ #include "common/string_util.h"
++ #include "core/core.h"
++ #include "core/core_timing.h"
++@@ -49,6 +53,9 @@ struct Nx2SysmixStream {
++     bool engaged{};
++     u32 kind{};           ///< CreateStream's kind: 1 for an input (a mic, or a device's loopback)
++     u32 dump_ticks{};     ///< EDEN_UP_MIC_DUMP: drains since the last index line
+++    bool raw_mic{};       ///< an input stream named ...TrueRawAudioIn: the console's microphone
+++    u64 mic_fed{}, mic_silence{}; ///< EDEN_UP_MIC_FEED: frames written, of them silence
+++    u32 mic_ticks{};
++     double owed_frames{};
++     u32 data_mode{};      ///< command 7's mode; 0 leaves the data event alone
++     s32 data_threshold{}; ///< free frames that signal the data event
++@@ -64,11 +71,59 @@ struct Nx2SysmixStreams {
++ 
++ // Streams are created through audsmx:u but started and stopped through auddmg:u (AttachStream and
++ // DetachStream), so both services share one list.
+++// The PS5 controller's mic (headless/mic_capture.cpp); absent in builds without it.
+++extern "C" std::size_t eden_mic_read(std::int16_t* out, std::size_t frames) __attribute__((weak));
+++
++ inline std::shared_ptr<Nx2SysmixStreams> Nx2SysmixStreamList() {
++     static const auto list = std::make_shared<Nx2SysmixStreams>();
++     return list;
++ }
++ 
+++// EDEN_UP_MIC_FEED=1 (or auto, or <data>,<system index>,<game index> in hex): the PS5 controller's
+++// microphone (EDEN_UP_MIC_PROBE, headless/mic_capture.cpp, eden_mic_read) goes into every raw mic
+++// input stream ("...TrueRawAudioIn", 1 channel, Q15). Every drain (5 ms) while the stream is open,
+++// the frames due at its rate are written at <data> + 2 * index (mono 16-bit, ring capacity being
+++// frames + 1), as many as the ring has room for, and the system's index is moved past them; the
+++// game's index is only read. With no mic sample to hand, silence is written, as a quiet mic would
+++// give. Default layout: data +0x2000, system index +0x44, game index +0x1004. Lines: EDEN_MIC_FEED.
+++struct Nx2MicFeed {
+++    bool on{};
+++    u64 data{}, system_index{}, game_index{};
+++};
+++inline const Nx2MicFeed& Nx2MicFeedLayout() {
+++    static const Nx2MicFeed layout = [] {
+++        Nx2MicFeed feed;
+++        const char* value = std::getenv("EDEN_UP_MIC_FEED");
+++        if (value == nullptr || value[0] == 0 || std::strcmp(value, "0") == 0 ||
+++            std::strcmp(value, "off") == 0) {
+++            return feed;
+++        }
+++        if (std::strcmp(value, "1") == 0 || std::strcmp(value, "auto") == 0 ||
+++            std::strcmp(value, "true") == 0 || std::strcmp(value, "on") == 0) {
+++            feed = {true, 0x2000, 0x44, 0x1004};
+++            LOG_INFO(Service_Audio,
+++                     "EDEN_UP_MIC_FEED: auto layout enabled: controller mic goes into raw mic streams: "
+++                     "data at +0x2000, system index at +0x44, game index at +0x1004");
+++            return feed;
+++        }
+++        unsigned long long data = 0, system_index = 0, game_index = 0;
+++        if (std::sscanf(value, "%llx,%llx,%llx", &data, &system_index, &game_index) == 3 &&
+++            data >= 0x10 && system_index + 4 <= 0x10000 && game_index + 4 <= 0x10000) {
+++            feed = {true, data, system_index, game_index};
+++            LOG_INFO(Service_Audio,
+++                     "EDEN_UP_MIC_FEED: custom layout: data at +{:#x}, system index at +{:#x}, "
+++                     "game index at +{:#x}",
+++                     data, system_index, game_index);
+++        } else {
+++            LOG_WARNING(Service_Audio,
+++                        "EDEN_UP_MIC_FEED={}: expected '1'/'auto' or '<data>,<system index>,<game index>' in hex; off",
+++                        value);
+++        }
+++        return feed;
+++    }();
+++    return layout;
+++}
+++
++ // EDEN_UP_MIC_DUMP=1: what an input stream's ring looks like, to learn where a mic's samples go.
++ // Ocarina of Time opens "InputStream-1<=1ch48kQ15<=TrueRawAudioIn" (kind 1, 4800 frames, mono Q15,
++ // a 0xd000-byte buffer) to play the ocarina from a hum; only the two indices are known (read at
++@@ -334,6 +389,10 @@ private:
++             stream->frames = frames;
++             stream->owed_frames = 0;
++             stream->open = true;
+++            if (stream->kind == 1) {
+++                // Input streams (microphone / capture) are active as soon as they are open.
+++                stream->engaged = true;
+++            }
++             Nx2MicDumpStream(system, *stream, "open");
++             stream->state_event->Signal(system.Kernel());
++         }
++@@ -345,6 +404,7 @@ private:
++         {
++             std::scoped_lock lk{streams->mutex};
++             stream->open = false;
+++            stream->engaged = false;
++             stream->state_event->Signal(system.Kernel());
++         }
++         IPC::ResponseBuilder rb{ctx, 2};
++@@ -479,6 +539,53 @@ private:
++                 LOG_INFO(Service_Audio, "EDEN_MIC_DUMP stream {} indices: read(+0x44) {} write(+0x1004) {} of {}, engaged {}",
++                          id, read, write, capacity, stream->engaged);
++             }
+++            // EDEN_UP_MIC_FEED: the system writes a raw mic stream; the game reads it.
+++            if (const auto& feed = Nx2MicFeedLayout();
+++                feed.on && stream->raw_mic && stream->channels == 1 &&
+++                feed.data + u64{capacity} * 2 <= stream->size) {
+++                if (stream->open) {
+++                    const u32 produced = memory.Read32(stream->buffer + feed.system_index);
+++                    const u32 consumed = memory.Read32(stream->buffer + feed.game_index);
+++                    if (produced < capacity && consumed < capacity) {
+++                        stream->owed_frames += stream->sample_rate *
+++                                               std::chrono::duration<double>(DrainInterval).count();
+++                        const auto owed = static_cast<u32>(stream->owed_frames);
+++                        stream->owed_frames -= owed;
+++                        const u32 waiting = (produced + capacity - consumed) % capacity;
+++                        const u32 room = capacity - 1 - waiting;
+++                        const u32 count = (std::min)(owed, room);
+++                        std::array<std::int16_t, 1024> samples{};
+++                        const u32 wanted = (std::min<u32>)(count, samples.size());
+++                        const std::size_t got =
+++                            eden_mic_read != nullptr ? eden_mic_read(samples.data(), wanted) : 0;
+++                        for (u32 i = 0; i < wanted; ++i) {
+++                            memory.Write16(stream->buffer + feed.data + u64{(produced + i) % capacity} * 2,
+++                                           static_cast<u16>(samples[i]));
+++                        }
+++                        memory.Write32(stream->buffer + feed.system_index, (produced + wanted) % capacity);
+++                        stream->mic_fed += wanted;
+++                        stream->mic_silence += wanted - got;
+++                        if (++stream->mic_ticks >= 200 && nx2_mic_dump_lines.fetch_add(1) < 200) {
+++                            stream->mic_ticks = 0; // about once a second
+++                            const u32 new_waiting = (produced + wanted + capacity - consumed) % capacity;
+++                            LOG_INFO(Service_Audio,
+++                                     "EDEN_MIC_FEED stream {}: fed {} ({} mic, {} silence); "
+++                                     "sys_idx {} game_idx {} (waiting {}) room {}",
+++                                     id, stream->mic_fed, stream->mic_fed - stream->mic_silence,
+++                                     stream->mic_silence, (produced + wanted) % capacity,
+++                                     consumed, new_waiting, capacity - 1 - new_waiting);
+++                        }
+++                        if (stream->data_event && stream->data_mode != 0 && waiting + wanted > 0) {
+++                            stream->data_event->Signal(system.Kernel());
+++                        }
+++                    }
+++                }
+++                continue;
+++            }
+++            if (stream->kind == 1) {
+++                // Input streams with feed off: do not treat as output stream.
+++                continue;
+++            }
++             if (stream->engaged) {
++                 stream->owed_frames += stream->sample_rate *
++                                        std::chrono::duration<double>(DrainInterval).count();
++@@ -509,6 +616,7 @@ private:
++         auto stream = std::make_shared<Nx2SysmixStream>();
++         stream->buffer = buffer;
++         stream->kind = kind;
+++        stream->raw_mic = kind == 1 && name.find("TrueRawAudioIn") != std::string::npos;
++         stream->size = size;
++         {
++             std::scoped_lock lk{streams->mutex};
+diff --git a/tools/eglantine-patches/1207-ocarina-mic-log-whole-session.patch b/tools/eglantine-patches/1207-ocarina-mic-log-whole-session.patch
+new file mode 100644
+index 0000000..90b33c8
+--- /dev/null
++++ b/tools/eglantine-patches/1207-ocarina-mic-log-whole-session.patch
+@@ -0,0 +1,105 @@
++Subject: [PATCH] W-32: EDEN_MIC_FEED and EDEN_MIC_DUMP index lines for the whole session, not the first 200
++
++The feed and dump index lines shared a cap of 200 lines, so they stopped about a minute after the
++game opened its raw mic stream (W-24 at 779 s, W-30 at 104 s) and never covered the hums. Now each
++has its own pacer (common/nx2_mic_log.h): the first 200 lines of the session as before, then a line
++whenever the indices moved since the last line, and every 10 s otherwise. Still only with
++EDEN_UP_MIC_DUMP / EDEN_UP_MIC_FEED set. Host test: tools/test-mic-log.cpp (outer repo).
++
++diff --git a/src/core/hle/service/audio/nx2_audio_device_manager.h b/src/core/hle/service/audio/nx2_audio_device_manager.h
++--- a/src/core/hle/service/audio/nx2_audio_device_manager.h
+++++ b/src/core/hle/service/audio/nx2_audio_device_manager.h
++@@ -18,6 +18,7 @@
++ #include <fmt/ranges.h>
++ 
++ #include "common/pe_switch.h"
+++#include "common/nx2_mic_log.h"
++ #include <cstdint>
++ #include <cstdio>
++ #include <cstdlib>
++@@ -55,6 +56,8 @@
++     u32 dump_ticks{};     ///< EDEN_UP_MIC_DUMP: drains since the last index line
++     bool raw_mic{};       ///< an input stream named ...TrueRawAudioIn: the console's microphone
++     u64 mic_fed{}, mic_silence{}; ///< EDEN_UP_MIC_FEED: frames written, of them silence
+++    Common::Nx2MicLog::Pacer dump_pacer{}; ///< EDEN_MIC_DUMP index lines (common/nx2_mic_log.h)
+++    Common::Nx2MicLog::Pacer feed_pacer{}; ///< EDEN_MIC_FEED lines
++     u32 mic_ticks{};
++     double owed_frames{};
++     u32 data_mode{};      ///< command 7's mode; 0 leaves the data event alone
++@@ -533,9 +536,12 @@
++                 continue;
++             }
++             u32 filled = (write + capacity - read) % capacity;
++-            if (Nx2MicDump() && stream->kind == 1 && ++stream->dump_ticks >= 200 &&
++-                nx2_mic_dump_lines.fetch_add(1) < 200) { // every 200 drains of 5 ms: about 1 s
++-                stream->dump_ticks = 0;
+++            // About once a second: the first 200 lines of the session, then a line whenever an
+++            // index moved and every 10 s (common/nx2_mic_log.h).
+++            static u32 dump_lines = 0;
+++            if (Nx2MicDump() && stream->kind == 1 &&
+++                Common::Nx2MicLog::Due(stream->dump_pacer, Common::Nx2MicLog::Pack(read, write),
+++                                       dump_lines)) {
++                 LOG_INFO(Service_Audio, "EDEN_MIC_DUMP stream {} indices: read(+0x44) {} write(+0x1004) {} of {}, engaged {}",
++                          id, read, write, capacity, stream->engaged);
++             }
++@@ -565,8 +571,10 @@
++                         memory.Write32(stream->buffer + feed.system_index, (produced + wanted) % capacity);
++                         stream->mic_fed += wanted;
++                         stream->mic_silence += wanted - got;
++-                        if (++stream->mic_ticks >= 200 && nx2_mic_dump_lines.fetch_add(1) < 200) {
++-                            stream->mic_ticks = 0; // about once a second
+++                        // About once a second: the first 200 lines, then whenever the game's index
+++                        // moved and every 10 s for the rest of the session (common/nx2_mic_log.h).
+++                        static u32 feed_lines = 0;
+++                        if (Common::Nx2MicLog::Due(stream->feed_pacer, consumed, feed_lines)) {
++                             const u32 new_waiting = (produced + wanted + capacity - consumed) % capacity;
++                             LOG_INFO(Service_Audio,
++                                      "EDEN_MIC_FEED stream {}: fed {} ({} mic, {} silence); "
++diff --git a/src/common/nx2_mic_log.h b/src/common/nx2_mic_log.h
++new file mode 100644
++--- /dev/null
+++++ b/src/common/nx2_mic_log.h
++@@ -0,0 +1,43 @@
+++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
+++// SPDX-License-Identifier: GPL-3.0-or-later
+++
+++#pragma once
+++
+++#include "common/common_types.h"
+++
+++/// EDEN_MIC_FEED / EDEN_MIC_DUMP index lines (W-32): one chance about every second (every 200
+++/// drains of 5 ms). The first `first_lines` lines of the session are all written; after that a line
+++/// is written when the indices moved since the last line, and every `every_seconds` chances
+++/// otherwise, so a long session shows when the game starts reading its raw mic stream.
+++namespace Common::Nx2MicLog {
+++
+++struct Pacer {
+++    u32 ticks{};
+++    u32 seconds{};
+++    u64 last{~u64{0}}; ///< the indices at the last line written (packed by the caller)
+++};
+++
+++/// Called once per drain. True when a line is due now; then `last` already holds `now`.
+++/// `lines_so_far` is the session's shared count of chances taken, incremented here.
+++[[nodiscard]] constexpr bool Due(Pacer& p, u64 now, u32& lines_so_far, u32 first_lines = 200,
+++                                 u32 every_seconds = 10, u32 drains_a_second = 200) noexcept {
+++    if (++p.ticks < drains_a_second) {
+++        return false;
+++    }
+++    p.ticks = 0;
+++    const bool early = lines_so_far < first_lines;
+++    ++lines_so_far;
+++    const bool moved = now != p.last;
+++    const bool periodic = every_seconds != 0 && ++p.seconds % every_seconds == 0;
+++    if (early || moved || periodic) {
+++        p.last = now;
+++        return true;
+++    }
+++    return false;
+++}
+++
+++[[nodiscard]] constexpr u64 Pack(u32 a, u32 b) noexcept {
+++    return (u64{a} << 32) | b;
+++}
+++
+++} // namespace Common::Nx2MicLog
+diff --git a/tools/eglantine-patches/1208-ocarina-mic-ring-layout.patch b/tools/eglantine-patches/1208-ocarina-mic-ring-layout.patch
+new file mode 100644
+index 0000000..52ed92b
+--- /dev/null
++++ b/tools/eglantine-patches/1208-ocarina-mic-ring-layout.patch
+@@ -0,0 +1,31 @@
++Subject: [PATCH] sysmix: correct the raw mono mic ring layout
++
++The guest audio SDK reads input PCM after the second control page header
++when no per-frame timestamps are requested. The second page owns the producer
++cursor; the guest advances the consumer cursor in the first page.
++
++--- a/src/core/hle/service/audio/nx2_audio_device_manager.h
+++++ b/src/core/hle/service/audio/nx2_audio_device_manager.h
++@@ -88,7 +88,8 @@
++ // the frames due at its rate are written at <data> + 2 * index (mono 16-bit, ring capacity being
++ // frames + 1), as many as the ring has room for, and the system's index is moved past them; the
++ // game's index is only read. With no mic sample to hand, silence is written, as a quiet mic would
++-// give. Default layout: data +0x2000, system index +0x44, game index +0x1004. Lines: EDEN_MIC_FEED.
+++// give. Default layout for raw mono Q15 input without timestamps: data +0x1040,
+++// system index +0x1004, game index +0x44. Lines: EDEN_MIC_FEED.
++ struct Nx2MicFeed {
++     bool on{};
++     u64 data{}, system_index{}, game_index{};
++@@ -103,10 +104,10 @@
++         }
++         if (std::strcmp(value, "1") == 0 || std::strcmp(value, "auto") == 0 ||
++             std::strcmp(value, "true") == 0 || std::strcmp(value, "on") == 0) {
++-            feed = {true, 0x2000, 0x44, 0x1004};
+++            feed = {true, 0x1040, 0x1004, 0x44};
++             LOG_INFO(Service_Audio,
++                      "EDEN_UP_MIC_FEED: auto layout enabled: controller mic goes into raw mic streams: "
++-                     "data at +0x2000, system index at +0x44, game index at +0x1004");
+++                     "data at +0x1040, system index at +0x1004, game index at +0x44");
++             return feed;
++         }
++         unsigned long long data = 0, system_index = 0, game_index = 0;
+diff --git a/tools/eglantine-patches/1209-ocarina-mic-feed-when-engaged.patch b/tools/eglantine-patches/1209-ocarina-mic-feed-when-engaged.patch
+new file mode 100644
+index 0000000..733133c
+--- /dev/null
++++ b/tools/eglantine-patches/1209-ocarina-mic-feed-when-engaged.patch
+@@ -0,0 +1,27 @@
++Subject: [PATCH] sysmix: feed raw mic PCM only while the stream is engaged
++
++--- a/src/core/hle/service/audio/nx2_audio_device_manager.h
+++++ b/src/core/hle/service/audio/nx2_audio_device_manager.h
++@@ -393,8 +393,11 @@
++             stream->frames = frames;
++             stream->owed_frames = 0;
++             stream->open = true;
++-            if (stream->kind == 1) {
++-                // Input streams (microphone / capture) are active as soon as they are open.
+++            if (stream->raw_mic) {
+++                // Raw capture starts when the game attaches the stream.
+++                stream->engaged = false;
+++            } else if (stream->kind == 1) {
+++                // Preserve the existing startup behavior for other inputs.
++                 stream->engaged = true;
++             }
++             Nx2MicDumpStream(system, *stream, "open");
++@@ -550,7 +553,7 @@
++             if (const auto& feed = Nx2MicFeedLayout();
++                 feed.on && stream->raw_mic && stream->channels == 1 &&
++                 feed.data + u64{capacity} * 2 <= stream->size) {
++-                if (stream->open) {
+++                if (stream->engaged) {
++                     const u32 produced = memory.Read32(stream->buffer + feed.system_index);
++                     const u32 consumed = memory.Read32(stream->buffer + feed.game_index);
++                     if (produced < capacity && consumed < capacity) {
+diff --git a/tools/eglantine-patches/1210-ocarina-mic-feed-reference.patch b/tools/eglantine-patches/1210-ocarina-mic-feed-reference.patch
+new file mode 100644
+index 0000000..48fb6a2
+--- /dev/null
++++ b/tools/eglantine-patches/1210-ocarina-mic-feed-reference.patch
+@@ -0,0 +1,94 @@
++Subject: [PATCH] W-34: EDEN_UP_MIC_FEED_REFERENCE=1, silence into the game's AudioVirtualOutput0 input stream (off by default)
++
++Ocarina of Time opens and attaches "InputStream-0<=1ch48kQ15<=AudioVirtualOutput0" every time it
++attaches its raw mic stream. Nothing wrote that stream: its read and write indices stayed 0/0 for
++whole sessions while the game read the mic at 48 kHz (9.40, W-32-mic-signal, 14 Nov). With Humming
++selected the game's volume gate opened but no song came; with Instruments it answered. Hypothesis:
++the stream is the reference (the game's own output) a voice pipeline subtracts from the mic, and
++Humming waits for it. With the switch (and EDEN_UP_MIC_FEED) set it gets silence at its rate, in
++the same ring layout as the mic feed, from the moment the game attaches it; the mic stream still
++takes all mic samples. EDEN_MIC_FEED lines for it say "(reference)". Unset: as before.
++
++diff --git a/src/core/hle/service/audio/nx2_audio_device_manager.h b/src/core/hle/service/audio/nx2_audio_device_manager.h
++--- a/src/core/hle/service/audio/nx2_audio_device_manager.h
+++++ b/src/core/hle/service/audio/nx2_audio_device_manager.h
++@@ -55,6 +55,7 @@
++     u32 kind{};           ///< CreateStream's kind: 1 for an input (a mic, or a device's loopback)
++     u32 dump_ticks{};     ///< EDEN_UP_MIC_DUMP: drains since the last index line
++     bool raw_mic{};       ///< an input stream named ...TrueRawAudioIn: the console's microphone
+++    bool output_loopback{}; ///< an input stream named ...AudioVirtualOutput...: the game's own output
++     u64 mic_fed{}, mic_silence{}; ///< EDEN_UP_MIC_FEED: frames written, of them silence
++     Common::Nx2MicLog::Pacer dump_pacer{}; ///< EDEN_MIC_DUMP index lines (common/nx2_mic_log.h)
++     Common::Nx2MicLog::Pacer feed_pacer{}; ///< EDEN_MIC_FEED lines
++@@ -134,6 +135,16 @@
++ // +0x44, write at +0x1004), and 0xd000 is far more than 4801 16-bit frames. At open and at each
++ // engage: every non-zero 32-bit word of the first 0x3000 bytes (at most 64); while open, both
++ // indices about once a second. At most 200 lines a session.
+++/// EDEN_UP_MIC_FEED_REFERENCE=1 (W-34; exact "1", off by default; needs EDEN_UP_MIC_FEED): Ocarina of
+++/// Time opens and attaches "InputStream-0<=1ch48kQ15<=AudioVirtualOutput0" together with its raw mic
+++/// stream every time, and nothing wrote it: its indices stayed 0/0 for whole sessions while the game
+++/// read the mic (9.40, 14 Nov). Taken to be the reference a voice pipeline subtracts from the mic
+++/// (the game's own sound; a hypothesis), it gets silence at the stream's rate, with the same ring
+++/// layout as the mic feed, once the game attaches it. Silence says "no game sound to subtract".
+++inline bool Nx2MicFeedReference() {
+++    static const bool on = Common::PeSwitch("EDEN_UP_MIC_FEED_REFERENCE");
+++    return on;
+++}
++ inline bool Nx2MicDump() {
++     static const bool on = Common::PeSwitch("EDEN_UP_MIC_DUMP");
++     return on;
++@@ -393,8 +404,9 @@
++             stream->frames = frames;
++             stream->owed_frames = 0;
++             stream->open = true;
++-            if (stream->raw_mic) {
++-                // Raw capture starts when the game attaches the stream.
+++            if (stream->raw_mic || (stream->output_loopback && Nx2MicFeedReference())) {
+++                // Raw capture (and its reference, with EDEN_UP_MIC_FEED_REFERENCE) starts when the
+++                // game attaches the stream.
++                 stream->engaged = false;
++             } else if (stream->kind == 1) {
++                 // Preserve the existing startup behavior for other inputs.
++@@ -551,7 +563,8 @@
++             }
++             // EDEN_UP_MIC_FEED: the system writes a raw mic stream; the game reads it.
++             if (const auto& feed = Nx2MicFeedLayout();
++-                feed.on && stream->raw_mic && stream->channels == 1 &&
+++                feed.on && stream->channels == 1 &&
+++                (stream->raw_mic || (stream->output_loopback && Nx2MicFeedReference())) &&
++                 feed.data + u64{capacity} * 2 <= stream->size) {
++                 if (stream->engaged) {
++                     const u32 produced = memory.Read32(stream->buffer + feed.system_index);
++@@ -566,8 +579,10 @@
++                         const u32 count = (std::min)(owed, room);
++                         std::array<std::int16_t, 1024> samples{};
++                         const u32 wanted = (std::min<u32>)(count, samples.size());
++-                        const std::size_t got =
++-                            eden_mic_read != nullptr ? eden_mic_read(samples.data(), wanted) : 0;
+++                        // The reference stream gets silence; only the mic stream takes mic samples.
+++                        const std::size_t got = stream->raw_mic && eden_mic_read != nullptr
+++                                                    ? eden_mic_read(samples.data(), wanted)
+++                                                    : 0;
++                         for (u32 i = 0; i < wanted; ++i) {
++                             memory.Write16(stream->buffer + feed.data + u64{(produced + i) % capacity} * 2,
++                                            static_cast<u16>(samples[i]));
++@@ -581,9 +596,9 @@
++                         if (Common::Nx2MicLog::Due(stream->feed_pacer, consumed, feed_lines)) {
++                             const u32 new_waiting = (produced + wanted + capacity - consumed) % capacity;
++                             LOG_INFO(Service_Audio,
++-                                     "EDEN_MIC_FEED stream {}: fed {} ({} mic, {} silence); "
+++                                     "EDEN_MIC_FEED stream {}{}: fed {} ({} mic, {} silence); "
++                                      "sys_idx {} game_idx {} (waiting {}) room {}",
++-                                     id, stream->mic_fed, stream->mic_fed - stream->mic_silence,
+++                                     id, stream->raw_mic ? "" : " (reference)", stream->mic_fed, stream->mic_fed - stream->mic_silence,
++                                      stream->mic_silence, (produced + wanted) % capacity,
++                                      consumed, new_waiting, capacity - 1 - new_waiting);
++                         }
++@@ -629,6 +644,7 @@
++         stream->buffer = buffer;
++         stream->kind = kind;
++         stream->raw_mic = kind == 1 && name.find("TrueRawAudioIn") != std::string::npos;
+++        stream->output_loopback = kind == 1 && name.find("AudioVirtualOutput") != std::string::npos;
++         stream->size = size;
++         {
++             std::scoped_lock lk{streams->mutex};
+diff --git a/tools/package-headless-native.sh b/tools/package-headless-native.sh
+index 480a0dd..f6ab933 100644
+--- a/tools/package-headless-native.sh
++++ b/tools/package-headless-native.sh
+@@ -38,6 +38,8 @@ if grep -qx 'EDEN_PS5_OPENGL:BOOL=ON' "$out/CMakeCache.txt"; then
+ fi
+ # The PS5 keyboard's libSceCommonDialog import (tools/build-common-dialog-stub.sh).
+ stub_flags+=(--stub "$root/build/stubs/libSceCommonDialog.so")
++# The controller mic's libSceAudioIn import (tools/build-audio-in-stub.sh).
++stub_flags+=(--stub "$root/build/stubs/libSceAudioIn.so")
+ "$builder" link --in "$out/llvm-pie.elf" --out "$out/eboot.elf" \
+     "${stub_flags[@]}" --module-sdk 0x02000009 \
+     --companion-sdk 0x08050001 --file-name eboot.elf
+diff --git a/tools/prepare-build.sh b/tools/prepare-build.sh
+index a43f58e..014d1d6 100644
+--- a/tools/prepare-build.sh
++++ b/tools/prepare-build.sh
+@@ -60,6 +60,7 @@ fi
+ step "libSceAgcDriver link stub"
+ bash tools/build-agc-driver-stub.sh
+ bash tools/build-common-dialog-stub.sh
++bash tools/build-audio-in-stub.sh
+ # The driver's display code carries this repository's adaptation (tools/patch-radv-wsi.py): a
+ # driver built with another version of it is built again (only the changed file compiles).
+ # So is a driver built from another Mesa revision than tools/deps.json pins.
+diff --git a/tools/stubs/libSceAudioIn.c b/tools/stubs/libSceAudioIn.c
+new file mode 100644
+index 0000000..b86fa3f
+--- /dev/null
++++ b/tools/stubs/libSceAudioIn.c
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * Link-time facade of the PS5 libSceAudioIn module, which the Payload SDK has no import library
++ * for: the three functions the controller's mic capture calls (headless/mic_capture.cpp). The
++ * native packaging tool turns the symbols into imports of the firmware module (by NID, as a
++ * game's are); nothing here is linked into the application or ever runs. W-14/W-15 looked the
++ * functions up at run time instead and the module refused every name and NID (0x80020003).
++ */
++int sceAudioInOpen(int user, unsigned type, unsigned index, unsigned length, unsigned rate, unsigned param) {
++    (void)user; (void)type; (void)index; (void)length; (void)rate; (void)param;
++    return -1;
++}
++int sceAudioInInput(int handle, void* samples) {
++    (void)handle; (void)samples;
++    return -1;
++}
++int sceAudioInClose(int handle) {
++    (void)handle;
++    return -1;
++}
+diff --git a/tools/test-hum-notes.cpp b/tools/test-hum-notes.cpp
+new file mode 100644
+index 0000000..90ca487
+--- /dev/null
++++ b/tools/test-hum-notes.cpp
+@@ -0,0 +1,163 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Host test for headless/hum_notes.h (EDEN_UP_MIC_NOTES).
++//   c++ -std=c++20 -O1 -fsanitize=address,undefined -Iheadless tools/test-hum-notes.cpp -o /tmp/t && /tmp/t
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <numbers>
++#include <random>
++#include <vector>
++
++#include "hum_notes.h"
++
++namespace H = Eden::Hum;
++static int failures = 0;
++#define CHECK(cond)                                                                                \
++    do {                                                                                           \
++        if (!(cond)) {                                                                             \
++            std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond);                            \
++            ++failures;                                                                            \
++        }                                                                                          \
++    } while (0)
++
++static float Hz(float midi) {
++    return 440.0f * std::pow(2.0f, (midi - 69.0f) / 12.0f);
++}
++
++// A hum: the fundamental with two weaker harmonics, as a voice has, plus a little noise.
++static std::vector<std::int16_t> Tone(float hz, float amplitude, unsigned seed = 1) {
++    std::vector<std::int16_t> out(H::Window);
++    std::mt19937 rng{seed};
++    std::normal_distribution<float> noise{0.0f, amplitude * 0.03f};
++    for (std::size_t i = 0; i < out.size(); ++i) {
++        const float t = static_cast<float>(i) / H::Rate;
++        const float w = 2 * std::numbers::pi_v<float> * hz * t;
++        const float s = amplitude * (std::sin(w) + 0.5f * std::sin(2 * w) + 0.25f * std::sin(3 * w)) / 1.75f;
++        out[i] = static_cast<std::int16_t>(std::lround(std::fmax(-32768.0f, std::fmin(32767.0f, s + noise(rng)))));
++    }
++    return out;
++}
++
++static float Detect(const std::vector<std::int16_t>& s) {
++    return H::DetectPitch(s.data(), s.size());
++}
++
++// Pitches across the hummed range come back within a few cents, harmonics or not.
++static void PitchAccuracy() {
++    for (float midi = 40.0f; midi <= 84.0f; midi += 1.0f) { // E2 .. C6
++        const float hz = Hz(midi);
++        const float found = Detect(Tone(hz, 8000.0f, static_cast<unsigned>(midi)));
++        const float cents = found > 0 ? 1200.0f * std::log2(found / hz) : 9999.0f;
++        if (std::fabs(cents) > 20.0f) std::printf("  midi %.0f: %.1f Hz -> %.1f Hz (%.0f cents)\n", midi, hz, found, cents);
++        CHECK(std::fabs(cents) <= 20.0f);
++    }
++}
++
++// Silence, a quiet room and white noise have no pitch; a window shorter than two of the longest
++// periods is refused rather than read past.
++static void NoPitch() {
++    CHECK(Detect(std::vector<std::int16_t>(H::Window, 0)) == 0.0f);
++    CHECK(Detect(Tone(220.0f, 150.0f)) == 0.0f); // under MinRms
++    std::vector<std::int16_t> noise(H::Window);
++    std::mt19937 rng{7};
++    std::uniform_int_distribution<int> any{-12000, 12000};
++    for (auto& s : noise) s = static_cast<std::int16_t>(any(rng));
++    CHECK(Detect(noise) == 0.0f);
++    const auto tone = Tone(220.0f, 8000.0f);
++    CHECK(H::DetectPitch(tone.data(), 300) == 0.0f);
++    CHECK(H::DetectPitch(nullptr, H::Window) == 0.0f);
++    CHECK(Detect(Tone(40.0f, 8000.0f)) == 0.0f); // below MinHz
++}
++
++// Note names in any octave; between two notes nothing; the D goes high only above a recent note.
++static void Classify() {
++    const float none = std::nanf("");
++    CHECK(H::Classify(Hz(62), none) == H::LowD); // D4
++    CHECK(H::Classify(Hz(50), none) == H::LowD); // D3, an octave down
++    CHECK(H::Classify(Hz(53), none) == H::F);
++    CHECK(H::Classify(Hz(57), none) == H::A);
++    CHECK(H::Classify(Hz(59), none) == H::B);
++    CHECK(H::Classify(Hz(71), none) == H::B);    // B4
++    CHECK(H::Classify(Hz(60), none) == H::None); // C: a whole tone from D and from B
++    CHECK(H::Classify(Hz(55), none) == H::None); // G
++    CHECK(H::Classify(Hz(62.7f), none) == H::LowD);  // 70 cents sharp still counts
++    CHECK(H::Classify(Hz(62.8f), none) == H::None);  // 80 cents is too far
++    CHECK(H::Classify(Hz(52.25f), none) == H::F);    // 75 cents flat of F counts
++    CHECK(H::Classify(0.0f, none) == H::None);
++    CHECK(H::Classify(Hz(62), 59.0f) == H::HighD);   // D4 above a B3
++    CHECK(H::Classify(Hz(50), 59.0f) == H::LowD);    // D3 below it
++}
++
++// Two agreeing windows start a note; a different note releases first; silence releases; nothing
++// unarmed; the idle limit disarms.
++static void Tracker() {
++    H::Tracker t;
++    std::int64_t now = 0;
++    const auto feed = [&](float hz) { now += 32; return t.Feed(hz, now); };
++    CHECK(feed(Hz(57)) == H::None); // not armed
++    t.Arm(now);
++    CHECK(feed(Hz(57)) == H::None); // one window
++    CHECK(feed(Hz(57)) == H::A);    // two in a row
++    CHECK(feed(Hz(57)) == H::A);
++    CHECK(feed(Hz(53)) == H::None); // a different note releases A first
++    CHECK(feed(Hz(53)) == H::F);
++    CHECK(feed(0.0f) == H::None);   // silence releases
++    CHECK(feed(Hz(62)) == H::None);
++    CHECK(feed(0.0f) == H::None);   // one stray window never presses
++    CHECK(feed(Hz(62)) == H::None);
++    // Zelda's Lullaby goes B up to D: the D after a B is the high one.
++    CHECK(feed(Hz(59)) == H::None);
++    CHECK(feed(Hz(59)) == H::B);
++    CHECK(feed(Hz(62)) == H::None);
++    CHECK(feed(Hz(62)) == H::HighD);
++    // Song of Time goes A down to D: low.
++    CHECK(feed(Hz(57)) == H::None);
++    CHECK(feed(Hz(57)) == H::A);
++    CHECK(feed(Hz(50)) == H::None);
++    CHECK(feed(Hz(50)) == H::LowD);
++    CHECK(t.Held() == H::LowD);
++    t.Disarm();
++    CHECK(t.Held() == H::None);
++    CHECK(feed(Hz(57)) == H::None);
++    // Idle: after IdleDisarmMs without a note, arming ends; a note just before keeps it.
++    t.Arm(now);
++    now += H::IdleDisarmMs - 100;
++    CHECK(t.Feed(Hz(57), now) == H::None && t.Armed());
++    now += H::IdleDisarmMs + 1;
++    CHECK(t.Feed(0.0f, now) == H::None);
++    CHECK(!t.Armed());
++    // The high-D context expires.
++    t.Arm(now);
++    feed(Hz(59));
++    feed(Hz(59));
++    now += H::HighDContextMs + 100;
++    feed(0.0f);
++    feed(Hz(62));
++    CHECK(feed(Hz(62)) == H::LowD);
++}
++
++// End to end: tones through DetectPitch into the tracker.
++static void EndToEnd() {
++    H::Tracker t;
++    t.Arm(0);
++    std::int64_t now = 0;
++    H::Note last = H::None;
++    for (int i = 0; i < 4; ++i) last = t.Feed(Detect(Tone(Hz(53), 6000.0f, i)), now += 32);
++    CHECK(last == H::F);
++    last = t.Feed(Detect(std::vector<std::int16_t>(H::Window, 0)), now += 32);
++    CHECK(last == H::None);
++}
++
++int main() {
++    PitchAccuracy();
++    NoPitch();
++    Classify();
++    Tracker();
++    EndToEnd();
++    if (failures) {
++        std::printf("%d failure(s)\n", failures);
++        return 1;
++    }
++    std::puts("hum notes PASS");
++    return 0;
++}
+diff --git a/tools/test-mic-feed.cpp b/tools/test-mic-feed.cpp
+new file mode 100644
+index 0000000..e5d1d56
+--- /dev/null
++++ b/tools/test-mic-feed.cpp
+@@ -0,0 +1,228 @@
++#include <cassert>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <vector>
++#include <array>
++#include <algorithm>
++#include <cmath>
++
++// Simulated Sysmix ring buffer
++struct SysmixBuffer {
++    std::vector<uint8_t> mem;
++    static constexpr uint64_t Size = 0xd000;
++    static constexpr uint32_t Frames = 4800;
++    static constexpr uint32_t Capacity = Frames + 1; // 4801
++    static constexpr uint64_t DataOffset = 0x2000;
++    static constexpr uint64_t SysIndexOffset = 0x44;
++    static constexpr uint64_t GameIndexOffset = 0x1004;
++
++    SysmixBuffer() : mem(Size, 0) {
++        // Offset 0 = 1 (initialized)
++        Write32(0x0, 1);
++        Write32(SysIndexOffset, 0);
++        Write32(GameIndexOffset, 0);
++    }
++
++    uint32_t Read32(uint64_t offset) const {
++        uint32_t v;
++        std::memcpy(&v, &mem[offset], sizeof(v));
++        return v;
++    }
++
++    void Write32(uint64_t offset, uint32_t v) {
++        std::memcpy(&mem[offset], &v, sizeof(v));
++    }
++
++    int16_t Read16(uint64_t offset) const {
++        int16_t v;
++        std::memcpy(&v, &mem[offset], sizeof(v));
++        return v;
++    }
++
++    void Write16(uint64_t offset, int16_t v) {
++        std::memcpy(&mem[offset], &v, sizeof(v));
++    }
++};
++
++// Simulated Bounded Mic Capture Ring (as in mic_capture.cpp)
++struct BoundedMicRing {
++    static constexpr size_t BufferSize = 9600;
++    static constexpr size_t MaxLatencyFrames = 4800; // 100ms cap at 48kHz
++    std::array<int16_t, BufferSize> ring{};
++    size_t ring_write = 0;
++    size_t ring_count = 0;
++    uint64_t drops = 0;
++    uint64_t underruns = 0;
++
++    void Push(const int16_t* samples, size_t count) {
++        for (size_t i = 0; i < count; ++i) {
++            ring[ring_write] = samples[i];
++            ring_write = (ring_write + 1) % BufferSize;
++            if (ring_count < MaxLatencyFrames) {
++                ring_count++;
++            } else {
++                drops++; // Oldest sample dropped to preserve sub-100ms real-time latency
++            }
++        }
++    }
++
++    size_t Read(int16_t* out, size_t frames) {
++        const size_t take = std::min(frames, ring_count);
++        if (take < frames) {
++            underruns += (frames - take);
++        }
++        const size_t start = (ring_write + BufferSize - ring_count) % BufferSize;
++        for (size_t i = 0; i < take; ++i) {
++            out[i] = ring[(start + i) % BufferSize];
++        }
++        ring_count -= take;
++        return take;
++    }
++};
++
++// Simulated Drain logic
++void SimDrain(SysmixBuffer& buf, BoundedMicRing& mic, double& owed_frames, uint64_t& mic_fed, uint64_t& mic_silence) {
++    const uint32_t capacity = SysmixBuffer::Capacity;
++    const uint32_t produced = buf.Read32(SysmixBuffer::SysIndexOffset);
++    const uint32_t consumed = buf.Read32(SysmixBuffer::GameIndexOffset);
++
++    if (produced >= capacity || consumed >= capacity) return;
++
++    // 5ms at 48000 Hz = 240 frames
++    owed_frames += 48000.0 * 0.005;
++    const auto owed = static_cast<uint32_t>(owed_frames);
++    owed_frames -= owed;
++
++    const uint32_t waiting = (produced + capacity - consumed) % capacity;
++    const uint32_t room = capacity - 1 - waiting;
++    const uint32_t count = std::min(owed, room);
++
++    std::array<int16_t, 1024> samples{};
++    const uint32_t wanted = std::min<uint32_t>(count, samples.size());
++    const size_t got = mic.Read(samples.data(), wanted);
++
++    for (uint32_t i = 0; i < wanted; ++i) {
++        buf.Write16(SysmixBuffer::DataOffset + uint64_t{(produced + i) % capacity} * 2, samples[i]);
++    }
++    buf.Write32(SysmixBuffer::SysIndexOffset, (produced + wanted) % capacity);
++
++    mic_fed += wanted;
++    mic_silence += (wanted - got);
++}
++
++// Simulated Game Audio Thread reading from ring
++size_t SimGameRead(SysmixBuffer& buf, std::vector<int16_t>& out) {
++    const uint32_t capacity = SysmixBuffer::Capacity;
++    const uint32_t produced = buf.Read32(SysmixBuffer::SysIndexOffset);
++    const uint32_t consumed = buf.Read32(SysmixBuffer::GameIndexOffset);
++
++    if (produced >= capacity || consumed >= capacity) return 0;
++
++    const uint32_t available = (produced + capacity - consumed) % capacity;
++    for (uint32_t i = 0; i < available; ++i) {
++        int16_t s = buf.Read16(SysmixBuffer::DataOffset + uint64_t{(consumed + i) % capacity} * 2);
++        out.push_back(s);
++    }
++    buf.Write32(SysmixBuffer::GameIndexOffset, (consumed + available) % capacity);
++    return available;
++}
++
++int main() {
++    printf("Starting Sysmix Mic Feed test...\n");
++
++    SysmixBuffer buf;
++    BoundedMicRing mic;
++    double owed = 0;
++    uint64_t fed = 0, silence = 0;
++
++    // Test 1: Mic feeds sine wave, Drain runs, Game consumes
++    // DualSense input sends 256 samples every ~5.33 ms
++    // Drain consumes 240 samples every 5.0 ms
++    std::vector<int16_t> game_received;
++    int16_t sample_counter = 1;
++
++    for (int tick = 0; tick < 200; ++tick) {
++        // Producer: DualSense hardware delivers 256 samples approx every tick
++        int16_t hw_block[256];
++        for (int i = 0; i < 256; ++i) {
++            hw_block[i] = sample_counter++;
++        }
++        mic.Push(hw_block, 256);
++
++        // System Drain (5ms)
++        SimDrain(buf, mic, owed, fed, silence);
++
++        // Game consumes
++        SimGameRead(buf, game_received);
++    }
++
++    printf("Test 1 Result: Fed %llu frames (%llu silence). Game received %zu frames.\n",
++           (unsigned long long)fed, (unsigned long long)silence, game_received.size());
++    assert(game_received.size() == fed);
++    assert(silence == 0); // All frames came from mic
++    // Verify waveform continuity
++    for (size_t i = 0; i < game_received.size(); ++i) {
++        assert(game_received[i] == static_cast<int16_t>(i + 1));
++    }
++    printf("Test 1 PASS: Perfect PCM continuity and timing!\n");
++
++    // Test 2: Silence fallback when mic underruns / disconnected
++    game_received.clear();
++    BoundedMicRing empty_mic;
++    for (int tick = 0; tick < 20; ++tick) {
++        SimDrain(buf, empty_mic, owed, fed, silence);
++        SimGameRead(buf, game_received);
++    }
++    assert(game_received.size() == 20 * 240);
++    for (auto s : game_received) {
++        assert(s == 0); // Pure silence
++    }
++    printf("Test 2 PASS: Silent fallback produces perfect 48kHz silence!\n");
++
++    // Test 3: Game stalls / pauses reading (e.g. 1 second pause)
++    // Producer keeps pushing, Drain fills ring to capacity (4800 frames) and then drops gracefully
++    sample_counter = 1000;
++    for (int tick = 0; tick < 50; ++tick) { // 50 * 240 = 12000 frames attempted
++        int16_t hw_block[256];
++        for (int i = 0; i < 256; ++i) hw_block[i] = sample_counter++;
++        mic.Push(hw_block, 256);
++        SimDrain(buf, mic, owed, fed, silence);
++        // Game does NOT read
++    }
++    uint32_t produced = buf.Read32(SysmixBuffer::SysIndexOffset);
++    uint32_t consumed = buf.Read32(SysmixBuffer::GameIndexOffset);
++    uint32_t waiting = (produced + SysmixBuffer::Capacity - consumed) % SysmixBuffer::Capacity;
++    printf("Test 3 Waiting frames in ring when stalled: %u (Capacity-1 = %u)\n", waiting, SysmixBuffer::Capacity - 1);
++    assert(waiting == SysmixBuffer::Capacity - 1); // exactly 4800 frames waiting
++
++    // Now Game wakes up and reads
++    game_received.clear();
++    SimGameRead(buf, game_received);
++    assert(game_received.size() == 4800);
++    produced = buf.Read32(SysmixBuffer::SysIndexOffset);
++    consumed = buf.Read32(SysmixBuffer::GameIndexOffset);
++    assert(produced == consumed); // Buffer drained!
++    printf("Test 3 PASS: Overrun gracefully bounds to 4800 frames, resume drains cleanly!\n");
++
++    // Test 4: Bounded latency check in BoundedMicRing
++    BoundedMicRing latency_mic;
++    int16_t test_val = 1;
++    // Push 20,000 samples (over 400 ms)
++    for (int i = 0; i < 20000; ++i) {
++        int16_t s = test_val++;
++        latency_mic.Push(&s, 1);
++    }
++    assert(latency_mic.ring_count == BoundedMicRing::MaxLatencyFrames);
++    assert(latency_mic.drops == 20000 - BoundedMicRing::MaxLatencyFrames);
++    // Read first sample: must be (20001 - MaxLatencyFrames), NOT sample 1!
++    int16_t read_back = 0;
++    latency_mic.Read(&read_back, 1);
++    printf("Latency test: first read sample = %d (expected %zu)\n", read_back, 20001 - BoundedMicRing::MaxLatencyFrames);
++    assert(read_back == static_cast<int16_t>(20001 - BoundedMicRing::MaxLatencyFrames));
++    printf("Test 4 PASS: Stale audio dropped, real-time latency strictly capped at 100ms!\n");
++
++    printf("ALL TESTS PASSED SUCCESSFULLY!\n");
++    return 0;
++}
+diff --git a/tools/test-mic-log.cpp b/tools/test-mic-log.cpp
+new file mode 100644
+index 0000000..5c1ece6
+--- /dev/null
++++ b/tools/test-mic-log.cpp
+@@ -0,0 +1,52 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Host test for Eglantine's src/common/nx2_mic_log.h (patch 1107): the EDEN_MIC_FEED / EDEN_MIC_DUMP
++// index lines are written for the whole session, not only the first 200.
++//   c++ -std=c++20 -O1 -fsanitize=address,undefined -I<patched Eglantine>/src tools/test-mic-log.cpp
++#include <cstdio>
++#include "common/nx2_mic_log.h"
++using namespace Common::Nx2MicLog;
++static int failures = 0;
++#define CHECK(c) do { if (!(c)) { std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); ++failures; } } while (0)
++// Runs `seconds` seconds of 200 drains each with the indices `idx(second)`; returns lines written.
++template <class F> static int Run(Pacer& p, u32& shared, int seconds, F idx) {
++    int lines = 0;
++    for (int s = 0; s < seconds; ++s)
++        for (int d = 0; d < 200; ++d)
++            lines += Due(p, idx(s), shared);
++    return lines;
++}
++int main() {
++    { // Indices never move: 200 lines, then one every 10 s; never more than one a second.
++        Pacer p; u32 shared = 0;
++        CHECK(Run(p, shared, 200, [](int) { return u64{4800}; }) == 200);
++        CHECK(Run(p, shared, 100, [](int) { return u64{4800}; }) == 10);
++    }
++    { // The bug this replaced: past the cap the old code re-checked every drain. 3600 s: at most 3600 lines.
++        Pacer p; u32 shared = 0;
++        const int lines = Run(p, shared, 3600, [](int s) { return u64(s % 2); }); // moves every second
++        CHECK(lines == 3600);
++        Pacer q; u32 shared2 = 0;
++        CHECK(Run(q, shared2, 3600, [](int) { return u64{7}; }) == 200 + (3600 - 200) / 10);
++    }
++    { // A move after the cap is reported at the next chance, and only once.
++        Pacer p; u32 shared = 0;
++        (void)Run(p, shared, 250, [](int) { return u64{0}; });
++        int lines = Run(p, shared, 3, [](int s) { return s == 0 ? u64{1} : u64{1}; });
++        CHECK(lines == 1);
++    }
++    { // No line between chances: exactly one chance per 200 drains.
++        Pacer p; u32 shared = 0;
++        for (int d = 0; d < 199; ++d) CHECK(!Due(p, d, shared));
++        CHECK(Due(p, 0, shared));
++        CHECK(shared == 1);
++    }
++    { // The count is shared between streams: the early lines are 200 in all, not per stream.
++        Pacer a, b; u32 shared = 0;
++        int la = 0, lb = 0;
++        for (int s = 0; s < 150; ++s) for (int d = 0; d < 200; ++d) { la += Due(a, 5, shared); lb += Due(b, 5, shared); }
++        CHECK(la + lb >= 200 && la + lb <= 200 + 2 * 5);
++    }
++    CHECK(Pack(1, 2) != Pack(2, 1) && Pack(0, 4800) != Pack(4800, 0));
++    if (failures == 0) std::puts("PASS");
++    return failures != 0;
++}
