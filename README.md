@@ -21,6 +21,12 @@
 
 # English
 
+## Green Hat Boy on base PS5
+
+The [T186 source kit](docs/green-hat-boy/README.md) documents the latest verified Wave Ocarina fixes and the exact base they use. It includes the DualSense mic implementation, minimap recording and steering, the depth-feedback fix, and the shown-frame flash counter.
+
+On the 9.40 Castle Town route, five matched park-wait pairs raised median entry FPS from **14.50 to 17.12**, and the walk from **17.70 to 21.52**. Frames over 250 ms fell from **22 to 12**. The 13.60 drawbridge corruption remains under investigation. [Source, measurements and build steps](docs/green-hat-boy/README.md)
+
 ## Ocarina of Time on base PS5
 
 This branch combines Vampinity’s T120 with the Build O fixes and an optional idle-texture sweep under PS5 memory pressure. The sweep looks for reloadable textures unused for at least one second when the largest free block falls below 1 GiB. The [comparison preset](docs/presets/env-t120-build-o-0400486024dec000.txt) enables it and T120’s stale upload skip and shader memory wait. Use the same Town save at 0.75× to compare with Build O. With the four review fixes applied, the combined build passed Start and reached **Goron City** on a base PS5 running firmware 13.60. One 30-second stretch earlier in that run averaged **33.2 FPS**. The runs below used the original Build O and Build N.

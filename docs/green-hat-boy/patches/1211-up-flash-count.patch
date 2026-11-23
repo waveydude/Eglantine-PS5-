@@ -1,0 +1,416 @@
+Subject: [PATCH] EDEN_UP_FLASH_COUNT=1: count one-frame flashes in the shown picture (off by default)
+
+There was no flash measure that works: GrowingBlackBeans' gbb8 counter compared each frame's mean
+brightness with a running median and saturated (close objects sweeping past count, more at low
+fps), so flashes were rated by eye. This one samples 576 points (32x18) of every shown frame, with
+the present's own commands and no wait (built as BlackProbe), and calls frame B a flash where it
+jumps at least 48 (of 255) away from both neighbouring frames A and C while A and C agree within 16,
+on at least 4% of the points. A camera move, a fade or a scene cut changes A to C too and is never
+counted. Lines: "EDEN_UP_FLASH_COUNT last 10 s: ..." and one "EDEN_UP_FLASH frame=... points=...
+box=..." per flash (at most 20 per 10 s). Tuning: EDEN_UP_FLASH_COUNT_JUMP,
+EDEN_UP_FLASH_COUNT_SHARE_PERMILLE. A two-frame flash is not counted (documented limit). Detector
+tested on the host: tools/test-flash-counter.cpp. Unset: one test of a static per composite.
+
+--- /dev/null
++++ b/src/video_core/flash_counter.h
+@@ -0,0 +1,105 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++// EDEN_UP_FLASH_COUNT=1 (waveydude, 15 Nov 2026): counts one-frame flashes in the shown picture.
++// GrowingBlackBeans' gbb8 counter compared each frame's mean brightness with a running median and
++// saturated: close objects sweeping past the camera count as flashes, more so at low fps. This one
++// looks at 576 points (32 x 18) of three shown frames in a row, A B C, and calls B a flash only
++// where B jumps away from both neighbours in the same direction while A and C agree with each
++// other. A camera move or a fade changes A to C as well, so it is never counted; a wrong picture
++// shown for one frame (the "split second" flashes, a bright patch of ground) is. A frame is a flash
++// when at least MinShare of the points do that. Pure logic: no Vulkan, tested on the host
++// (tools/test-flash-counter.cpp); present/flash_probe.h feeds it.
++
++#include <algorithm>
++#include <array>
++#include <cstdint>
++#include <cstdlib>
++#include <optional>
++#include <span>
++
++namespace VideoCommon::FlashCount {
++
++inline constexpr std::uint32_t Cols = 32;
++inline constexpr std::uint32_t Rows = 18;
++inline constexpr std::uint32_t Samples = Cols * Rows;
++
++struct Params {
++    std::uint32_t jump = 48;               ///< B must differ from A and from C by at least this (0-255)
++    std::uint32_t settle = 16;             ///< and A and C may differ by at most this
++    std::uint32_t min_share_permille = 40; ///< share of the points that must do so (40 = 4%)
++    // settle must stay under jump: the direction of a flash then needs no check (Judge).
++};
++
++struct Event {
++    std::uint64_t frame{};     ///< index of the flashing frame (B)
++    std::uint32_t points{};    ///< points that flashed, of Samples
++    std::uint32_t mean_jump{}; ///< mean of min(|B-A|, |B-C|) over those points
++    bool brighter{};           ///< most of them got brighter
++    std::uint32_t x0{}, y0{}, x1{}, y1{}; ///< grid box holding them (inclusive)
++};
++
++class Detector {
++public:
++    explicit Detector(Params params = {}) : p{params} {}
++
++    /// One shown frame's brightness at the Samples points, row by row. index counts shown frames;
++    /// a gap (a frame that was not probed) starts over, so no flash is ever judged across it.
++    /// Returns an event for the frame before this one when that frame flashed.
++    std::optional<Event> Feed(std::uint64_t index, std::span<const std::uint8_t, Samples> luma) {
++        std::optional<Event> event;
++        if (have == 0 || index != last + 1) {
++            have = 0;
++        } else if (have >= 2) {
++            event = Judge(index - 1, luma);
++        }
++        a = b;
++        std::copy(luma.begin(), luma.end(), b.begin());
++        last = index;
++        have = (std::min)(have + 1, 2);
++        return event;
++    }
++
++private:
++    std::optional<Event> Judge(std::uint64_t middle, std::span<const std::uint8_t, Samples> c) const {
++        Event e{.frame = middle, .x0 = Cols, .y0 = Rows};
++        std::uint64_t jump_sum = 0;
++        std::uint32_t up = 0;
++        for (std::uint32_t i = 0; i < Samples; ++i) {
++            const int va = a[i], vb = b[i], vc = c[i];
++            const int d1 = vb - va, d2 = vb - vc;
++            // With A and C within settle (< jump) of each other, a jump of at least jump from both
++            // puts B above both or below both: the direction needs no check of its own.
++            if (std::abs(va - vc) > static_cast<int>(p.settle)) {
++                continue;
++            }
++            const int j = (std::min)(std::abs(d1), std::abs(d2));
++            if (j < static_cast<int>(p.jump)) {
++                continue;
++            }
++            ++e.points;
++            jump_sum += static_cast<std::uint32_t>(j);
++            up += d1 > 0 ? 1 : 0;
++            const std::uint32_t x = i % Cols, y = i / Cols;
++            e.x0 = (std::min)(e.x0, x);
++            e.y0 = (std::min)(e.y0, y);
++            e.x1 = (std::max)(e.x1, x);
++            e.y1 = (std::max)(e.y1, y);
++        }
++        if (e.points == 0 || std::uint64_t{e.points} * 1000 < std::uint64_t{p.min_share_permille} * Samples) {
++            return std::nullopt;
++        }
++        e.mean_jump = static_cast<std::uint32_t>(jump_sum / e.points);
++        e.brighter = up * 2 >= e.points;
++        return e;
++    }
++
++    Params p;
++    std::array<std::uint8_t, Samples> a{}, b{};
++    std::uint64_t last{};
++    int have{};
++};
++
++} // namespace VideoCommon::FlashCount
+--- /dev/null
++++ b/src/video_core/renderer_vulkan/present/flash_probe.h
+@@ -0,0 +1,257 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++#include <exception>
++#include <string_view>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++#include "common/pe_switch.h"
++#include "core/frontend/framebuffer_layout.h"
++#include "video_core/flash_counter.h"
++#include "video_core/renderer_vulkan/present/util.h"
++#include "video_core/renderer_vulkan/vk_present_manager.h"
++#include "video_core/renderer_vulkan/vk_scheduler.h"
++#include "video_core/vulkan_common/vulkan_memory_allocator.h"
++#include "video_core/vulkan_common/vulkan_wrapper.h"
++
++namespace Vulkan {
++
++/// EDEN_UP_FLASH_COUNT=1 (exact "1"; off by default): counts one-frame flashes in what is shown
++/// (video_core/flash_counter.h). Built as BlackProbe is: at each composite, 576 single pixels on a
++/// 32x18 grid inside the drawn area of the frame image are copied into one of Slots small host
++/// buffers with the present's own commands (no extra submit), and a slot is read at a later
++/// composite once the GPU is past it (Scheduler::IsFree). Nothing ever waits for it. A frame whose
++/// slot is still on the GPU gets no probe, and the detector starts over after it, so no flash is
++/// judged across a missing frame (the 10 s line says how many were missed).
++/// Lines: "EDEN_UP_FLASH_COUNT last 10 s: ..." every 10 s, and one "EDEN_UP_FLASH ..." per flash
++/// (at most 20 per 10 s). Tuning, read once: EDEN_UP_FLASH_COUNT_JUMP (default 48, 0-255),
++/// EDEN_UP_FLASH_COUNT_SHARE_PERMILLE (default 40 = 4% of the points).
++/// Cost while on: 576 one-pixel copies (2.3 KB) and two barriers per present on the GPU, a 2.3 KB
++/// read and 576 compares on the GPU thread. Off: one test of a static per composite.
++class FlashProbe {
++public:
++    static constexpr u32 Samples = VideoCommon::FlashCount::Samples;
++    static constexpr u32 Slots = 4;
++
++    static bool Enabled() {
++        static const bool on = Common::PeSwitch("EDEN_UP_FLASH_COUNT");
++        return on;
++    }
++
++    /// The GPU thread, in RendererVulkan::Composite after the frame is drawn, before its submit.
++    void AtComposite(MemoryAllocator& allocator, Scheduler& scheduler, Frame* frame,
++                     VkFormat format, const Layout::FramebufferLayout& layout) {
++        const u64 index = composites++;
++        if (disabled || frame == nullptr || !frame->image) {
++            return;
++        }
++        if (std::any_of(slots.begin(), slots.end(), [](const Slot& s) { return s.pending; })) {
++            scheduler.GetMasterSemaphore().Refresh();
++        }
++        // Oldest first, so the detector sees frames in order.
++        for (u32 i = 0; i < Slots; ++i) {
++            Slot& slot = slots[(next + i) % Slots];
++            if (slot.pending && scheduler.IsFree(slot.tick)) {
++                Read(slot);
++            }
++        }
++        Report();
++        if (Kind(format) == PixelKind::Unsupported) {
++            disabled = true;
++            LOG_WARNING(Render_Vulkan, "EDEN_UP_FLASH_COUNT: frame format {} is not probed; off for "
++                                       "this run", static_cast<int>(format));
++            return;
++        }
++        if (!made) {
++            try {
++                for (Slot& slot : slots) {
++                    slot.buffer = CreateWrappedBuffer(allocator, Samples * 4, MemoryUsage::Download);
++                }
++            } catch (const std::exception&) {
++                disabled = true;
++                LOG_WARNING(Render_Vulkan, "EDEN_UP_FLASH_COUNT: no memory for the probe; off for this run");
++                return;
++            }
++            made = true;
++            const auto number = [](const char* name, u32 fallback, u32 max) {
++                const char* const v = std::getenv(name);
++                if (v == nullptr || *v == '\0') return fallback;
++                char* end = nullptr;
++                const unsigned long n = std::strtoul(v, &end, 10);
++                return (end == v || *end != '\0' || n > max) ? fallback : static_cast<u32>(n);
++            };
++            VideoCommon::FlashCount::Params params;
++            params.jump = (std::max)(number("EDEN_UP_FLASH_COUNT_JUMP", params.jump, 255), params.settle + 1);
++            params.min_share_permille =
++                (std::max)(number("EDEN_UP_FLASH_COUNT_SHARE_PERMILLE", params.min_share_permille, 1000), 1U);
++            detector = VideoCommon::FlashCount::Detector{params};
++            LOG_INFO(Render_Vulkan,
++                     "EDEN_UP_FLASH_COUNT=1: one-frame flashes counted on {} points ({}x{}): a point "
++                     "jumps at least {} from both neighbouring frames while they agree within {}; a "
++                     "frame counts when {} per mille of the points do",
++                     Samples, VideoCommon::FlashCount::Cols, VideoCommon::FlashCount::Rows,
++                     params.jump, params.settle, params.min_share_permille);
++            window_start = std::chrono::steady_clock::now();
++        }
++        Slot& slot = slots[next];
++        if (slot.pending) {
++            ++skipped;
++            return;
++        }
++        const u32 left = (std::min)(layout.screen.left, frame->width - 1);
++        const u32 top = (std::min)(layout.screen.top, frame->height - 1);
++        const u32 right = (std::clamp)(layout.screen.right, left + 1, frame->width);
++        const u32 bottom = (std::clamp)(layout.screen.bottom, top + 1, frame->height);
++        constexpr u32 Cols = VideoCommon::FlashCount::Cols, Rows = VideoCommon::FlashCount::Rows;
++        for (u32 y = 0; y < Rows; ++y) {
++            for (u32 x = 0; x < Cols; ++x) {
++                const u32 px = left + ((2 * x + 1) * (right - left)) / (2 * Cols);
++                const u32 py = top + ((2 * y + 1) * (bottom - top)) / (2 * Rows);
++                slot.regions[y * Cols + x] = VkBufferImageCopy{
++                    .bufferOffset = VkDeviceSize{(y * Cols + x) * 4U},
++                    .bufferRowLength = 0,
++                    .bufferImageHeight = 0,
++                    .imageSubresource{
++                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++                        .mipLevel = 0,
++                        .baseArrayLayer = 0,
++                        .layerCount = 1,
++                    },
++                    .imageOffset{.x = static_cast<s32>(px), .y = static_cast<s32>(py), .z = 0},
++                    .imageExtent{.width = 1, .height = 1, .depth = 1},
++                };
++            }
++        }
++        slot.format = format;
++        slot.index = index;
++        slot.pending = true;
++        slot.tick = scheduler.CurrentTick();
++        next = (next + 1) % Slots;
++        scheduler.RequestOutsideRenderPassOperationContext();
++        scheduler.Record([image = *frame->image, buffer = *slot.buffer,
++                          regions = slot.regions.data()](vk::CommandBuffer cmdbuf) {
++            static constexpr VkMemoryBarrier before{
++                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
++            };
++            static constexpr VkMemoryBarrier to_host{
++                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                .pNext = nullptr,
++                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++                .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
++            };
++            cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
++                                   VK_PIPELINE_STAGE_TRANSFER_BIT, 0, before);
++            // The frame image stays in GENERAL (the present pass's final layout), as BlackProbe's.
++            cmdbuf.CopyImageToBuffer(image, VK_IMAGE_LAYOUT_GENERAL, buffer,
++                                     vk::Span<VkBufferImageCopy>(regions, Samples));
++            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
++                                   to_host);
++        });
++    }
++
++private:
++    enum class PixelKind { Unsupported, Bytes8, Packed10 };
++
++    struct Slot {
++        vk::Buffer buffer;
++        std::array<VkBufferImageCopy, Samples> regions{};
++        u64 tick{};
++        u64 index{};
++        VkFormat format{};
++        bool pending{};
++    };
++
++    static PixelKind Kind(VkFormat format) {
++        switch (format) {
++        case VK_FORMAT_B8G8R8A8_UNORM:
++        case VK_FORMAT_B8G8R8A8_SRGB:
++        case VK_FORMAT_R8G8B8A8_UNORM:
++        case VK_FORMAT_R8G8B8A8_SRGB:
++        case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
++        case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
++            return PixelKind::Bytes8;
++        case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
++        case VK_FORMAT_A2R10G10B10_UNORM_PACK32:
++            return PixelKind::Packed10;
++        default:
++            return PixelKind::Unsupported;
++        }
++    }
++
++    /// The brightest colour channel, 0-255: the same measure BlackProbe uses, and independent of
++    /// the channel order of the 8-bit formats.
++    static u8 Brightest(const u8* pixel, PixelKind kind) {
++        if (kind == PixelKind::Bytes8) {
++            return (std::max)({pixel[0], pixel[1], pixel[2]});
++        }
++        u32 word{};
++        std::memcpy(&word, pixel, sizeof(word));
++        return static_cast<u8>((std::max)({word & 0x3ffU, (word >> 10) & 0x3ffU, (word >> 20) & 0x3ffU}) >> 2);
++    }
++
++    void Read(Slot& slot) {
++        slot.pending = false;
++        slot.buffer.Invalidate();
++        const auto bytes = slot.buffer.Mapped();
++        if (bytes.size() < Samples * 4) {
++            return;
++        }
++        const PixelKind kind = Kind(slot.format);
++        std::array<u8, Samples> luma{};
++        for (u32 i = 0; i < Samples; ++i) {
++            luma[i] = Brightest(bytes.data() + i * 4, kind);
++        }
++        ++probed;
++        if (const auto e = detector.Feed(slot.index, luma)) {
++            ++flashes;
++            ++total;
++            ++(e->brighter ? brighter : darker);
++            if (lines_this_window < 20) {
++                ++lines_this_window;
++                LOG_INFO(Render_Vulkan,
++                         "EDEN_UP_FLASH frame={} points={}/{} jump={} {} box={},{}-{},{} (32x18 grid)",
++                         e->frame, e->points, Samples, e->mean_jump, e->brighter ? "brighter" : "darker",
++                         e->x0, e->y0, e->x1, e->y1);
++            }
++        }
++    }
++
++    void Report() {
++        if (!made) {
++            return;
++        }
++        const auto now = std::chrono::steady_clock::now();
++        if (now - window_start < std::chrono::seconds{10}) {
++            return;
++        }
++        LOG_INFO(Render_Vulkan,
++                 "EDEN_UP_FLASH_COUNT last 10 s: {} flashes ({} brighter, {} darker) in {} frames "
++                 "probed, {} not probed (slot busy); {} flashes this session",
++                 flashes, brighter, darker, probed, skipped, total);
++        flashes = brighter = darker = probed = skipped = lines_this_window = 0;
++        window_start = now;
++    }
++
++    std::array<Slot, Slots> slots{};
++    VideoCommon::FlashCount::Detector detector{};
++    std::chrono::steady_clock::time_point window_start{};
++    u64 composites{};
++    u64 total{};
++    u32 flashes{}, brighter{}, darker{}, probed{}, skipped{}, lines_this_window{};
++    u32 next{};
++    bool made{};
++    bool disabled{};
++};
++
++} // namespace Vulkan
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.h
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.h
+@@ -17,6 +17,7 @@
+ #include "video_core/renderer_vulkan/present/frame_gen.h"
+ #endif
+ #include "video_core/renderer_vulkan/present/black_probe.h"
++#include "video_core/renderer_vulkan/present/flash_probe.h"
+ #include "video_core/renderer_vulkan/vk_blit_screen.h"
+ #include "video_core/renderer_vulkan/vk_present_manager.h"
+ #include "video_core/renderer_vulkan/vk_rasterizer.h"
+@@ -114,6 +115,9 @@
+     /// EDEN_UP_AHEAD_READ_SYNC_AUTO: is the frame about to be shown black (last member: its
+     /// buffers go before the allocator).
+     BlackProbe black_probe;
++    /// EDEN_UP_FLASH_COUNT=1: one-frame flashes in the shown picture (its buffers, too, go
++    /// before the allocator).
++    FlashProbe flash_probe;
+ };
+ 
+ } // namespace Vulkan
+--- a/src/video_core/renderer_vulkan/renderer_vulkan.cpp
++++ b/src/video_core/renderer_vulkan/renderer_vulkan.cpp
+@@ -234,6 +234,12 @@
+         black_probe.AtComposite(memory_allocator, scheduler, frame, swapchain.GetImageFormat(),
+                                 render_window.GetFramebufferLayout());
+     }
++    // EDEN_UP_FLASH_COUNT=1 (present/flash_probe.h): 576 points of this frame for the one-frame
++    // flash count, read at a later composite once the GPU is past it. Off: one test.
++    if (FlashProbe::Enabled()) [[unlikely]] {
++        flash_probe.AtComposite(memory_allocator, scheduler, frame, swapchain.GetImageFormat(),
++                                render_window.GetFramebufferLayout());
++    }
+ 
+ #ifdef HAS_LSFG
+     void(frame_gen.WantedGenerations(present_manager.MaxExtraFrames()));
